@@ -1,0 +1,15 @@
+services:
+  prusa-watch:
+    build: .
+    image: prusa-watch:latest
+    container_name: prusa-watch
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: America/New_York
+    ports:
+      - "8484:8484"
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      # decision baseline + saved failure frames (relative paths in config resolve under /app)
+      - ./data:/app/data

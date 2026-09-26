@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>prusa-watch</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --ink: #1c1c1a; --muted: #6b6b66; --line: #e3e3de;
+    --ok: #2f9e44; --warn: #e8890c; --fail: #d6336c; --accent: #fa6831;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121211; --panel: #1b1b1a; --ink: #ededea; --muted: #9a9a94; --line: #2c2c2a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 14px 20px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
+  header h1 span { color: var(--accent); }
+  .pill { padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid var(--line); }
+  .pill.PRINTING { background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); border-color: transparent; }
+  .pill.PAUSED, .pill.ATTENTION { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); border-color: transparent; }
+  .pill.ERROR, .pill.offline { background: color-mix(in srgb, var(--fail) 15%, transparent); color: var(--fail); border-color: transparent; }
+  .job { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 50ch; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; padding: 16px 20px; max-width: 1400px; margin: 0 auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 12px 16px; } .side { order: -1; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .card h2 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+  .viewer img { width: 100%; border-radius: 6px; background: #000; display: block; aspect-ratio: 16/9; object-fit: contain; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+  .tabs button { flex: 0 0 auto; }
+  button { font: inherit; padding: 7px 12px; border-radius: 7px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
+  button:hover { border-color: var(--muted); }
+  button.active { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+  button.danger { color: var(--fail); }
+  button:disabled { opacity: .45; cursor: default; }
+  .score { font-size: 44px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; }
+  .verdict { font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
+  .verdict.ok { color: var(--ok); } .verdict.warning { color: var(--warn); } .verdict.failure { color: var(--fail); }
+  .bar { height: 8px; border-radius: 4px; background: linear-gradient(90deg, var(--ok) 0 33.3%, var(--warn) 33.3% 66.6%, var(--fail) 66.6%); position: relative; margin: 12px 0 4px; opacity: .85; }
+  .bar i { position: absolute; top: -4px; width: 3px; height: 16px; background: var(--ink); border-radius: 2px; transform: translateX(-1px); transition: left .4s; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 12px 0 0; font-variant-numeric: tabular-nums; }
+  dt { color: var(--muted); } dd { margin: 0; text-align: right; }
+  .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .side { display: flex; flex-direction: column; gap: 16px; }
+  svg { width: 100%; height: 120px; display: block; }
+  .msg { min-height: 1.4em; color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .banner { display: none; margin: 0 20px; padding: 10px 14px; border-radius: 8px; background: color-mix(in srgb, var(--fail) 14%, transparent); color: var(--fail); font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>prusa<span>-watch</span></h1>
+  <span id="pname" class="job"></span>
+  <span id="pstate" class="pill">…</span>
+  <span id="job" class="job"></span>
+</header>
+<div id="banner" class="banner"></div>
+<main>
+  <section class="card viewer">
+    <div class="tabs">
+      <button data-src="frame" class="active">Analyzed</button>
+      <button data-src="raw">Live (raw)</button>
+      <button data-src="test">Last test</button>
+    </div>
+    <img id="view" alt="camera frame">
+    <div class="card" style="margin-top:16px; padding:12px">
+      <h2 id="chart-title">Score history</h2>
+      <svg id="chart" viewBox="0 0 600 120" preserveAspectRatio="none"></svg>
+    </div>
+  </section>
+  <aside class="side">
+    <section class="card">
+      <h2>Failure score</h2>
+      <div class="score" id="score">-</div>
+      <div class="bar"><i id="marker" style="left:0"></i></div>
+      <div><span id="verdict" class="verdict ok">-</span> <span id="grace" style="color:var(--muted)"></span></div>
+      <dl>
+        <dt>Frame p (sum conf.)</dt><dd id="p">-</dd>
+        <dt>EWM / baseline</dt><dd id="ewm">-</dd>
+        <dt>Frames this print</dt><dd id="fn">-</dd>
+        <dt>Inference</dt><dd id="inf">-</dd>
+        <dt>Camera</dt><dd id="cam">-</dd>
+        <dt>Mode</dt><dd id="mode">-</dd>
+        <dt>Pauses / warnings</dt><dd id="cnt">-</dd>
+      </dl>
+    </section>
+    <section class="card">
+      <h2>Controls</h2>
+      <div class="controls">
+        <button id="b-pause">Pause</button>
+        <button id="b-resume">Resume</button>
+        <button id="b-mute">Mute this print</button>
+        <button id="b-test">Test detection</button>
+        <button id="b-stop" class="danger" style="grid-column: span 2">Stop print</button>
+      </div>
+      <div class="msg" id="msg"></div>
+    </section>
+  </aside>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let src = "frame", last = null, token = "";
+try { token = localStorage.getItem("pw-token") || ""; } catch (e) {}
+
+document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => {
+  document.querySelectorAll(".tabs button").forEach(x => x.classList.remove("active"));
+  b.classList.add("active"); src = b.dataset.src; refreshImage();
+});
+
+function refreshImage() { $("view").src = `/${src}.jpg?t=${Date.now()}`; }
+$("view").onerror = () => { if (src === "frame") { $("view").src = `/raw.jpg?t=${Date.now()}`; } };
+
+async function call(path, confirmText) {
+  if (confirmText && !confirm(confirmText)) return;
+  if (last && last.auth_required && !token) {
+    token = prompt("Control token (web.token in config):") || "";
+    try { localStorage.setItem("pw-token", token); } catch (e) {}
+  }
+  $("msg").textContent = "…";
+  try {
+    const r = await fetch(path + (token ? `?token=${encodeURIComponent(token)}` : ""), { method: "POST" });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { $("msg").textContent = `Error: ${j.detail || r.status}`; if (r.status === 401) { token = ""; try { localStorage.removeItem("pw-token"); } catch (e) {} } return; }
+    if (path === "/api/test") { $("msg").textContent = `Test: ${j.detections.length} boxes, sum p ${j.sum_p.toFixed(2)}`; document.querySelector('[data-src="test"]').click(); }
+    else $("msg").textContent = `OK: ${j.result}`;
+    poll();
+  } catch (e) { $("msg").textContent = `Error: ${e}`; }
+}
+$("b-pause").onclick = () => call("/api/pause");
+$("b-resume").onclick = () => call("/api/resume");
+$("b-stop").onclick = () => call("/api/stop", "Stop (cancel) the current print?");
+$("b-test").onclick = () => call("/api/test");
+$("b-mute").onclick = () => call(last && last.job.muted ? "/api/unmute" : "/api/mute");
+
+function chart(hist) {
+  const W = 600, H = 120, svg = $("chart");
+  const now = Date.now() / 1000;
+  const first = hist.length ? hist[0].ts : now;
+  const span = Math.min(7200, Math.max(600, now - first));  // 10 min .. 2 h, grows with the print
+  const x = t => W - ((now - t) / span) * W, y = v => H - Math.min(1, Math.max(0, v)) * H;
+  const band = (lo, hi, c) => `<rect x="0" y="${y(hi)}" width="${W}" height="${y(lo) - y(hi)}" fill="${c}" opacity=".08"/>`;
+  let d = hist.filter(h => now - h.ts <= span).map((h, i) => `${i ? "L" : "M"}${x(h.ts).toFixed(1)},${y(h.score).toFixed(1)}`).join("");
+  svg.innerHTML = band(0, 1/3, "var(--ok)") + band(1/3, 2/3, "var(--warn)") + band(2/3, 1, "var(--fail)") +
+    (d ? `<path d="${d}" fill="none" stroke="var(--ink)" stroke-width="1.6" vector-effect="non-scaling-stroke"/>` :
+         `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="var(--muted)" font-size="13">No analysis yet (runs while printing)</text>`);
+}
+
+async function poll() {
+  try {
+    const s = await (await fetch("/api/state")).json();
+    last = s;
+    $("pname").textContent = s.printer_name;
+    const st = s.printer_reachable ? s.printer_state : "offline";
+    $("pstate").textContent = st; $("pstate").className = "pill " + st;
+    $("job").textContent = s.job.job_name ? `${s.job.job_name}${s.progress != null ? ` · ${Math.round(s.progress)}%` : ""}` : "";
+    $("score").textContent = s.last_analysis_ts ? s.score.toFixed(2) : "-";
+    $("marker").style.left = `${Math.min(100, s.score * 100)}%`;
+    $("verdict").textContent = s.verdict; $("verdict").className = "verdict " + s.verdict;
+    $("grace").textContent = s.grace_frames_left > 0 && s.printer_state === "PRINTING" ? `· grace ${s.grace_frames_left} frames` : "";
+    $("p").textContent = s.current_p.toFixed(3);
+    $("ewm").textContent = `${s.ewm_mean.toFixed(3)} / ${s.baseline.toFixed(3)}`;
+    $("fn").textContent = s.frame_num;
+    $("inf").textContent = s.inference_ms ? `${s.inference_ms.toFixed(0)} ms` : "-";
+    $("cam").textContent = s.camera_connected ? `live${s.frame_age_s != null ? ` (${s.frame_age_s.toFixed(1)} s)` : ""}` : "disconnected";
+    $("mode").textContent = `${s.action_mode} · sens ${s.sensitivity}`;
+    $("cnt").textContent = `${s.counters.pauses} / ${s.counters.warnings}`;
+    $("b-mute").textContent = s.job.muted ? "Unmute this print" : "Mute this print";
+    const active = s.job.job_id != null && ["PRINTING", "PAUSED", "ATTENTION"].includes(s.printer_state);
+    $("b-pause").disabled = !active || s.printer_state !== "PRINTING";
+    $("b-resume").disabled = !active || s.printer_state !== "PAUSED";
+    $("b-stop").disabled = !active; $("b-mute").disabled = !active;
+    const b = $("banner");
+    if (s.job.action_taken === "paused" && s.printer_state === "PAUSED") { b.style.display = "block"; b.textContent = "Paused by prusa-watch: spaghetti detected. Check the print, then Resume or Stop."; }
+    else if (!s.printer_reachable) { b.style.display = "block"; b.textContent = `Printer unreachable: ${s.printer_error || ""}`; }
+    else b.style.display = "none";
+    chart(s.history);
+  } catch (e) { $("pstate").textContent = "dashboard offline"; $("pstate").className = "pill offline"; }
+}
+poll(); refreshImage();
+setInterval(poll, 3000);
+setInterval(() => { if (src !== "test") refreshImage(); }, 3000);
+</script>
+</body>
+</html>

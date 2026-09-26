@@ -1,0 +1,55 @@
+# prusa-watch configuration. Copy to config.yaml and edit.
+# ${VAR} and ${VAR:-default} are expanded from the environment / .env file.
+
+printer:
+  name: core-one
+  host: 192.168.1.50             # printer IP (shown in Settings > Network)
+  username: maker                # always "maker" on Buddy firmware
+  password: ${PRUSALINK_PASSWORD} # Settings > Network > PrusaLink > Password
+  auth: digest                   # digest | apikey
+  poll_interval_s: 5
+
+camera:
+  # Enable RTSP for the Buddy3D in the Prusa app (camera settings), then use its IP.
+  # Reserve the camera's IP in your router, since DHCP changes will break this.
+  url: rtsp://192.168.1.51/live
+  transport: tcp
+  # Optional crop to just the build plate, normalized [x1, y1, x2, y2].
+  # Use the dashboard's "Live (raw)" tab to see the box, then tune.
+  # roi: [0.15, 0.10, 0.85, 0.95]
+  stale_after_s: 30
+
+detector:
+  model_path: models/model-weights.onnx
+  threshold: 0.08                # per-box floor (Obico default, don't raise this)
+  interval_s: 10                 # decision params are tuned for 10 s
+  use_gpu: false                 # CPU is plenty at 1 frame / 10 s
+
+decision:
+  action: pause                  # pause | stop | notify
+  sensitivity: 1.0               # 0.5 = conservative ... 2.0 = trigger-happy
+  init_safe_frame_num: 30        # grace frames at print start (30 x 10 s = 5 min)
+  resume_grace_s: 120            # after you resume an AI pause
+
+notify:
+  cooldown_s: 300
+  notify_camera_down: true
+  ntfy:
+    url: ${NTFY_URL:-https://ntfy.sh}
+    topic: ${NTFY_TOPIC}         # pick something unguessable if using ntfy.sh
+    token: ${NTFY_TOKEN:-}
+  discord:
+    webhook_url: ${DISCORD_WEBHOOK_URL:-}
+  webhook:
+    url: ${WEBHOOK_URL:-}        # e.g. Home Assistant: http://ha.lan:8123/api/webhook/<id>
+
+web:
+  enabled: true
+  host: 0.0.0.0
+  port: 8484
+  public_url: ${PUBLIC_URL:-}    # e.g. http://192.168.1.10:8484 (enables ntfy action buttons)
+  token: ${WEB_TOKEN:-}          # protects pause/resume/stop endpoints
+
+state_dir: data
+save_failure_frames: true
+log_level: INFO
