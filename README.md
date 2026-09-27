@@ -67,15 +67,18 @@ docker compose up -d --build        # the build downloads the ~250 MB model once
 docker compose run --rm prusa-watch check
 ```
 
-### 3b. Or run natively (Windows / macOS / Linux, Python ≥ 3.10)
+### 3b. Or run natively (macOS / Linux / Windows, Python ≥ 3.10)
 
-```powershell
-py -m venv .venv; .venv\Scripts\activate
+```bash
+python3 -m venv .venv && source .venv/bin/activate    # Windows: py -m venv .venv; .venv\Scripts\activate
 pip install -e .
-python scripts/fetch_model.py
 prusa-watch check      # verifies PrusaLink auth, grabs a camera frame, runs the model on it
 prusa-watch run        # dashboard on http://localhost:8484
 ```
+
+- `.env` is loaded automatically from next to `config.yaml` (or the current directory), the same file Docker uses. Variables already set in your shell win; `--env-file PATH` picks a different file.
+- The first `check` or `run` downloads the ~250 MB model into `models/`. `prusa-watch fetch-model --force` re-downloads it.
+- On a Mac, keep the machine awake while testing: `caffeinate -i prusa-watch run`.
 
 `check` saves the grabbed frame to `data/check_frame.jpg`. Look at it before trusting the system.
 
@@ -190,7 +193,7 @@ The dashboard shows a live countdown to the next action, with buttons for whatev
 
 ```bash
 pip install -e ".[dev]"
-pytest                                    # 107 tests, synthetic ONNX model, no hardware
+pytest                                    # synthetic ONNX model, no hardware needed
 python scripts/fake_printer.py &          # PrusaLink simulator (apikey auth, password "test")
 ```
 

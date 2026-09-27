@@ -4,6 +4,10 @@
     prusa-watch check  [-c config.yaml]   # verify printer, camera, model and escalation, then exit
     prusa-watch config [-c config.yaml]   # print the effective config (defaults + file + env), secrets masked
     prusa-watch config --defaults         # print the built-in defaults only
+    prusa-watch fetch-model [--force]     # download the detection model (run/check do this if it's missing)
+
+A `.env` next to the config file (or in the current directory) is loaded
+automatically; variables already set in the shell win.
 """
 
 from __future__ import annotations
@@ -29,13 +33,18 @@ def _setup_logging(level: str) -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-def _require_model(cfg: Config) -> None:
-    if not Path(cfg.detector.model_path).exists():
-        sys.exit(
-            f"Model not found at {cfg.detector.model_path}.\n"
-            "Download it with:  python scripts/fetch_model.py\n"
-            "(the Docker image does this at build time)"
-        )
+def _ensure_model(path: str, force: bool = False) -> bool:
+    """Download the model if it's missing (or force). Returns False on failure."""
+    from .model import ModelDownloadError, download_model
+
+    if Path(path).exists() and not force:
+        return True
+    try:
+        download_model(path, force=force)
+        return True
+    except ModelDownloadError as exc:
+        print(f"{exc}\nRetry with:  prusa-watch fetch-model", file=sys.stderr)
+        return False
 
 
 def cmd_check(cfg: Config) -> int:
@@ -95,9 +104,9 @@ def cmd_check(cfg: Config) -> int:
         print("  WARNING: no notification channel configured - policies that wait for your answer will just act late")
 
     print(f"[model] {cfg.detector.model_path}")
-    if not Path(cfg.detector.model_path).exists():
+    if not _ensure_model(cfg.detector.model_path):
         ok = False
-        print("  FAIL missing; run: python scripts/fetch_model.py")
+        print("  FAIL model missing and download failed")
     else:
         try:
             det = SpaghettiDetector(cfg.detector.model_path, use_gpu=cfg.detector.use_gpu)
@@ -122,7 +131,8 @@ def cmd_run(cfg: Config) -> int:
     from .monitor import Monitor
     from .web import create_app
 
-    _require_model(cfg)
+    if not _ensure_model(cfg.detector.model_path):
+        return 1
     monitor = Monitor(cfg)
     monitor.start()
 
@@ -169,18 +179,54 @@ def cmd_config(args) -> int:
     return 0
 
 
+def cmd_fetch_model(args) -> int:
+    path = Config().detector.model_path
+    if Path(args.config).exists():
+        try:
+            path = load_config(args.config).detector.model_path
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            return 2
+    if Path(path).exists() and not args.force:
+        print(f"{path} already exists ({Path(path).stat().st_size / 1e6:.1f} MB); use --force to re-download")
+        return 0
+    return 0 if _ensure_model(path, force=args.force) else 1
+
+
+def _load_env_files(args) -> None:
+    from .dotenv import load_dotenv
+
+    if args.env_file:
+        if not Path(args.env_file).is_file():
+            print(f"--env-file {args.env_file}: not found", file=sys.stderr)
+            sys.exit(2)
+        candidates = [Path(args.env_file)]
+    else:
+        candidates = [Path(args.config).resolve().parent / ".env", Path.cwd() / ".env"]
+    for p in load_dotenv(candidates):
+        print(f"prusa-watch: loaded {p}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="prusa-watch", description="AI spaghetti detection for Prusa printers + Buddy3D camera")
-    ap.add_argument("command", nargs="?", default="run", choices=["run", "check", "config"])
+    ap.add_argument("command", nargs="?", default="run", choices=["run", "check", "config", "fetch-model"])
     ap.add_argument("-c", "--config", default=os.environ.get("PRUSA_WATCH_CONFIG", "config.yaml"))
+    ap.add_argument("--env-file", default=None, help="load this .env instead of looking next to the config / in the cwd")
     ap.add_argument("--defaults", action="store_true", help="config: show built-in defaults only")
     ap.add_argument("--show-secrets", action="store_true", help="config: don't mask passwords/tokens/topics")
+    ap.add_argument("--force", action="store_true", help="fetch-model: re-download even if present")
     args = ap.parse_args(argv)
 
+    _load_env_files(args)
     if args.command == "config":
         return cmd_config(args)
+    if args.command == "fetch-model":
+        return cmd_fetch_model(args)
     try:
         cfg = load_config(args.config)
+    except FileNotFoundError as exc:
+        print(f"{exc}\nCreate one with:  cp config.example.yaml {args.config}", file=sys.stderr)
+        return 2
     except ValueError as exc:
         print(exc, file=sys.stderr)
         return 2
