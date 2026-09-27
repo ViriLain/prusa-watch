@@ -283,11 +283,13 @@ class Incident:
     id: str = field(default_factory=lambda: secrets.token_urlsafe(6))
     next_idx: int = 0  # first step not yet executed
     acted: str | None = None  # "paused" | "stopped" once we acted on the printer
+    action_errors: int = 0  # failed pause/stop attempts (retried every poll)
+    retry_idx: int | None = None  # step to run on the next poll regardless of its `at` (failed "act now")
 
     def due(self, now: float) -> list[tuple[int, Step]]:
         out = []
         for i in range(self.next_idx, len(self.policy.steps)):
-            if self.started_ts + self.policy.steps[i].at <= now:
+            if self.started_ts + self.policy.steps[i].at <= now or i == self.retry_idx:
                 out.append((i, self.policy.steps[i]))
             else:
                 break

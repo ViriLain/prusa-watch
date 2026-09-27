@@ -35,6 +35,7 @@ class JobContext:
     last_warning_ts: float = 0.0
     warnings: int = 0
     rearm_at: float = 0.0  # no new incidents until this time (after resume / keep printing)
+    printer_handled: bool = False  # you paused at the printer during an incident -> grace on resume
 
 
 @dataclass
@@ -254,6 +255,13 @@ class Monitor:
         # Resumed (anywhere: printer knob, Prusa app, dashboard) after we paused it
         if prev is not None and prev.state == "PAUSED" and status.state == "PRINTING" and self.job.action_taken == "paused":
             self._after_resume()
+        # Back to printing after you paused at the printer during an incident: same grace as our resume,
+        # so a mess you're still clearing doesn't open a new incident the moment it resumes.
+        elif prev is not None and prev.state in ACTIVE and prev.state != "PRINTING" and status.state == "PRINTING" and self.job.printer_handled:
+            grace = self.cfg.decision.resume_grace_s
+            log.info("Monitor: job %s resumed after a pause at the printer - incidents re-arm in %.0fs", self.job.job_id, grace)
+            self.job.printer_handled = False
+            self.job.rearm_at = max(self.job.rearm_at, self.clock() + grace)
 
         # Print ended
         if not active and self.job.job_id is not None and prev is not None and prev.state in ACTIVE:
@@ -393,6 +401,7 @@ class Monitor:
         elif status.state not in ACTIVE:
             self._close_incident(f"printer is {status.state}")
         elif status.state != "PRINTING" and inc.acted is None:
+            self.job.printer_handled = True
             self._close_incident(f"printer is {status.state} (handled at the printer)")
         else:
             self._run_due_steps(inc, status, now, auto=True)
@@ -401,8 +410,13 @@ class Monitor:
     def _run_due_steps(self, inc: Incident, status: PrinterStatus, now: float, auto: bool = False) -> None:
         for idx, step in inc.due(now):
             inc.next_idx = idx + 1
-            self._run_step(inc, step, status, now, auto=auto and step.at > 0)
+            ok = self._run_step(inc, step, status, now, auto=auto and step.at > 0)
             if self.incident is not inc:
+                return
+            if not ok:
+                # The pause/stop didn't go through: keep the incident open and retry this
+                # step on the next poll instead of moving on (and snoozing) as if it had.
+                inc.next_idx = idx
                 return
         self._maybe_finish(inc)
 
@@ -411,7 +425,8 @@ class Monitor:
             # Paused incidents stay open so Resume / False alarm buttons keep working.
             self._close_incident("all steps done", cooldown=inc.acted is None)
 
-    def _run_step(self, inc: Incident, step: Step, status: PrinterStatus, now: float, auto: bool = False) -> None:
+    def _run_step(self, inc: Incident, step: Step, status: PrinterStatus, now: float, auto: bool = False) -> bool:
+        """Run one step. Returns False if its pause/stop failed (caller retries)."""
         taken, err = None, None
         if step.action == "pause" and inc.acted is None and status.state == "PRINTING":
             taken, err = self._do("pause", inc.job_id)
@@ -423,18 +438,25 @@ class Monitor:
             if auto:
                 self.counters.auto_actions += 1
         if err:
-            # Never let a failed pause/stop go quietly: every channel, max priority.
-            name = self.job.job_name or inc.job_id
-            ev = self._event(
-                "failure",
-                f"{self.cfg.printer.name}: {step.action} FAILED",
-                f"Spaghetti detected on '{name}' but the {step.action} command failed: {err}. Check the printer NOW.",
-                inc.jpeg,
-            )
-            ev.priority, ev.incident_id, ev.policy = 5, inc.id, inc.policy.name
-            self.notifier.send(ev, channels=None)
-            return
+            inc.action_errors += 1
+            if inc.action_errors == 1:
+                # Never let a failed pause/stop go quietly: every channel, max priority. Once per
+                # incident; retries follow every poll and the normal alert goes out if one succeeds.
+                name = self.job.job_name or inc.job_id
+                ev = self._event(
+                    "failure",
+                    f"{self.cfg.printer.name}: {step.action} FAILED",
+                    f"Spaghetti detected on '{name}' but the {step.action} command failed: {err}. "
+                    "Retrying every few seconds. Check the printer NOW.",
+                    inc.jpeg,
+                )
+                ev.priority, ev.incident_id, ev.policy = 5, inc.id, inc.policy.name
+                self.notifier.send(ev, channels=None)
+            else:
+                log.warning("Monitor: %s retry %d for incident %s failed: %s", step.action, inc.action_errors, inc.id, err)
+            return False
         self._notify_step(inc, step, now, taken)
+        return True
 
     def _do(self, action: str, job_id: int | None) -> tuple[str | None, str | None]:
         if job_id is None:
@@ -538,9 +560,12 @@ class Monitor:
             inc.next_idx = idx + 1  # skip any reminders before it
             last = self._last_status
             status = PrinterStatus(last.state if last else "PRINTING", inc.job_id, None, None, None, None, {})
-            self._run_step(inc, step, status, now)
+            if not self._run_step(inc, step, status, now):
+                inc.next_idx = idx
+                inc.retry_idx = idx  # the loop retries it on the next poll, not at its scheduled time
+                return f"failed: {step.action} command failed; retrying"
             self._maybe_finish(inc)
-            return inc.acted or f"{step.action} failed"
+            return inc.acted or f"{step.action} skipped (printer is {status.state})"
         if cmd == "stop":
             taken, err = self._do("stop", inc.job_id)
             if err:

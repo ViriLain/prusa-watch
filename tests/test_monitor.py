@@ -512,3 +512,63 @@ def test_pause_in_flight_is_not_mistaken_for_a_resume(rig):
     assert mon.job.action_taken == "paused"
     assert mon.handle_reply("resume", inc.id) == "resumed"
     assert printer.state == "PRINTING"
+
+
+def test_failed_pause_is_retried_until_it_works(rig):
+    """A failed pause must not be treated as done: the incident stays open, the step is
+    retried every poll, the loud alert goes out once, and the normal PAUSED alert follows."""
+    mon, printer, grabber, clock, sent, cfg = rig
+    printer.fail_pause = True
+    inc = _spaghetti_until_incident(mon, printer, grabber, clock, 5)  # pause_now policy
+    assert printer.calls.count(("pause", 5)) == 1
+    assert mon.incident is inc and inc.acted is None and inc.next_idx == 0
+
+    advance(mon, clock, 3, step=5.0)  # still failing: retried each poll, incident stays open
+    assert printer.calls.count(("pause", 5)) == 4
+    assert mon.incident is inc and inc.action_errors == 4
+    failed = [r for r in sent if "pause FAILED" in r.headers.get("Title", "")]
+    assert len(failed) == 1, "the FAILED alert should go out once, not every retry"
+
+    printer.fail_pause = False
+    advance(mon, clock, 1, step=5.0)
+    assert printer.state == "PAUSED" and inc.acted == "paused" and mon.job.action_taken == "paused"
+    assert mon.incident is inc  # paused incidents stay open for Resume / False alarm
+    assert any("print PAUSED" in r.headers.get("Title", "") for r in sent)
+    assert mon.job.rearm_at == 0.0, "a failed attempt must not snooze detection"
+
+
+def test_act_reply_reports_failed_pause_and_keeps_retrying(rig):
+    mon, printer, grabber, clock, sent, cfg = rig
+    _arm(mon, cfg)
+    inc = _spaghetti_until_incident(mon, printer, grabber, clock, 12)
+    printer.fail_pause = True
+    result = mon.handle_reply("act", inc.id)
+    assert result.startswith("failed:")
+    assert mon.incident is inc and inc.acted is None
+    printer.fail_pause = False
+    advance(mon, clock, 1, step=5.0)  # the loop retries the pending pause on the next poll
+    assert printer.state == "PAUSED" and inc.acted == "paused"
+
+
+def test_pause_at_printer_then_resume_gets_grace(rig):
+    mon, printer, grabber, clock, sent, cfg = rig
+    _arm(mon, cfg)
+    _spaghetti_until_incident(mon, printer, grabber, clock, 35)
+    printer.state = "PAUSED"  # you paused it at the printer
+    advance(mon, clock, 1)
+    assert mon.incident is None and mon.job.printer_handled
+
+    advance(mon, clock, 3)  # still paused, time passes
+    # The detector would fire again straight away (as in test_resume_after_ai_pause_rearms_after_grace,
+    # crank sensitivity so the mess still in view reads as a failure despite the absorbed baseline).
+    cfg.decision.sensitivity = 3.0
+    printer.state = "PRINTING"  # resumed at the printer; the spaghetti is still in view
+    advance(mon, clock, 1)
+    t_resume = clock.t
+    assert not mon.job.printer_handled
+    assert mon.job.rearm_at == t_resume + cfg.decision.resume_grace_s
+    advance(mon, clock, int(cfg.decision.resume_grace_s // 10) - 1)
+    assert mon.incident is None, "no new incident during the resume grace"
+    advance(mon, clock, 2)
+    assert mon.incident is not None, "re-arms after the grace"
+    assert printer.calls == []
