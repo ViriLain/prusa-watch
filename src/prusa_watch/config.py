@@ -1,7 +1,16 @@
 """Configuration loading.
 
-YAML file with ``${ENV_VAR}`` expansion in string values, so secrets can live in
-``.env`` / the environment instead of the config file.
+Layers, lowest to highest precedence:
+  1. Built-in defaults (the dataclass defaults below; escalation.BUILTIN)
+  2. Your config.yaml: only the keys you want to change. `${ENV_VAR}` and
+     `${ENV_VAR:-default}` are expanded inside it.
+  3. Environment overrides: PRUSA_WATCH__<SECTION>__<KEY>=value, e.g.
+       PRUSA_WATCH__DECISION__SENSITIVITY=1.25
+       PRUSA_WATCH__ESCALATION__DEFAULT_POLICY=watch_only
+     Values are parsed as YAML (numbers, true/false, [lists]).
+
+`prusa-watch config` prints the effective result; config.reference.yaml lists
+every setting with its default.
 """
 
 from __future__ import annotations
@@ -285,12 +294,69 @@ def _coerce(current: Any, value: Any, key: str = "") -> Any:
     return value
 
 
-def load_config(path: str | os.PathLike | None) -> Config:
+ENV_PREFIX = "PRUSA_WATCH__"
+
+
+def apply_env_overrides(data: dict, environ: dict | None = None) -> dict:
+    """PRUSA_WATCH__A__B__C=value  ->  data["a"]["b"]["c"] = yaml(value)."""
+    environ = os.environ if environ is None else environ
+    for name in sorted(environ):
+        if not name.startswith(ENV_PREFIX):
+            continue
+        path = [p.lower() for p in name[len(ENV_PREFIX):].split("__") if p]
+        if not path:
+            continue
+        raw = environ[name]
+        try:
+            value = yaml.safe_load(raw) if raw.strip() else ""
+        except yaml.YAMLError:
+            value = raw
+        node = data
+        for key in path[:-1]:
+            if not isinstance(node.get(key), dict):
+                node[key] = {}
+            node = node[key]
+        node[path[-1]] = value
+    return data
+
+
+def load_config(path: str | os.PathLike | None, environ: dict | None = None) -> Config:
     data: dict = {}
     if path and Path(path).exists():
         with open(path, encoding="utf-8") as fh:
             data = yaml.safe_load(fh) or {}
     elif path:
         raise FileNotFoundError(f"Config file not found: {path}")
-    cfg = _build(Config, _expand(data))
-    return cfg
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: top level must be a mapping")
+    data = apply_env_overrides(_expand(data), environ)
+    return _build(Config, data)
+
+
+_SECRET_KEYS = {"password", "token", "webhook_url", "topic", "reply_topic"}
+
+
+def effective_config(cfg: Config, redact: bool = True) -> dict:
+    """Fully-resolved settings (defaults + file + env) as plain data, for `prusa-watch config`."""
+    from dataclasses import asdict
+
+    from .escalation import merge_escalation
+
+    d = asdict(cfg)
+    d["escalation"] = merge_escalation(cfg.escalation)
+    if redact:
+
+        def scrub(node, parent=""):
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    secret = k in _SECRET_KEYS or (parent == "webhook" and k == "url")
+                    if secret and isinstance(v, str) and v:
+                        node[k] = "***"
+                    else:
+                        scrub(v, k)
+            elif isinstance(node, list):
+                for v in node:
+                    scrub(v, parent)
+
+        scrub(d)
+    return d

@@ -5,26 +5,18 @@ failure is detected (an *incident*). Each step can notify (which channels, what
 priority, which buttons, what text) and/or act on the printer (pause / stop).
 Schedules pick which policy applies by time of day.
 
+Sensible defaults are built in (BUILTIN below): ask first and pause after 2 min
+during the day, pause silently at night (22:00-07:00). Your config only needs
+the parts you want to change, e.g.
+
     escalation:
-      default_policy: ask_first
-      snooze_s: 30m                # "Keep printing" / notify-only: no new incident for this long (0 = rest of print)
+      default_policy: watch_only          # first few prints: never touch the printer
       policies:
-        ask_first:
+        ask_first:                        # replaces just this built-in policy
           steps:
-            - at: 0
-              notify: [ntfy]
-              priority: 5
-              buttons: [keep, act, stop]
-            - at: 2m
-              action: pause
-              notify: [ntfy, discord, webhook]
-            - at: 32m              # still paused and nobody answered -> cancel
-              action: stop
-        night:
-          steps:
-            - {at: 0, action: pause, notify: [ntfy], priority: 2}
-      schedules:
-        - {name: night, start: "22:00", end: "07:00", policy: night}
+            - {at: 0, buttons: [keep, act, stop]}
+            - {at: 5m, action: pause}
+      schedules: []                       # no night mode
 
 An incident ends when you answer (keep / act / stop / resume / mute), when you
 handle it at the printer (pause/resume/stop there), when the job ends, or when
@@ -97,10 +89,64 @@ class EscalationConfig:
     snooze_s: float = 1800.0
 
 
-DEFAULT_RAW = {
-    "default_policy": "pause",
-    "policies": {"pause": {"steps": [{"at": 0, "action": "pause"}]}},
+# Built-in defaults. Your `escalation:` section is merged on top of this:
+#   - policies merge BY NAME: define `ask_first` to replace that one policy, or add new names
+#   - `schedules`, if you set it, replaces the list ([] turns the night schedule off)
+#   - `default_policy` / `snooze_s` override
+# Deliberately non-destructive: nothing here ever cancels a print. Add a `stop`
+# step yourself if you want that (see config.reference.yaml).
+BUILTIN = {
+    "default_policy": "ask_first",
+    "snooze_s": "30m",
+    "policies": {
+        # Ask first, remind once, pause after 2 min of silence.
+        "ask_first": {
+            "steps": [
+                {"at": 0, "priority": 5, "buttons": ["keep", "act", "stop"]},
+                {
+                    "at": "1m",
+                    "priority": 5,
+                    "title": "{printer}: still failing, {next_action} in {next_action_in}",
+                    "attach_image": False,
+                },
+                {"at": "2m", "action": "pause", "priority": 5},
+            ]
+        },
+        # Pause immediately, loud.
+        "pause_now": {"steps": [{"at": 0, "action": "pause", "priority": 5}]},
+        # Pause immediately, silent notification (you'll see it in the morning).
+        "night": {"steps": [{"at": 0, "action": "pause", "priority": 2}]},
+        # Never touch the printer; just tell me.
+        "watch_only": {"steps": [{"at": 0, "priority": 4, "buttons": ["stop", "dashboard"]}]},
+    },
+    "schedules": [{"name": "night", "start": "22:00", "end": "07:00", "policy": "night"}],
 }
+_TOP_KEYS = {"default_policy", "policies", "schedules", "snooze_s"}
+
+
+def merge_escalation(user: dict | None) -> dict:
+    """Built-in escalation with the user's section layered on top (see BUILTIN)."""
+    import copy
+
+    user = user or {}
+    if not isinstance(user, dict):
+        raise EscalationError("escalation must be a mapping")
+    unknown = set(user) - _TOP_KEYS
+    if unknown:
+        raise EscalationError(f"escalation: unknown keys {sorted(unknown)}")
+    merged = copy.deepcopy(BUILTIN)
+    for key in ("default_policy", "snooze_s", "schedules"):
+        if key in user:
+            merged[key] = copy.deepcopy(user[key]) if user[key] is not None else ([] if key == "schedules" else merged[key])
+    pols = user.get("policies") or {}
+    if not isinstance(pols, dict):
+        raise EscalationError("escalation.policies must be a mapping of name -> {steps: [...]}")
+    for name, body in pols.items():
+        if body is None:  # `name: null` removes a built-in policy
+            merged["policies"].pop(str(name), None)
+        else:
+            merged["policies"][str(name)] = copy.deepcopy(body)
+    return merged
 
 
 def _check_template(t, where: str) -> str | None:
@@ -169,11 +215,12 @@ def _parse_step(raw, where: str) -> Step:
     )
 
 
-def parse_escalation(raw: dict | None) -> EscalationConfig:
-    raw = raw or DEFAULT_RAW
+def parse_escalation(user: dict | None, builtin: bool = True) -> EscalationConfig:
+    """Parse the user's escalation section merged over BUILTIN (builtin=False: parse as-is)."""
+    raw = merge_escalation(user) if builtin else (user or {})
     if not isinstance(raw, dict):
         raise EscalationError("escalation must be a mapping")
-    unknown = set(raw) - {"default_policy", "policies", "schedules", "snooze_s"}
+    unknown = set(raw) - _TOP_KEYS
     if unknown:
         raise EscalationError(f"escalation: unknown keys {sorted(unknown)}")
     pols_raw = raw.get("policies") or {}

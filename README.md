@@ -55,8 +55,9 @@ Simulated time to action (10 s frames, default sensitivity, established baseline
 ### 2. Configure
 
 ```bash
-cp config.example.yaml config.yaml
-cp .env.example .env        # PRUSALINK_PASSWORD, NTFY_TOPIC, WEB_TOKEN, PUBLIC_URL
+cp config.example.yaml config.yaml   # ~10 lines: printer IP, camera URL, timezone
+cp .env.example .env                 # PRUSALINK_PASSWORD, NTFY_TOPIC, NTFY_REPLY_TOPIC, WEB_TOKEN, PUBLIC_URL
+prusa-watch config                   # see the effective settings
 ```
 
 ### 3a. Run with Docker (recommended, on an always-on box)
@@ -90,32 +91,39 @@ prusa-watch run        # dashboard on http://localhost:8484
 
 ## Configuration
 
-Everything is set in `config.yaml`. [`config.example.yaml`](config.example.yaml) lists **every** setting with its default; a test fails if a new setting isn't documented there.
+Sensible defaults are built in, so your `config.yaml` only lists what's different. The starter [`config.example.yaml`](config.example.yaml) is about 10 lines: printer IP, camera URL, ntfy topic and timezone.
 
-- Any `*_s` setting, and every escalation `at:`, accepts seconds or a duration: `90`, `"90s"`, `"2m"`, `"1h30m"`.
-- Unknown keys are rejected at startup. So are keys from older versions, and the error names where each one moved (for example, `decision.action` → `escalation.policies.<name>.steps[].action`).
-- `prusa-watch check` prints each policy's steps and which policy is active right now.
+| Layer (low → high) | Where | Example |
+|---|---|---|
+| Built-in defaults | [`config.reference.yaml`](config.reference.yaml) shows every setting and its default | `decision.sensitivity: 1.0` |
+| Your file | `config.yaml`, only your changes; `${VAR}` / `${VAR:-default}` expand from `.env` | `decision: {sensitivity: 1.25}` |
+| Environment | `PRUSA_WATCH__<SECTION>__<KEY>=value`, parsed as YAML | `PRUSA_WATCH__ESCALATION__DEFAULT_POLICY=watch_only` |
+
+- **`prusa-watch config`** prints the effective result (defaults + file + env) with secrets masked. `prusa-watch config --defaults` prints the built-ins.
+- **Escalation merges by policy name.** Define `ask_first:` to replace just that policy, and the other built-ins stay. `schedules:` replaces the whole list (`[]` turns night mode off). `name: null` removes a built-in policy. Defining a new policy doesn't make it active; set `default_policy` or schedule it.
+- **Durations:** any `*_s` setting, and every escalation `at:`, accepts seconds or a duration: `90`, `"90s"`, `"2m"`, `"1h30m"`.
+- **Strict keys:** misspelled keys are rejected at startup, including in env overrides. So are keys from older versions, and the error names where each one moved.
+- **The reference can't go stale:** tests fail if `config.reference.yaml` stops matching the built-in defaults or misses a setting.
+
+**Built-in behavior when you configure nothing else:**
+- **During the day** (`ask_first`): ask with *Keep printing / Pause now / Cancel* buttons, remind at 1 min, pause at 2 min.
+- **22:00–07:00** (`night`): pause immediately with a silent notification.
+- **Never** cancel a print on its own. That's opt-in (see below).
+- Also built in: `pause_now` and `watch_only`.
 
 ## Escalation policies
 
-Detection (`decision:`) decides *whether* a print is failing. Escalation (`escalation:`) decides *what happens next*. A failure verdict opens an **incident**, and the active **policy** runs its timed **steps**:
+Detection (`decision:`) decides *whether* a print is failing. Escalation (`escalation:`) decides *what happens next*. A failure verdict opens an **incident**, and the active **policy** runs its timed **steps**. Example override: a longer window, and give up on a print left paused for 2 h:
 
 ```yaml
 escalation:
-  default_policy: ask_first
-  snooze_s: 30m                  # after "Keep printing" (or a notify-only policy): no new incident for this long
   policies:
-    ask_first:
+    ask_first:                   # replaces the built-in ask_first; night/pause_now/watch_only stay
       steps:
-        - {at: 0,   notify: [ntfy, discord, webhook], priority: 5, buttons: [keep, act, stop]}
-        - {at: 1m,  notify: [ntfy], title: "{printer}: still failing, {next_action} in {next_action_in}"}
-        - {at: 2m,  action: pause}
-        - {at: 2h,  action: stop, notify: [ntfy, discord], priority: 4}   # nobody answered for 2 h
-    night:
-      steps:
-        - {at: 0, action: pause, notify: [ntfy], priority: 2}             # silent notification
-  schedules:
-    - {name: night, start: "22:00", end: "07:00", policy: night}
+        - {at: 0,   notify: [ntfy, discord, webhook], buttons: [keep, act, stop]}
+        - {at: 3m,  notify: [ntfy], title: "{printer}: still failing, {next_action} in {next_action_in}"}
+        - {at: 5m,  action: pause}
+        - {at: 2h5m, action: stop, notify: [ntfy, discord], priority: 4}
 ```
 
 | Step key | Meaning |

@@ -1,172 +1,41 @@
-# prusa-watch configuration. Copy to config.yaml and edit.
+# prusa-watch: your config. Copy to config.yaml.
 #
-# Every setting prusa-watch has is listed here, with its default value.
-# - ${VAR} and ${VAR:-default} are expanded from the environment / .env file.
-# - Any setting ending in _s (and every escalation `at:`) accepts a plain number of
-#   seconds or a duration string: 90, "90s", "2m", "1h30m".
-# - Unknown or misspelled keys are rejected at startup, as are keys from older versions
-#   (the error says where they moved). `prusa-watch check` prints the resolved policies.
+# Only list what differs from the built-in defaults. Every setting and its default
+# is in config.reference.yaml. `prusa-watch config` shows the effective result.
+# Secrets come from .env via ${VAR}.
 
-# ───────────────────────────── printer ─────────────────────────────
 printer:
-  name: core-one                   # shown in notifications
-  host: 192.168.1.50               # printer IP (Settings > Network on the printer)
-  scheme: http
-  username: maker                  # always "maker" on Buddy firmware
-  password: ${PRUSALINK_PASSWORD}  # Settings > Network > PrusaLink > Password
-  auth: digest                     # digest | apikey (same secret sent as X-Api-Key)
-  poll_interval_s: 5               # how often printer state is polled (and escalation steps checked)
-  timeout_s: 5                     # PrusaLink request timeout
+  host: 192.168.1.50                    # printer IP
+  password: ${PRUSALINK_PASSWORD}       # Settings > Network > PrusaLink
 
-# ───────────────────────────── camera ─────────────────────────────
 camera:
-  # Enable RTSP for the Buddy3D in the Prusa app, then use its IP.
-  # Reserve the camera's IP in your router; a DHCP change will break this.
-  url: rtsp://192.168.1.51/live
-  transport: tcp                   # tcp | udp
-  roi: null                        # crop to the bed, normalized [x1, y1, x2, y2], e.g. [0.15, 0.10, 0.85, 0.95]
-  stale_after_s: 30                # frame older than this while printing = "camera offline"
-  reconnect_backoff_s: 5
-  open_timeout_s: 10
-  read_timeout_s: 10
+  url: rtsp://192.168.1.51/live         # enable RTSP for the Buddy3D in the Prusa app
 
-# ───────────────────────────── detector ─────────────────────────────
-detector:
-  model_path: models/model-weights.onnx
-  threshold: 0.08                  # per-box confidence floor (Obico default; don't raise it)
-  nms: 0.45
-  interval_s: 10                   # decision parameters are tuned for 10 s
-  use_gpu: false                   # CPU is plenty at 1 frame / 10 s
-  visualization_threshold: 0.2     # boxes drawn on the dashboard and in alerts
-
-# ───────────────────────────── decision ─────────────────────────────
-# *Whether* the print is failing. What happens next is in `escalation` below.
-decision:
-  sensitivity: 1.0                 # 0.5 = conservative ... 2.0 = trigger-happy
-  init_safe_frame_num: 30          # frames of grace at print start (30 x 10 s = 5 min)
-  resume_grace_s: 120              # after you resume an AI-paused print, no new incident for this long
-  baseline_prior_frames: 360       # fresh-install prior (see README); 0 = exact Obico behavior
-  # Obico's tuned internals; change only if you know why:
-  ewm_span: 12
-  rolling_win_short: 310
-  rolling_win_long: 7200
-  threshold_low: 0.38
-  threshold_high: 0.78
-  rolling_mean_short_multiple: 3.8
-  escalating_factor: 1.75          # how much stronger than a "warning" a "failure" must be
-
-# ───────────────────────────── escalation ─────────────────────────────
-# A failure verdict opens an *incident* and runs the active policy's steps.
-# Step keys:
-#   at:       time after detection (0, 90, "2m", ...); steps run in order
-#   action:   pause | stop | none. A pause only happens while printing; a stop also works on a paused print
-#   notify:   channels [ntfy, discord, webhook]; omit = all configured; [] or false = silent
-#   priority: ntfy 1 (min) .. 5 (max, breaks through Do Not Disturb on Android). Default 5
-#   buttons:  up to 3 of keep, act, stop, resume, mute, dashboard (omit = automatic:
-#             keep/act/stop before we act, resume/mute/stop after a pause)
-#   title / message: templates; fields {printer} {job} {score} {policy} {schedule}
-#             {next_action} {next_action_in} {elapsed} {action_taken}
-#   attach_image: true
-# Buttons:  keep = false alarm, keep printing (resumes if we already paused);
-#           act = do the next action step now; stop = cancel the print;
-#           resume = resume; mute = resume + no more alerts this print
-# An incident ends when you answer, when you handle it at the printer, when the job ends,
-# or when its steps run out (it stays open while paused by us so Resume keeps working).
-escalation:
-  default_policy: ask_first
-  snooze_s: 30m                    # after "keep" or a notify-only incident: no new incident for this long (0 = rest of print)
-
-  policies:
-    ask_first:                     # daytime: ask, remind, pause, then give up on the print
-      steps:
-        - at: 0
-          notify: [ntfy, discord, webhook]
-          priority: 5
-          buttons: [keep, act, stop]
-        - at: 1m
-          notify: [ntfy]
-          priority: 5
-          title: "{printer}: still failing, {next_action} in {next_action_in}"
-          attach_image: false
-        - at: 2m
-          action: pause
-          notify: [ntfy, discord, webhook]
-          priority: 5
-        - at: 2h                   # still paused 2 h later with no answer: cancel so the nozzle isn't parked hot
-          action: stop
-          notify: [ntfy, discord]
-          priority: 4
-
-    night:                         # asleep: pause immediately, silent notification
-      steps:
-        - at: 0
-          action: pause
-          notify: [ntfy]
-          priority: 2
-
-    watch_only:                    # never touches the printer
-      steps:
-        - at: 0
-          priority: 4
-          buttons: [stop, dashboard]
-
-  # Pick a policy by time of day; first match wins; no match = default_policy.
-  # Windows can cross midnight; `days` (mon..sun, optional) is the day the window starts.
-  schedules:
-    - name: night
-      start: "22:00"
-      end: "07:00"
-      policy: night
-    # - name: work
-    #   days: [mon, tue, wed, thu, fri]
-    #   start: "09:00"
-    #   end: "17:00"
-    #   policy: watch_only
-
-# ───────────────────────────── notify ─────────────────────────────
 notify:
-  timeout_s: 15                    # per-request timeout for notification calls
-  # Non-escalation notifications: enabled, channels (null = all configured), ntfy priority, cooldown
-  warning:                         # "possible failure" heads-up, below the failure threshold
-    enabled: true
-    channels: null
-    priority: 4
-    cooldown_s: 5m
-  camera:                          # camera went offline / came back while printing
-    enabled: true
-    channels: null
-    priority: 3
-    cooldown_s: 0                  # e.g. 10m if a flaky camera spams you
-  info:                            # confirmations ("keeping the print running")
-    enabled: true
-    channels: [ntfy]
-    priority: 3
-    cooldown_s: 0
-
   ntfy:
-    url: ${NTFY_URL:-https://ntfy.sh}
-    topic: ${NTFY_TOPIC:-}         # alerts; use something unguessable on ntfy.sh
-    token: ${NTFY_TOKEN:-}         # bearer token for protected / self-hosted topics
-    # Buttons post replies here, and prusa-watch subscribes outbound, so the buttons work
-    # away from home. Use a different long random name than `topic`.
-    reply_topic: ${NTFY_REPLY_TOPIC:-}
-    reply_reconnect_s: 5
-  discord:
-    webhook_url: ${DISCORD_WEBHOOK_URL:-}
-  webhook:
-    url: ${WEBHOOK_URL:-}          # e.g. Home Assistant: http://ha.lan:8123/api/webhook/<id>
+    topic: ${NTFY_TOPIC}
+    reply_topic: ${NTFY_REPLY_TOPIC:-}  # makes the alert buttons work away from home
 
-# ───────────────────────────── web ─────────────────────────────
 web:
-  enabled: true
-  host: 0.0.0.0
-  port: 8484
-  public_url: ${PUBLIC_URL:-}      # e.g. http://192.168.1.10:8484 (links, and button fallback without reply_topic)
-  token: ${WEB_TOKEN:-}            # required for pause/resume/stop/incident endpoints when set
-  history_s: 2h                    # score history kept for the dashboard chart
+  public_url: ${PUBLIC_URL:-}
+  token: ${WEB_TOKEN:-}
 
-# ───────────────────────────── misc ─────────────────────────────
-state_dir: data
-timezone: ${TZ:-}                  # IANA zone for schedules, e.g. America/New_York (empty = system time)
-save_failure_frames: true          # annotated frame saved to state_dir/failures on every incident
-log_level: INFO
+timezone: America/New_York              # for the built-in night schedule (22:00-07:00: pause silently)
+
+# ── Common overrides (uncomment what you need) ─────────────────────────────
+#
+# camera:
+#   roi: [0.15, 0.10, 0.85, 0.95]       # crop to the bed: biggest accuracy win
+#
+# decision:
+#   sensitivity: 1.25                   # pause on moderate spaghetti too
+#
+# escalation:
+#   default_policy: watch_only          # first few prints: notify only, never touch the printer
+#   policies:
+#     ask_first:                        # replace one built-in policy; the others stay
+#       steps:
+#         - {at: 0, buttons: [keep, act, stop]}
+#         - {at: 5m, action: pause}
+#         - {at: 2h, action: stop}      # give up on a print left paused with no answer
+#   schedules: []                       # no night mode

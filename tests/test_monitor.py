@@ -84,6 +84,8 @@ def rig(fake_model, tmp_path):
     cfg.notify.ntfy.url = "https://ntfy.example"
     cfg.web.public_url = "http://watch.lan:8484"
     cfg.web.token = "tok"
+    # Most tests exercise the simplest policy; escalation tests below override this.
+    cfg.escalation = {"default_policy": "pause_now", "schedules": []}
 
     sent = []
 
@@ -210,7 +212,7 @@ def test_new_job_resets_state_and_mute(rig):
 
 def test_notify_only_mode_does_not_touch_printer(rig):
     mon, printer, grabber, clock, sent, cfg = rig
-    cfg.escalation = {"policies": {"watch": {"steps": [{"at": 0}]}}}
+    cfg.escalation = {"default_policy": "watch", "policies": {"watch": {"steps": [{"at": 0}]}}}
     mon.reload_escalation()
     printer.state, printer.job_id = "PRINTING", 3
     advance(mon, clock, 60)
@@ -223,7 +225,7 @@ def test_notify_only_mode_does_not_touch_printer(rig):
 
 def test_stop_mode(rig):
     mon, printer, grabber, clock, sent, cfg = rig
-    cfg.escalation = {"policies": {"kill": {"steps": [{"at": 0, "action": "stop"}]}}}
+    cfg.escalation = {"default_policy": "kill", "policies": {"kill": {"steps": [{"at": 0, "action": "stop"}]}}}
     mon.reload_escalation()
     printer.state, printer.job_id = "PRINTING", 4
     advance(mon, clock, 60)
@@ -454,7 +456,7 @@ def test_notify_only_policy_cools_down(rig):
 
 def test_silent_step_and_dashboard_fallback_links(rig):
     mon, printer, grabber, clock, sent, cfg = rig
-    esc = {"policies": {"p": {"steps": [{"at": 0, "notify": []}, {"at": 30, "buttons": ["keep", "act", "dashboard"]}, {"at": 60, "action": "pause", "notify": False}]}}}
+    esc = {"default_policy": "p", "policies": {"p": {"steps": [{"at": 0, "notify": []}, {"at": 30, "buttons": ["keep", "act", "dashboard"]}, {"at": 60, "action": "pause", "notify": False}]}}}
     _arm(mon, cfg, esc, reply_topic="", webhook=False)
     inc = _spaghetti_until_incident(mon, printer, grabber, clock, 38)
     assert _ntfy(sent) == [] or all("hourglass" not in r.headers.get("Tags", "") for r in _ntfy(sent))
