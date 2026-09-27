@@ -469,3 +469,46 @@ def test_silent_step_and_dashboard_fallback_links(rig):
     advance(mon, clock, 4)
     assert printer.calls == [("pause", 38)]
     assert len(sent) == n  # pause step was silent
+
+
+def test_pause_in_flight_is_not_mistaken_for_a_resume(rig):
+    """PrusaLink can still report PRINTING for a poll or two after the pause command
+    is accepted (firmware finishing the current move / parking). That must not be
+    read as "resumed at the printer", which would close the incident and kill the
+    Resume / False alarm buttons."""
+    mon, printer, grabber, clock, sent, _ = rig
+    printer.state, printer.job_id = "PRINTING", 7
+    advance(mon, clock, 60)
+
+    lag = {"polls": 0}
+    real_pause, real_status = printer.pause, printer.status
+
+    def slow_pause(job_id):
+        real_pause(job_id)
+        printer.state = "PRINTING"  # command accepted, not paused yet
+        lag["polls"] = 2
+
+    def status():
+        if lag["polls"]:
+            lag["polls"] -= 1
+            if not lag["polls"]:
+                printer.state = "PAUSED"
+        return real_status()
+
+    printer.pause, printer.status = slow_pause, status
+    grabber.image = solid(255)
+    for _ in range(40):
+        clock.t += 10.0
+        mon.tick()
+        if ("pause", 7) in printer.calls:
+            break
+    assert ("pause", 7) in printer.calls
+    inc = mon.incident
+    assert inc is not None and inc.acted == "paused"
+
+    advance(mon, clock, 3)  # PRINTING (in flight), then PAUSED
+    assert printer.state == "PAUSED"
+    assert mon.incident is inc, "incident closed by a phantom resume"
+    assert mon.job.action_taken == "paused"
+    assert mon.handle_reply("resume", inc.id) == "resumed"
+    assert printer.state == "PRINTING"

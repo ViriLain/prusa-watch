@@ -7,7 +7,7 @@ import secrets
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import cv2
@@ -179,7 +179,10 @@ class Monitor:
         if status is None:
             return
         self._handle_job_transitions(status)
-        self._last_status = status
+        # Keep what the printer actually reported. _run_step marks `status` PAUSED/STOPPED
+        # for the rest of this tick; if that leaked into _last_status, a pause still in
+        # flight (next poll reads PRINTING) would look like a resume at the printer.
+        self._last_status = replace(status)
 
         now = self.clock()
         self._process_incident(status, now)
