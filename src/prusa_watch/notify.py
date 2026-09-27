@@ -30,6 +30,11 @@ class Event:
     score: float | None = None
     action_taken: str | None = None  # "paused" | "stopped" | None
     image_jpeg: bytes | None = None
+    # Veto window: set on kind == "pending"
+    pending_id: str | None = None
+    pending_action: str | None = None  # what happens at the deadline: "pause" | "stop"
+    deadline_ts: float | None = None
+    quiet: bool = False  # low priority / no sound (e.g. night schedule)
     ts: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def to_json(self) -> dict:
@@ -90,14 +95,25 @@ class Notifier:
     def _ntfy(self, e: Event) -> None:
         c = self.cfg.ntfy
         url = f"{c.url.rstrip('/')}/{c.topic}"
-        prio = {"failure": c.priority_failure, "warning": c.priority_warning, "camera_down": 3}.get(e.kind, 3)
-        tags = {"failure": "rotating_light,printer", "warning": "warning,printer", "camera_down": "no_entry_sign,camera"}.get(
-            e.kind, "printer"
-        )
+        prio = {"failure": c.priority_failure, "pending": 5, "warning": c.priority_warning, "camera_down": 3}.get(e.kind, 3)
+        if e.quiet:
+            prio = min(prio, 2)  # delivered silently; you'll see it in the morning
+        tags = {
+            "failure": "rotating_light,printer",
+            "pending": "hourglass_flowing_sand,printer",
+            "warning": "warning,printer",
+            "camera_down": "no_entry_sign,camera",
+        }.get(e.kind, "printer")
         headers = {"Title": _ascii(e.title), "Priority": str(prio), "Tags": tags}
         if c.token:
             headers["Authorization"] = f"Bearer {c.token}"
-        if self.public_url:
+        if e.kind == "pending" and e.pending_id:
+            actions = self._pending_actions(e)
+            if actions:
+                headers["Actions"] = "; ".join(actions)
+            if self.public_url:
+                headers["Click"] = self.public_url
+        elif self.public_url:
             # ntfy allows max 3 actions; tapping the notification opens the dashboard.
             base, q = self.public_url, self._q
             sep = "&" if q else "?"
@@ -121,8 +137,35 @@ class Notifier:
             r = self._client.post(url, content=e.message.encode("utf-8"), headers=headers)
         r.raise_for_status()
 
+    def _pending_actions(self, e: Event) -> list[str]:
+        """Buttons for a veto-window alert.
+
+        Preferred: post a reply into ntfy.reply_topic (prusa-watch subscribes to
+        it outbound, so this works from anywhere). Fallback: call the dashboard
+        directly (LAN/VPN only).
+        """
+        c = self.cfg.ntfy
+        verb = "Pause now" if e.pending_action == "pause" else "Stop now"
+        if c.reply_topic:
+            url = f"{c.url.rstrip('/')}/{c.reply_topic}"
+            auth = f", headers.Authorization=Bearer {c.token}" if c.token else ""
+            return [
+                f"http, Keep printing, {url}, method=POST{auth}, body=veto {e.pending_id}, clear=true",
+                f"http, {verb}, {url}, method=POST{auth}, body=act {e.pending_id}, clear=true",
+                f"http, Cancel print, {url}, method=POST{auth}, body=stop {e.pending_id}, clear=true",
+            ]
+        if self.public_url:
+            base = self.public_url
+            q = f"{self._q}&" if self._q else "?"
+            return [
+                f"http, Keep printing, {base}/api/pending/veto{q}id={e.pending_id}, method=POST, clear=true",
+                f"http, {verb}, {base}/api/pending/act{q}id={e.pending_id}, method=POST, clear=true",
+                f"http, Cancel print, {base}/api/pending/stop{q}id={e.pending_id}, method=POST, clear=true",
+            ]
+        return []
+
     def _discord(self, e: Event) -> None:
-        color = {"failure": 0xE5484D, "warning": 0xF5A524, "camera_down": 0x8B8D98}.get(e.kind, 0x3E63DD)
+        color = {"failure": 0xE5484D, "pending": 0xE5484D, "warning": 0xF5A524, "camera_down": 0x8B8D98}.get(e.kind, 0x3E63DD)
         embed = {"title": e.title, "description": e.message, "color": color, "timestamp": e.ts}
         if e.image_jpeg:
             embed["image"] = {"url": "attachment://frame.jpg"}
@@ -141,5 +184,9 @@ class Notifier:
         body = e.to_json()
         if self.public_url and e.image_jpeg:
             body["image_url"] = f"{self.public_url}/frame.jpg"
+        if e.kind == "pending" and e.pending_id and self.public_url:
+            q = f"{self._q}&" if self._q else "?"
+            body["veto_url"] = f"{self.public_url}/api/pending/veto{q}id={e.pending_id}"
+            body["act_url"] = f"{self.public_url}/api/pending/act{q}id={e.pending_id}"
         r = self._client.post(self.cfg.webhook.url, json=body)
         r.raise_for_status()

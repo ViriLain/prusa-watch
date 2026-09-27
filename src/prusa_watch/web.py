@@ -94,6 +94,19 @@ def create_app(monitor: Monitor) -> FastAPI:
     def api_unmute(request: Request):
         return control(lambda: monitor.set_muted(False) or "unmuted", request)
 
+    @app.post("/api/pending/{cmd}")
+    def api_pending(cmd: str, request: Request):
+        if cmd not in ("veto", "act", "stop"):
+            raise HTTPException(status_code=404, detail="unknown command")
+        require_token(request)
+        pid = request.query_params.get("id")
+        if not pid:  # dashboard buttons act on whatever is pending right now
+            pid = monitor.pending.id if monitor.pending else ""
+        result = monitor.handle_reply(cmd, pid)
+        if result.startswith("ignored"):
+            raise HTTPException(status_code=409, detail=result)
+        return {"ok": True, "result": result}
+
     @app.post("/api/test")
     def api_test(request: Request):
         require_token(request)
@@ -129,6 +142,9 @@ def create_app(monitor: Monitor) -> FastAPI:
             f"prusa_watch_frame_age_seconds{{{lbl}}} {s.frame_age_s if s.frame_age_s is not None else 'NaN'}",
             "# TYPE prusa_watch_printer_reachable gauge",
             f"prusa_watch_printer_reachable{{{lbl}}} {int(s.printer_reachable)}",
+            "# HELP prusa_watch_pending_seconds_left Seconds until a pending pause/stop fires (0 = none pending)",
+            "# TYPE prusa_watch_pending_seconds_left gauge",
+            f"prusa_watch_pending_seconds_left{{{lbl}}} {s.pending['seconds_left'] if s.pending else 0:.0f}",
             "# TYPE prusa_watch_printer_state gauge",
         ]
         lines += [f'prusa_watch_printer_state{{{lbl},state="{st}"}} {int(s.printer_state == st)}' for st in states]
@@ -139,6 +155,8 @@ def create_app(monitor: Monitor) -> FastAPI:
             ("pauses", "Prints paused by prusa-watch"),
             ("stops", "Prints stopped by prusa-watch"),
             ("printer_errors", "PrusaLink request failures"),
+            ("vetoes", "Pending actions cancelled by the user (Keep printing)"),
+            ("auto_actions", "Pending actions that fired because nobody responded"),
         ):
             lines += [
                 f"# HELP prusa_watch_{field_name}_total {help_text}",

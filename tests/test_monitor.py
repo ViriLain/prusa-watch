@@ -270,3 +270,139 @@ def test_detection_interval_respected(rig):
     printer.state, printer.job_id = "PRINTING", 12
     advance(mon, clock, 20, step=5.0)  # poll every 5 s, detect every 10 s
     assert 9 <= mon.counters.frames_analyzed <= 11
+
+
+# ---------------------------------------------------------------- veto window
+from prusa_watch.policy import PolicyResolver  # noqa: E402
+
+
+def _arm(mon, cfg, veto=120, reply_topic="reply-xyz", schedules=None, tz="UTC"):
+    cfg.decision.veto_window_s = veto
+    cfg.decision.schedules = schedules or []
+    cfg.notify.ntfy.reply_topic = reply_topic
+    cfg.timezone = tz
+    mon.policy = PolicyResolver(cfg.decision, tz)
+
+
+def _spaghetti_until_pending(mon, printer, grabber, clock, job):
+    printer.state, printer.job_id = "PRINTING", job
+    advance(mon, clock, 60)
+    grabber.image = solid(255)
+    for _ in range(40):
+        advance(mon, clock, 1)
+        if mon.pending:
+            return mon.pending
+    raise AssertionError("no pending action created")
+
+
+def _by_kind(sent, tag):
+    return [r for r in sent if tag in r.headers.get("Tags", "")]
+
+
+def test_veto_window_fires_after_silence(rig):
+    mon, printer, grabber, clock, sent, cfg = rig
+    _arm(mon, cfg, veto=120)
+    p = _spaghetti_until_pending(mon, printer, grabber, clock, 30)
+    assert printer.calls == []  # nothing yet: waiting for the human
+
+    (alert,) = _by_kind(sent, "hourglass")
+    assert alert.headers["Priority"] == "5"
+    assert "pausing in 2:00" in alert.headers["Title"]
+    acts = alert.headers["Actions"]
+    assert f"https://ntfy.example/reply-xyz, method=POST, body=veto {p.id}" in acts
+    assert f"body=act {p.id}" in acts and f"body=stop {p.id}" in acts
+    assert alert.content[:2] == b"\xff\xd8"
+
+    advance(mon, clock, 11)  # 110 s: still inside the window
+    assert printer.calls == [] and mon.snapshot().pending["seconds_left"] <= 10
+    advance(mon, clock, 2)
+    assert printer.calls == [("pause", 30)] and mon.pending is None
+    assert mon.counters.auto_actions == 1
+    fail = [r for r in sent if r.headers.get("Tags", "").startswith("rotating_light")]
+    assert "no response within 120 s" in fail[-1].headers["Message"]
+
+
+def test_keep_printing_snoozes_then_rearms(rig):
+    mon, printer, grabber, clock, sent, cfg = rig
+    _arm(mon, cfg, veto=120)
+    cfg.decision.veto_snooze_s = 600
+    p = _spaghetti_until_pending(mon, printer, grabber, clock, 31)
+    assert mon.handle_reply("veto", p.id).startswith("vetoed")
+    assert mon.counters.vetoes == 1
+    advance(mon, clock, 50)  # 500 s of continued "spaghetti" inside the snooze
+    assert printer.calls == [] and mon.pending is None
+    warnings_before = len(_by_kind(sent, "warning,printer"))
+    advance(mon, clock, 15)  # snooze over -> re-armed: warns again
+    assert len(_by_kind(sent, "warning,printer")) == warnings_before + 1
+    # Obico semantics: the per-print mean absorbed the mess while snoozed, so it
+    # only asks again if things get worse. Emulate "worse" with sensitivity.
+    cfg.decision.sensitivity = 3.0
+    advance(mon, clock, 5)
+    assert mon.pending is not None and mon.pending.id != p.id
+    assert printer.calls == []  # asks again rather than pausing straight away
+    assert len(_by_kind(sent, "hourglass")) == 2
+
+
+def test_veto_with_zero_snooze_mutes_print(rig):
+    mon, printer, grabber, clock, sent, cfg = rig
+    _arm(mon, cfg)
+    cfg.decision.veto_snooze_s = 0
+    p = _spaghetti_until_pending(mon, printer, grabber, clock, 32)
+    assert "muted" in mon.handle_reply("veto", p.id)
+    advance(mon, clock, 200)
+    assert printer.calls == [] and mon.pending is None
+
+
+def test_act_now_and_stop_and_bad_ids(rig):
+    mon, printer, grabber, clock, sent, cfg = rig
+    _arm(mon, cfg)
+    p = _spaghetti_until_pending(mon, printer, grabber, clock, 33)
+    assert mon.handle_reply("veto", "wrong-id").startswith("ignored")
+    assert mon.handle_reply("act", "wrong-id").startswith("ignored")
+    assert mon.pending is p
+    assert mon.handle_reply("act", p.id) == "paused"
+    assert printer.calls == [("pause", 33)]
+    assert mon.handle_reply("veto", p.id).startswith("ignored")  # one-time id
+
+    printer.resume(33)
+    printer.state, printer.job_id = "FINISHED", 33
+    advance(mon, clock, 2)
+    grabber.image = solid(0)
+    p2 = _spaghetti_until_pending(mon, printer, grabber, clock, 34)
+    assert mon.handle_reply("stop", p2.id) == "stopped"
+    assert ("stop", 34) in printer.calls
+
+
+def test_pending_cancelled_if_you_pause_at_the_printer(rig):
+    mon, printer, grabber, clock, sent, cfg = rig
+    _arm(mon, cfg)
+    _spaghetti_until_pending(mon, printer, grabber, clock, 35)
+    printer.state = "PAUSED"  # knob on the printer / Prusa app
+    advance(mon, clock, 1)
+    assert mon.pending is None
+    advance(mon, clock, 20)
+    assert printer.calls == []
+
+
+def test_night_schedule_pauses_immediately_and_quietly(rig):
+    mon, printer, grabber, clock, sent, cfg = rig
+    # rig clock starts at 1970-01-12 13:46 UTC
+    _arm(mon, cfg, veto=120, schedules=[{"name": "nap", "start": "13:00", "end": "16:00", "veto_window_s": 0, "quiet": True}])
+    printer.state, printer.job_id = "PRINTING", 36
+    advance(mon, clock, 60)
+    grabber.image = solid(255)
+    advance(mon, clock, 30)
+    assert printer.calls == [("pause", 36)]
+    assert _by_kind(sent, "hourglass") == []
+    fail = [r for r in sent if r.headers.get("Tags", "").startswith("rotating_light")]
+    assert fail[0].headers["Priority"] == "2" and "schedule 'nap'" in fail[0].headers["Message"]
+    assert mon.snapshot().policy["rule"] == "nap"
+
+
+def test_pending_without_reply_topic_uses_dashboard_links(rig):
+    mon, printer, grabber, clock, sent, cfg = rig
+    _arm(mon, cfg, reply_topic="")
+    mon.notifier.cfg.ntfy.reply_topic = ""
+    p = _spaghetti_until_pending(mon, printer, grabber, clock, 37)
+    (alert,) = _by_kind(sent, "hourglass")
+    assert f"http://watch.lan:8484/api/pending/veto?token=tok&id={p.id}" in alert.headers["Actions"]

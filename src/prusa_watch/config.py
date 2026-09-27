@@ -75,6 +75,22 @@ class DecisionConfig:
     # Only used when no saved state exists. Set 0 for exact Obico behavior.
     baseline_prior_frames: int = 360
 
+    # --- Veto window ---------------------------------------------------------
+    # On a failure verdict, wait this long before pausing/stopping and push an
+    # alert with "Keep printing" / "Pause now" / "Cancel print" buttons. No
+    # response = the action happens (fail-safe). 0 = act immediately.
+    veto_window_s: float = 0.0
+    # "Keep printing" disarms actions for this long (detection keeps running).
+    # 0 = for the rest of the print.
+    veto_snooze_s: float = 1800.0
+    # Time-of-day overrides, first match wins. Each item:
+    #   {name, start: "HH:MM", end: "HH:MM", days: [mon..sun] (optional),
+    #    action: pause|stop|notify (optional), veto_window_s (optional),
+    #    quiet: bool (optional; low-priority, silent notifications)}
+    # Windows may cross midnight (start > end); `days` refers to the day the
+    # window starts.
+    schedules: list = field(default_factory=list)
+
 
 @dataclass
 class NtfyConfig:
@@ -83,6 +99,11 @@ class NtfyConfig:
     token: str = ""  # optional bearer token for protected/self-hosted topics
     priority_warning: int = 4
     priority_failure: int = 5
+    # Topic prusa-watch SUBSCRIBES to for button replies (Keep printing / Pause
+    # now / Cancel). Buttons post to ntfy, prusa-watch reads them over an
+    # outbound connection -> works away from home with no port forwarding.
+    # Use a long random name (or an ACL-protected topic on self-hosted ntfy).
+    reply_topic: str = ""
 
 
 @dataclass
@@ -125,6 +146,7 @@ class Config:
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     web: WebConfig = field(default_factory=WebConfig)
     state_dir: str = "data"
+    timezone: str = ""  # IANA name for schedules, e.g. America/New_York; empty = system local time
     save_failure_frames: bool = True
     log_level: str = "INFO"
 
@@ -140,6 +162,18 @@ class Config:
             errors.append("camera.url is required (rtsp://<camera-ip>/live)")
         if self.decision.action not in ("pause", "stop", "notify"):
             errors.append("decision.action must be 'pause', 'stop' or 'notify'")
+        if self.decision.veto_window_s < 0 or self.decision.veto_snooze_s < 0:
+            errors.append("decision.veto_window_s / veto_snooze_s must be >= 0")
+        from .policy import ScheduleError, parse_schedules, resolve_tz
+
+        try:
+            parse_schedules(self.decision.schedules)
+        except ScheduleError as exc:
+            errors.append(str(exc))
+        try:
+            resolve_tz(self.timezone)
+        except ScheduleError as exc:
+            errors.append(str(exc))
         if self.camera.roi is not None:
             r = self.camera.roi
             if len(r) != 4 or not (0 <= r[0] < r[2] <= 1 and 0 <= r[1] < r[3] <= 1):

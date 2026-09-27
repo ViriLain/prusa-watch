@@ -45,6 +45,13 @@
   .side { display: flex; flex-direction: column; gap: 16px; }
   svg { width: 100%; height: 120px; display: block; }
   .msg { min-height: 1.4em; color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .pending { display: none; margin: 12px 20px 0; padding: 14px 16px; border-radius: 10px; border: 2px solid var(--fail);
+    background: color-mix(in srgb, var(--fail) 8%, var(--panel)); align-items: center; gap: 16px; flex-wrap: wrap; }
+  .pending .count { font-size: 32px; font-weight: 750; font-variant-numeric: tabular-nums; color: var(--fail); min-width: 3.2ch; }
+  .pending .txt { flex: 1 1 240px; } .pending .txt b { display: block; }
+  .pending .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .pending button.keep { background: var(--ink); color: var(--panel); border-color: var(--ink); font-weight: 600; }
+  @media (max-width: 900px) { .pending { margin: 12px 16px 0; } }
   .banner { display: none; margin: 0 20px; padding: 10px 14px; border-radius: 8px; background: color-mix(in srgb, var(--fail) 14%, transparent); color: var(--fail); font-weight: 600; }
 </style>
 </head>
@@ -56,6 +63,15 @@
   <span id="job" class="job"></span>
 </header>
 <div id="banner" class="banner"></div>
+<div id="pending" class="pending" role="alert">
+  <div class="count" id="p-count">2:00</div>
+  <div class="txt"><b id="p-title">Spaghetti detected: pausing soon</b><span id="p-sub">No response = pause.</span></div>
+  <div class="btns">
+    <button class="keep" id="p-veto">Keep printing</button>
+    <button id="p-act">Pause now</button>
+    <button class="danger" id="p-stop">Cancel print</button>
+  </div>
+</div>
 <main>
   <section class="card viewer">
     <div class="tabs">
@@ -82,6 +98,7 @@
         <dt>Inference</dt><dd id="inf">-</dd>
         <dt>Camera</dt><dd id="cam">-</dd>
         <dt>Mode</dt><dd id="mode">-</dd>
+        <dt>On failure</dt><dd id="policy">-</dd>
         <dt>Pauses / warnings</dt><dd id="cnt">-</dd>
       </dl>
     </section>
@@ -131,6 +148,12 @@ $("b-pause").onclick = () => call("/api/pause");
 $("b-resume").onclick = () => call("/api/resume");
 $("b-stop").onclick = () => call("/api/stop", "Stop (cancel) the current print?");
 $("b-test").onclick = () => call("/api/test");
+$("p-veto").onclick = () => call("/api/pending/veto");
+$("p-act").onclick = () => call("/api/pending/act");
+$("p-stop").onclick = () => call("/api/pending/stop", "Cancel the print?");
+const fmt = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+let deadline = null;
+setInterval(() => { if (deadline) $("p-count").textContent = fmt(Math.max(0, deadline - Date.now() / 1000)); }, 250);
 $("b-mute").onclick = () => call(last && last.job.muted ? "/api/unmute" : "/api/mute");
 
 function chart(hist) {
@@ -165,6 +188,17 @@ async function poll() {
     $("cam").textContent = s.camera_connected ? `live${s.frame_age_s != null ? ` (${s.frame_age_s.toFixed(1)} s)` : ""}` : "disconnected";
     $("mode").textContent = `${s.action_mode} · sens ${s.sensitivity}`;
     $("cnt").textContent = `${s.counters.pauses} / ${s.counters.warnings}`;
+    const pol = s.policy || {};
+    $("policy").textContent = pol.action ? (["pause", "stop"].includes(pol.action) && pol.veto_window_s > 0
+      ? `${pol.action} after ${fmt(pol.veto_window_s)} veto` : `${pol.action} immediately`) + (pol.rule ? ` (${pol.rule})` : "") + (pol.quiet ? " · quiet" : "") : "-";
+    const pe = s.pending;
+    $("pending").style.display = pe ? "flex" : "none";
+    if (pe) {
+      deadline = Date.now() / 1000 + pe.seconds_left;
+      $("p-title").textContent = `Spaghetti detected: ${pe.action === "stop" ? "stopping" : "pausing"} when the timer runs out`;
+      $("p-sub").textContent = `Score ${pe.score.toFixed(2)}${pe.rule ? ` · ${pe.rule} schedule` : ""}. Keep printing if it's a false alarm (snoozes alerts).`;
+      $("p-act").textContent = pe.action === "stop" ? "Stop now" : "Pause now";
+    } else deadline = null;
     $("b-mute").textContent = s.job.muted ? "Unmute this print" : "Mute this print";
     const active = s.job.job_id != null && ["PRINTING", "PAUSED", "ATTENTION"].includes(s.printer_state);
     $("b-pause").disabled = !active || s.printer_state !== "PRINTING";

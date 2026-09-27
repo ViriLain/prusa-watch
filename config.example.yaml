@@ -31,6 +31,24 @@ decision:
   init_safe_frame_num: 30        # grace frames at print start (30 x 10 s = 5 min)
   resume_grace_s: 120            # after you resume an AI pause
 
+  # Veto window: on a failure, push an alert with Keep printing / Pause now /
+  # Cancel buttons and wait this long. No response = action happens.
+  veto_window_s: 120             # 0 = act immediately
+  veto_snooze_s: 1800            # "Keep printing" disarms actions this long (0 = rest of print)
+
+  # Time-of-day overrides (first match wins). Times use `timezone` below.
+  schedules:
+    - name: night
+      start: "22:00"
+      end: "07:00"                # crosses midnight
+      veto_window_s: 0            # asleep: pause immediately...
+      quiet: true                 # ...with a silent notification
+    # - name: work
+    #   days: [mon, tue, wed, thu, fri]
+    #   start: "09:00"
+    #   end: "17:00"
+    #   veto_window_s: 300        # more time to pull up the camera
+
 notify:
   cooldown_s: 300
   notify_camera_down: true
@@ -38,6 +56,9 @@ notify:
     url: ${NTFY_URL:-https://ntfy.sh}
     topic: ${NTFY_TOPIC}         # pick something unguessable if using ntfy.sh
     token: ${NTFY_TOKEN:-}
+    # Button replies go here; prusa-watch subscribes outbound, so the buttons
+    # work away from home. Use a different long random name than `topic`.
+    reply_topic: ${NTFY_REPLY_TOPIC:-}
   discord:
     webhook_url: ${DISCORD_WEBHOOK_URL:-}
   webhook:
@@ -51,5 +72,6 @@ web:
   token: ${WEB_TOKEN:-}          # protects pause/resume/stop endpoints
 
 state_dir: data
+timezone: ${TZ:-}                # for schedules, e.g. America/New_York (empty = system time)
 save_failure_frames: true
 log_level: INFO

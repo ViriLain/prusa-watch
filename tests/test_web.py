@@ -38,3 +38,22 @@ def test_dashboard_state_frames_metrics_and_auth(rig):  # noqa: F811
     assert len(t["detections"]) == 2
     assert c.get("/test.jpg").content[:2] == b"\xff\xd8"
     assert c.get("/healthz").status_code == 200
+
+
+def test_pending_endpoints(rig):  # noqa: F811
+    from test_monitor import _arm, _spaghetti_until_pending
+
+    mon, printer, grabber, clock, sent, cfg = rig
+    c = TestClient(create_app(mon))
+    assert c.post("/api/pending/veto?token=tok").status_code == 409  # nothing pending
+    assert c.post("/api/pending/nuke?token=tok").status_code == 404
+    _arm(mon, cfg)
+    p = _spaghetti_until_pending(mon, printer, grabber, clock, 40)
+    s = c.get("/api/state").json()
+    assert s["pending"]["id"] == p.id and 0 < s["pending"]["seconds_left"] <= 120
+    assert s["policy"]["veto_window_s"] == 120
+    assert "prusa_watch_pending_seconds_left" in c.get("/metrics").text
+    assert c.post(f"/api/pending/veto?id={p.id}").status_code == 401  # token still required
+    r = c.post("/api/pending/veto?token=tok")  # dashboard: no id -> current pending
+    assert r.status_code == 200 and r.json()["result"].startswith("vetoed")
+    assert c.get("/api/state").json()["pending"] is None

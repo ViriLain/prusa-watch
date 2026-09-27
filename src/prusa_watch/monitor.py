@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import secrets
 import threading
 import time
 from collections import deque
@@ -17,6 +18,7 @@ from .config import Config
 from .decision import FailureDecider, Verdict
 from .detector import Detection, SpaghettiDetector, annotate
 from .notify import Event, Notifier
+from .policy import Policy, PolicyResolver
 from .prusalink import PrinterStatus, PrusaLink, PrusaLinkError
 
 log = logging.getLogger(__name__)
@@ -34,6 +36,33 @@ class JobContext:
 
 
 @dataclass
+class PendingAction:
+    """A failure verdict waiting out its veto window."""
+
+    id: str  # one-time id carried by the alert buttons
+    action: str  # "pause" | "stop" at the deadline
+    job_id: int | None
+    created_ts: float
+    deadline_ts: float
+    rule: str | None
+    quiet: bool
+    score: float
+    jpeg: bytes = b""
+
+    def public(self, now: float) -> dict:
+        return {
+            "id": self.id,
+            "action": self.action,
+            "job_id": self.job_id,
+            "deadline_ts": self.deadline_ts,
+            "seconds_left": max(0.0, self.deadline_ts - now),
+            "window_s": self.deadline_ts - self.created_ts,
+            "rule": self.rule,
+            "score": self.score,
+        }
+
+
+@dataclass
 class Counters:
     frames_analyzed: int = 0
     warnings: int = 0
@@ -41,6 +70,8 @@ class Counters:
     pauses: int = 0
     stops: int = 0
     printer_errors: int = 0
+    vetoes: int = 0
+    auto_actions: int = 0  # veto window expired without a response
 
 
 @dataclass
@@ -70,6 +101,8 @@ class Snapshot:
     last_detections: list = field(default_factory=list)
     last_analysis_ts: float | None = None
     progress: float | None = None
+    pending: dict | None = None
+    policy: dict = field(default_factory=dict)
 
 
 def _jpeg(img: np.ndarray, quality: int = 85) -> bytes:
@@ -104,6 +137,11 @@ class Monitor:
         self.detector = detector or SpaghettiDetector(cfg.detector.model_path, use_gpu=cfg.detector.use_gpu)
         self.notifier = notifier or Notifier(cfg.notify, public_url=cfg.web.public_url, control_token=cfg.web.token)
         self.decider = FailureDecider(cfg.decision, self.state_dir / "prediction_state.json")
+        self.policy = PolicyResolver(cfg.decision, cfg.timezone)
+        self.pending: PendingAction | None = None
+        self.replies = None  # NtfyReplyListener, started in start()
+        # Serializes the monitor loop with replies arriving from ntfy / the web UI.
+        self._ctl = threading.RLock()
 
         self.job = JobContext()
         self.counters = Counters()
@@ -121,12 +159,20 @@ class Monitor:
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
         self.grabber.start()
+        ntfy = self.cfg.notify.ntfy
+        if ntfy.reply_topic and self.replies is None:
+            from .replies import NtfyReplyListener
+
+            self.replies = NtfyReplyListener(ntfy, self.handle_reply)
+            self.replies.start()
         self._thread = threading.Thread(target=self._run, name="monitor", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
         self.grabber.stop()
+        if self.replies:
+            self.replies.stop()
         if self._thread:
             self._thread.join(timeout=10)
         self.decider.save()
@@ -143,14 +189,21 @@ class Monitor:
     # ------------------------------------------------------------------ core loop
     def tick(self) -> None:
         """One iteration. Public so tests can drive it deterministically."""
+        with self._ctl:
+            self._tick()
+
+    def _tick(self) -> None:
         status = self._poll_printer()
         if status is None:
             return
         self._handle_job_transitions(status)
         self._last_status = status
 
-        frame = self.grabber.latest()
         now = self.clock()
+        self._process_pending(status, now)
+        self._refresh_policy_snapshot(now)
+
+        frame = self.grabber.latest()
         frame_age = (now - frame.ts) if frame else None
         with self._lock:
             self._snap.camera_connected = self.grabber.connected
@@ -281,7 +334,7 @@ class Monitor:
 
         log.debug("Analyze: %d dets p=%.3f ewm=%.3f base=%.3f -> %s", len(detections), s.current_p, s.ewm_mean, s.rolling_mean_long, verdict.value)
 
-        if self.job.muted or self.job.action_taken or now < self.job.rearm_at:
+        if self.job.muted or self.job.action_taken or self.pending or now < self.job.rearm_at:
             return
         if verdict == Verdict.FAILURE:
             self._on_failure(status, jpeg, annotated)
@@ -309,8 +362,22 @@ class Monitor:
 
     def _on_failure(self, status: PrinterStatus, jpeg: bytes, annotated: np.ndarray) -> None:
         self.counters.failures += 1
-        action = self.cfg.decision.action
+        now = self.clock()
         job_id = status.job_id if status.job_id is not None else self.job.job_id
+        if self.cfg.save_failure_frames:
+            out = self.state_dir / "failures"
+            out.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(out / f"{int(now)}_job{job_id}.jpg"), annotated)
+
+        pol = self.policy.resolve(now)
+        if pol.uses_veto and job_id is not None:
+            self._start_pending(pol, job_id, jpeg, now)
+            return
+        why = f"schedule '{pol.rule}'" if pol.rule else None
+        self._execute(pol.action, job_id, jpeg, quiet=pol.quiet, why=why)
+
+    def _execute(self, action: str, job_id: int | None, jpeg: bytes, quiet: bool = False, why: str | None = None) -> str | None:
+        """Pause/stop/notify now and send the failure notification. Returns what was done."""
         taken = None
         err = None
         if action in ("pause", "stop") and job_id is not None:
@@ -329,19 +396,120 @@ class Monitor:
         # Mark handled even for notify-only so we don't spam every 10 s.
         self.job.action_taken = taken or "notified"
 
-        if self.cfg.save_failure_frames:
-            out = self.state_dir / "failures"
-            out.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(out / f"{int(self.clock())}_job{job_id}.jpg"), annotated)
-
+        name = self.job.job_name or job_id
+        score = self.decider.state.normalized_p
         if taken:
-            msg = f"Print '{self.job.job_name or job_id}' was {taken.upper()} - spaghetti detected (score {self.decider.state.normalized_p:.2f})."
+            msg = f"Print '{name}' was {taken.upper()} - spaghetti detected (score {score:.2f})."
         elif err:
-            msg = f"Spaghetti detected on '{self.job.job_name or job_id}' but the {action} command FAILED: {err}. Check the printer NOW."
+            msg = f"Spaghetti detected on '{name}' but the {action} command FAILED: {err}. Check the printer NOW."
+            quiet = False  # never silence a failed action
         else:
-            msg = f"Spaghetti detected on '{self.job.job_name or job_id}' (notify-only mode, printer still running)."
+            msg = f"Spaghetti detected on '{name}' (notify-only mode, printer still running)."
+        if why:
+            msg += f" ({why})"
         log.warning("Monitor: %s", msg)
-        self.notifier.send(self._event("failure", f"{self.cfg.printer.name}: print failure detected", msg, jpeg, taken))
+        ev = self._event("failure", f"{self.cfg.printer.name}: print failure detected", msg, jpeg, taken)
+        ev.quiet = quiet
+        self.notifier.send(ev)
+        return taken
+
+    # ------------------------------------------------------------------ veto window
+    def _start_pending(self, pol: Policy, job_id: int, jpeg: bytes, now: float) -> None:
+        p = PendingAction(
+            id=secrets.token_urlsafe(6),
+            action=pol.action,
+            job_id=job_id,
+            created_ts=now,
+            deadline_ts=now + pol.veto_window_s,
+            rule=pol.rule,
+            quiet=pol.quiet,
+            score=self.decider.state.normalized_p,
+            jpeg=jpeg,
+        )
+        self.pending = p
+        self._refresh_pending_snapshot(now)
+        mins, secs = divmod(int(pol.veto_window_s), 60)
+        verb = "Pausing" if p.action == "pause" else "Stopping"
+        log.warning("Monitor: failure on job %s - %s in %ds unless vetoed (id %s)", job_id, verb.lower(), pol.veto_window_s, p.id)
+        channel = (
+            "Tap Keep printing if it's a false alarm."
+            if (self.cfg.notify.ntfy.reply_topic or self.cfg.web.public_url)
+            else "Open the dashboard to keep printing."
+        )
+        ev = self._event(
+            "pending",
+            f"{self.cfg.printer.name}: {verb.lower()} in {mins}:{secs:02d} unless you respond",
+            f"Spaghetti detected on '{self.job.job_name or job_id}' (score {p.score:.2f}). {channel} "
+            f"No response = {p.action}.",
+            jpeg,
+        )
+        ev.pending_id, ev.pending_action, ev.deadline_ts, ev.quiet = p.id, p.action, p.deadline_ts, p.quiet
+        self.notifier.send(ev)
+
+    def _process_pending(self, status: PrinterStatus, now: float) -> None:
+        p = self.pending
+        if p is None:
+            return
+        if status.state != "PRINTING" or (status.job_id is not None and status.job_id != p.job_id):
+            log.info("Monitor: pending %s cancelled - printer is %s (handled at the printer?)", p.action, status.state)
+            self.pending = None
+            self._refresh_pending_snapshot(now)
+            return
+        if now >= p.deadline_ts:
+            self.pending = None
+            self.counters.auto_actions += 1
+            self._execute(p.action, p.job_id, p.jpeg, quiet=p.quiet, why=f"no response within {int(p.deadline_ts - p.created_ts)} s")
+        self._refresh_pending_snapshot(now)
+
+    def handle_reply(self, cmd: str, pending_id: str) -> str:
+        """veto | act | stop for the current pending alert. Called from ntfy replies and the web UI."""
+        with self._ctl:
+            now = self.clock()
+            p = self.pending
+            if p is None or not secrets.compare_digest(str(pending_id), p.id):
+                log.info("Monitor: ignoring '%s' for unknown/expired alert id", cmd)
+                return "ignored: no matching pending alert"
+            self.pending = None
+            if cmd == "veto":
+                self.counters.vetoes += 1
+                snooze = self.cfg.decision.veto_snooze_s
+                if snooze > 0:
+                    self.job.rearm_at = now + snooze
+                    detail = f"actions snoozed for {int(snooze // 60)} min"
+                else:
+                    self.job.muted = True
+                    detail = "alerts muted for the rest of this print"
+                log.info("Monitor: vetoed by user - %s", detail)
+                self.notifier.send(
+                    self._event("info", f"{self.cfg.printer.name}: keeping the print running", f"Got it: {detail}.")
+                )
+                result = f"vetoed ({detail})"
+            elif cmd in ("act", "stop"):
+                action = p.action if cmd == "act" else "stop"
+                taken = self._execute(action, p.job_id, p.jpeg, why="confirmed by you")
+                result = taken or f"{action} failed"
+            else:
+                self.pending = p
+                return f"ignored: unknown command {cmd!r}"
+            self._refresh_pending_snapshot(now)
+            with self._lock:
+                self._snap.job = JobContext(**self.job.__dict__)
+            return result
+
+    def _refresh_pending_snapshot(self, now: float) -> None:
+        with self._lock:
+            self._snap.pending = self.pending.public(now) if self.pending else None
+
+    def _refresh_policy_snapshot(self, now: float) -> None:
+        pol = self.policy.resolve(now)
+        with self._lock:
+            self._snap.policy = {
+                "action": pol.action,
+                "veto_window_s": pol.veto_window_s,
+                "quiet": pol.quiet,
+                "rule": pol.rule,
+                "replies_connected": bool(self.replies and self.replies.connected),
+            }
 
     def _event(self, kind, title, message, jpeg=None, action_taken=None) -> Event:
         return Event(
@@ -398,6 +566,8 @@ class Monitor:
     def snapshot(self) -> Snapshot:
         with self._lock:
             snap = Snapshot(**self._snap.__dict__)
+            if self.pending:  # keep the countdown live between ticks
+                snap.pending = self.pending.public(self.clock())
         return snap
 
     def history_points(self) -> list[HistoryPoint]:

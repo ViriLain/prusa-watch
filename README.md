@@ -88,6 +88,28 @@ prusa-watch run        # dashboard on http://localhost:8484
 - `decision.action`: start with `notify` for a few prints to watch the scores, then switch to `pause`.
 - **False positive mid-print?** Tap *False alarm: resume + mute* in the ntfy notification, or *Mute this print* on the dashboard.
 
+## Veto window and schedules
+
+Instead of pausing the moment it's confident, prusa-watch can ask first:
+
+```
+failure verdict ──▶ push: "pausing in 2:00 unless you respond"  [Keep printing] [Pause now] [Cancel print]
+                         │
+          ┌──────────────┼───────────────────────┬──────────────────────────────┐
+     Keep printing    Pause now / Cancel      no response                you pause at the printer
+   snooze 30 min,     act immediately         pause at 2:00 (fail-safe)   pending alert cancelled
+   then re-arm
+```
+
+- `decision.veto_window_s` sets the window length. `0` means act immediately, which was the previous behavior.
+- `decision.veto_snooze_s` sets how long *Keep printing* disarms actions. The default is 30 min, not the rest of the print, so a real failure later still gets caught. Set it to `0` to mute for the rest of the print.
+- `decision.schedules` holds time-of-day overrides; the first match wins. Windows can cross midnight, and `days` refers to the day the window starts. A rule can override `action` and `veto_window_s`, and it can set `quiet: true`, which sends priority-2 notifications that don't make a sound. The example config ships a `night` rule, 22:00–07:00, that pauses immediately and quietly.
+- `timezone` (IANA name) controls the schedule clock. Leave it empty to use the host's time.
+
+**How the buttons reach prusa-watch from anywhere:** each button POSTs `veto <id>`, `act <id>` or `stop <id>` to `notify.ntfy.reply_topic`. prusa-watch keeps an **outbound** streaming subscription to that topic, so the buttons work on LTE with no port forwarding and no VPN. Every alert has a one-time id, and replies that don't match the current pending alert are ignored. If `reply_topic` isn't set, the buttons call the dashboard directly, which only works on your LAN or VPN.
+
+The dashboard shows the same countdown with the same three buttons. The generic webhook payload includes `pending_id`, `deadline_ts`, `veto_url` and `act_url`, so Home Assistant can build its own actionable notification.
+
 ## Notifications
 
 - **ntfy** (default): the image is attached. When `PUBLIC_URL` is set, the notification gets action buttons: *Resume*, *False alarm: resume + mute*, and *Cancel print*. These buttons call the dashboard directly, so they only work while your phone is on the LAN or VPN (Tailscale, WireGuard). Self-host ntfy or use a long random topic. Topics on ntfy.sh are public-by-name.
@@ -102,11 +124,13 @@ prusa-watch run        # dashboard on http://localhost:8484
 | `GET /api/state` | full JSON state + 2 h score history |
 | `GET /frame.jpg`, `/raw.jpg` | last analyzed (annotated) frame / live frame with ROI box |
 | `POST /api/pause`, `/api/resume[?mute=1]`, `/api/stop`, `/api/mute`, `/api/unmute`, `/api/test` | require `?token=` or `X-Token` when `web.token` is set |
+| `POST /api/pending/veto`, `/act`, `/stop` `[?id=]` | answer the current veto-window alert (no id = whatever is pending); token required |
 | `GET /metrics` | Prometheus: score, p, ewm, baseline, inference ms, frame age, camera and printer up, state, counters |
 
 ## Security
 
 - Control endpoints can pause or cancel your print. Set `WEB_TOKEN`, and don't port-forward 8484. Use a VPN for remote access.
+- The ntfy **reply topic** can pause, stop or keep a print, but only while an alert with a matching one-time id is pending. On ntfy.sh, topics are public-by-name, so give it a long random name. Better: self-host ntfy with an ACL and set `token`.
 - PrusaLink is plain HTTP with digest auth. Keep it on the LAN.
 - The Buddy3D RTSP stream is unauthenticated and unencrypted. Anyone on your LAN or Wi-Fi can watch it. Put IoT devices on their own VLAN if that matters to you.
 
@@ -120,7 +144,7 @@ prusa-watch run        # dashboard on http://localhost:8484
 
 ```bash
 pip install -e ".[dev]"
-pytest                                    # 45 tests, synthetic ONNX model, no hardware
+pytest                                    # 73 tests, synthetic ONNX model, no hardware
 python scripts/fake_printer.py &          # PrusaLink simulator (apikey auth, password "test")
 ```
 
