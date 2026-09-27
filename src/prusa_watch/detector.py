@@ -6,7 +6,7 @@ from obico-server ``ml_api/lib/onnx.py`` (AGPL-3.0) so the per-frame
 confidences match what Obico's tuned decision thresholds expect.
 
 Model weights: https://tsd-pub-static.s3.amazonaws.com/ml-models/model-weights-5a6b1be1fa.onnx
-(fetched by ``scripts/fetch_model.py``).
+(fetched by ``prusa-watch fetch-model``, or automatically on first run).
 """
 
 from __future__ import annotations
