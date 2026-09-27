@@ -179,6 +179,15 @@ web:
   token: ""                        # required for pause/resume/stop/incident endpoints when set
   history_s: 2h                    # score history kept for the dashboard chart
 
+# ───────────────────────────── recording ─────────────────────────────
+# What the detector saw on every print, for tuning sensitivity and the ROI.
+recording:
+  history: true                    # per-frame scores: state_dir/history/job-<id>.csv
+  frames: true                     # annotated frames when the model sees something: state_dir/frames/job-<id>/
+  frame_min_p: 0.3                 # save a frame once its summed box confidence reaches this (warning/failure frames always)
+  max_frames_per_job: 120          # cap per print (~100 KB per frame)
+  keep_jobs: 50                    # delete history/frames of older prints beyond this many (0 = keep all)
+
 # ───────────────────────────── misc ─────────────────────────────
 state_dir: data
 timezone: ""                       # IANA zone for schedules, e.g. America/New_York (empty = system time)

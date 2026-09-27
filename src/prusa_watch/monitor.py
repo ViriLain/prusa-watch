@@ -20,6 +20,7 @@ from .detector import Detection, SpaghettiDetector, annotate
 from .escalation import Incident, PolicyResolver, Step, fmt_duration, parse_escalation
 from .notify import Event, Notifier
 from .prusalink import PrinterStatus, PrusaLink, PrusaLinkError
+from .recording import Recorder
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +115,7 @@ class Monitor:
         self.detector = detector or SpaghettiDetector(cfg.detector.model_path, use_gpu=cfg.detector.use_gpu)
         self.notifier = notifier or Notifier(cfg.notify, public_url=cfg.web.public_url, control_token=cfg.web.token)
         self.decider = FailureDecider(cfg.decision, self.state_dir / "prediction_state.json")
+        self.recorder = Recorder(cfg.recording, self.state_dir)
         self.reload_escalation()
 
         self.incident: Incident | None = None
@@ -250,6 +252,7 @@ class Monitor:
                 self._close_incident("a new job started")
             self.job = JobContext(job_id=status.job_id, job_name=name)
             self.decider.reset_for_new_print()
+            self.recorder.start_job(status.job_id, name, self.clock())
             self.history.clear()
 
         # Resumed (anywhere: printer knob, Prusa app, dashboard) after we paused it
@@ -325,6 +328,15 @@ class Monitor:
             self._snap.inference_ms = self.detector.last_inference_ms
             self._snap.last_detections = [d.as_list() for d in detections if d.confidence >= cfg.detector.visualization_threshold]
             self._snap.last_analysis_ts = now
+
+        try:
+            self.recorder.record(
+                now, s.current_frame_num, status.progress, [d.confidence for d in detections],
+                s.ewm_mean, s.rolling_mean_long, s.rolling_mean_short, s.normalized_p,
+                verdict.value, self.detector.last_inference_ms, jpeg,
+            )
+        except Exception:
+            log.exception("Recording: unexpected error (monitoring continues)")
 
         log.debug("Analyze: %d dets p=%.3f ewm=%.3f base=%.3f -> %s", len(detections), s.current_p, s.ewm_mean, s.rolling_mean_long, verdict.value)
 
