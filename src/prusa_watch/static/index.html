@@ -45,6 +45,13 @@
   .side { display: flex; flex-direction: column; gap: 16px; }
   svg { width: 100%; height: 120px; display: block; }
   .msg { min-height: 1.4em; color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .pending { display: none; margin: 12px 20px 0; padding: 14px 16px; border-radius: 10px; border: 2px solid var(--fail);
+    background: color-mix(in srgb, var(--fail) 8%, var(--panel)); align-items: center; gap: 16px; flex-wrap: wrap; }
+  .pending .count { font-size: 32px; font-weight: 750; font-variant-numeric: tabular-nums; color: var(--fail); min-width: 3.2ch; }
+  .pending .txt { flex: 1 1 240px; } .pending .txt b { display: block; }
+  .pending .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .pending button.keep { background: var(--ink); color: var(--panel); border-color: var(--ink); font-weight: 600; }
+  @media (max-width: 900px) { .pending { margin: 12px 16px 0; } }
   .banner { display: none; margin: 0 20px; padding: 10px 14px; border-radius: 8px; background: color-mix(in srgb, var(--fail) 14%, transparent); color: var(--fail); font-weight: 600; }
 </style>
 </head>
@@ -56,6 +63,11 @@
   <span id="job" class="job"></span>
 </header>
 <div id="banner" class="banner"></div>
+<div id="pending" class="pending" role="alert">
+  <div class="count" id="p-count">2:00</div>
+  <div class="txt"><b id="p-title">Spaghetti detected: pausing soon</b><span id="p-sub">No response = pause.</span></div>
+  <div class="btns" id="p-btns"></div>
+</div>
 <main>
   <section class="card viewer">
     <div class="tabs">
@@ -81,7 +93,8 @@
         <dt>Frames this print</dt><dd id="fn">-</dd>
         <dt>Inference</dt><dd id="inf">-</dd>
         <dt>Camera</dt><dd id="cam">-</dd>
-        <dt>Mode</dt><dd id="mode">-</dd>
+        <dt>Sensitivity</dt><dd id="mode">-</dd>
+        <dt>On failure</dt><dd id="policy">-</dd>
         <dt>Pauses / warnings</dt><dd id="cnt">-</dd>
       </dl>
     </section>
@@ -131,6 +144,29 @@ $("b-pause").onclick = () => call("/api/pause");
 $("b-resume").onclick = () => call("/api/resume");
 $("b-stop").onclick = () => call("/api/stop", "Stop (cancel) the current print?");
 $("b-test").onclick = () => call("/api/test");
+const fmt = s => { s = Math.max(0, Math.round(s)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = String(s % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${x}` : `${m}:${x}`; };
+let deadline = null, btnKey = "";
+setInterval(() => { if (deadline) $("p-count").textContent = fmt(deadline - Date.now() / 1000); }, 250);
+const CMD = {
+  veto: ["Keep printing", "keep"], act: [null, ""], stop: ["Cancel print", "danger", "Cancel the print?"],
+  resume: ["Resume", "keep"], mute: ["False alarm: resume + mute", ""],
+};
+function incidentButtons(inc) {
+  const cmds = inc.commands.filter(c => !(inc.acted === "paused" && c === "veto"));  // resume covers it
+  const key = cmds.join(",") + inc.next_action;
+  if (key === btnKey) return;
+  btnKey = key;
+  $("p-btns").innerHTML = "";
+  for (const c of cmds) {
+    const [label, cls, conf] = CMD[c];
+    const b = document.createElement("button");
+    b.textContent = label || (inc.next_action === "stop" ? "Stop now" : "Pause now");
+    if (cls) b.className = cls;
+    b.onclick = () => call(`/api/incident/${c}`, conf);
+    $("p-btns").appendChild(b);
+  }
+}
 $("b-mute").onclick = () => call(last && last.job.muted ? "/api/unmute" : "/api/mute");
 
 function chart(hist) {
@@ -163,15 +199,39 @@ async function poll() {
     $("fn").textContent = s.frame_num;
     $("inf").textContent = s.inference_ms ? `${s.inference_ms.toFixed(0)} ms` : "-";
     $("cam").textContent = s.camera_connected ? `live${s.frame_age_s != null ? ` (${s.frame_age_s.toFixed(1)} s)` : ""}` : "disconnected";
-    $("mode").textContent = `${s.action_mode} · sens ${s.sensitivity}`;
+    $("mode").textContent = `${s.sensitivity}`;
     $("cnt").textContent = `${s.counters.pauses} / ${s.counters.warnings}`;
+    const pol = s.policy || {};
+    const act = (pol.steps || []).find(x => x.action);
+    $("policy").textContent = pol.policy ? `${pol.policy}${pol.schedule ? ` (${pol.schedule})` : ""}: ` +
+      (act ? `${act.action} ${act.at > 0 ? "after " + fmt(act.at) : "immediately"}` : "notify only") : "-";
+    const inc = s.incident;
+    $("pending").style.display = inc ? "flex" : "none";
+    if (inc) {
+      incidentButtons(inc);
+      const where = `${inc.policy}${inc.schedule ? " · " + inc.schedule : ""}`;
+      if (inc.acted === "paused") {
+        deadline = inc.next_action_in_s != null ? Date.now() / 1000 + inc.next_action_in_s : null;
+        $("p-count").textContent = deadline ? fmt(inc.next_action_in_s) : "⏸";
+        $("p-title").textContent = deadline ? `Paused by prusa-watch: ${inc.next_action} when the timer runs out` : "Paused by prusa-watch: spaghetti detected";
+        $("p-sub").textContent = `Score ${inc.score.toFixed(2)} · ${where}. Resume if it's fine, or cancel the print.`;
+      } else if (inc.next_action) {
+        deadline = Date.now() / 1000 + inc.next_action_in_s;
+        $("p-title").textContent = `Spaghetti detected: ${inc.next_action === "stop" ? "stopping" : "pausing"} when the timer runs out`;
+        $("p-sub").textContent = `Score ${inc.score.toFixed(2)} · ${where}. Keep printing if it's a false alarm.`;
+      } else {
+        deadline = null; $("p-count").textContent = "!";
+        $("p-title").textContent = "Spaghetti detected (notify-only policy)";
+        $("p-sub").textContent = `Score ${inc.score.toFixed(2)} · ${where}. The printer keeps running.`;
+      }
+    } else { deadline = null; btnKey = ""; }
     $("b-mute").textContent = s.job.muted ? "Unmute this print" : "Mute this print";
     const active = s.job.job_id != null && ["PRINTING", "PAUSED", "ATTENTION"].includes(s.printer_state);
     $("b-pause").disabled = !active || s.printer_state !== "PRINTING";
     $("b-resume").disabled = !active || s.printer_state !== "PAUSED";
     $("b-stop").disabled = !active; $("b-mute").disabled = !active;
     const b = $("banner");
-    if (s.job.action_taken === "paused" && s.printer_state === "PAUSED") { b.style.display = "block"; b.textContent = "Paused by prusa-watch: spaghetti detected. Check the print, then Resume or Stop."; }
+    if (s.job.action_taken === "paused" && s.printer_state === "PAUSED" && !inc) { b.style.display = "block"; b.textContent = "Paused by prusa-watch: spaghetti detected. Check the print, then Resume or Stop."; }
     else if (!s.printer_reachable) { b.style.display = "block"; b.textContent = `Printer unreachable: ${s.printer_error || ""}`; }
     else b.style.display = "none";
     chart(s.history);

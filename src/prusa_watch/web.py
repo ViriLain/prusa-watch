@@ -46,7 +46,6 @@ def create_app(monitor: Monitor) -> FastAPI:
         snap = monitor.snapshot()
         d = asdict(snap)
         d["printer_name"] = monitor.cfg.printer.name
-        d["action_mode"] = monitor.cfg.decision.action
         d["sensitivity"] = monitor.cfg.decision.sensitivity
         d["auth_required"] = bool(token)
         d["history"] = [asdict(h) for h in monitor.history_points()]
@@ -94,6 +93,22 @@ def create_app(monitor: Monitor) -> FastAPI:
     def api_unmute(request: Request):
         return control(lambda: monitor.set_muted(False) or "unmuted", request)
 
+    @app.post("/api/incident/{cmd}")
+    def api_incident(cmd: str, request: Request):
+        if cmd not in ("veto", "act", "stop", "resume", "mute"):
+            raise HTTPException(status_code=404, detail="unknown command")
+        require_token(request)
+        iid = request.query_params.get("id")
+        if not iid:  # dashboard buttons act on whatever incident is open right now
+            inc = monitor.incident
+            iid = inc.id if inc else ""
+        result = monitor.handle_reply(cmd, iid)
+        if result.startswith("ignored"):
+            raise HTTPException(status_code=409, detail=result)
+        if result.startswith("failed"):
+            raise HTTPException(status_code=502, detail=result)
+        return {"ok": True, "result": result}
+
     @app.post("/api/test")
     def api_test(request: Request):
         require_token(request)
@@ -129,6 +144,13 @@ def create_app(monitor: Monitor) -> FastAPI:
             f"prusa_watch_frame_age_seconds{{{lbl}}} {s.frame_age_s if s.frame_age_s is not None else 'NaN'}",
             "# TYPE prusa_watch_printer_reachable gauge",
             f"prusa_watch_printer_reachable{{{lbl}}} {int(s.printer_reachable)}",
+            "# HELP prusa_watch_incident_open 1 while an escalation incident is open",
+            "# TYPE prusa_watch_incident_open gauge",
+            f"prusa_watch_incident_open{{{lbl}}} {int(s.incident is not None)}",
+            "# HELP prusa_watch_next_action_seconds Seconds until the incident's next pause/stop step (-1 = none)",
+            "# TYPE prusa_watch_next_action_seconds gauge",
+            f"prusa_watch_next_action_seconds{{{lbl}}} "
+            f"{s.incident['next_action_in_s'] if s.incident and s.incident['next_action_in_s'] is not None else -1:.0f}",
             "# TYPE prusa_watch_printer_state gauge",
         ]
         lines += [f'prusa_watch_printer_state{{{lbl},state="{st}"}} {int(s.printer_state == st)}' for st in states]
@@ -139,6 +161,8 @@ def create_app(monitor: Monitor) -> FastAPI:
             ("pauses", "Prints paused by prusa-watch"),
             ("stops", "Prints stopped by prusa-watch"),
             ("printer_errors", "PrusaLink request failures"),
+            ("vetoes", "Pending actions cancelled by the user (Keep printing)"),
+            ("auto_actions", "Pending actions that fired because nobody responded"),
         ):
             lines += [
                 f"# HELP prusa_watch_{field_name}_total {help_text}",

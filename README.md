@@ -55,8 +55,9 @@ Simulated time to action (10 s frames, default sensitivity, established baseline
 ### 2. Configure
 
 ```bash
-cp config.example.yaml config.yaml
-cp .env.example .env        # PRUSALINK_PASSWORD, NTFY_TOPIC, WEB_TOKEN, PUBLIC_URL
+cp config.example.yaml config.yaml   # ~10 lines: printer IP, camera URL, timezone
+cp .env.example .env                 # PRUSALINK_PASSWORD, NTFY_TOPIC, NTFY_REPLY_TOPIC, WEB_TOKEN, PUBLIC_URL
+prusa-watch config                   # see the effective settings
 ```
 
 ### 3a. Run with Docker (recommended, on an always-on box)
@@ -85,14 +86,81 @@ prusa-watch run        # dashboard on http://localhost:8484
 - **ROI (biggest accuracy win):** crop to the build plate so the frame, door, cable chain, and any tool dock or purge area are excluded. Open *Live (raw)* on the dashboard to see the ROI box, then adjust `camera.roi` (normalized `[x1, y1, x2, y2]`).
 - **Test detection** button: runs the model on the current frame without touching decision state. Hold some spaghetti in view to sanity-check it.
 - `decision.sensitivity`: `1.0` is Obico's default. Raise it to about `1.25–1.5` if moderate failures only warn. Lower it if you get false pauses.
-- `decision.action`: start with `notify` for a few prints to watch the scores, then switch to `pause`.
+- `escalation.default_policy`: start with a notify-only policy (the example has `watch_only`) for a few prints to watch the scores, then switch to one that pauses.
 - **False positive mid-print?** Tap *False alarm: resume + mute* in the ntfy notification, or *Mute this print* on the dashboard.
+
+## Configuration
+
+Sensible defaults are built in, so your `config.yaml` only lists what's different. The starter [`config.example.yaml`](config.example.yaml) is about 10 lines: printer IP, camera URL, ntfy topic and timezone.
+
+| Layer (low → high) | Where | Example |
+|---|---|---|
+| Built-in defaults | [`config.reference.yaml`](config.reference.yaml) shows every setting and its default | `decision.sensitivity: 1.0` |
+| Your file | `config.yaml`, only your changes; `${VAR}` / `${VAR:-default}` expand from `.env` | `decision: {sensitivity: 1.25}` |
+| Environment | `PRUSA_WATCH__<SECTION>__<KEY>=value`, parsed as YAML | `PRUSA_WATCH__ESCALATION__DEFAULT_POLICY=watch_only` |
+
+- **`prusa-watch config`** prints the effective result (defaults + file + env) with secrets masked. `prusa-watch config --defaults` prints the built-ins.
+- **Escalation merges by policy name.** Define `ask_first:` to replace just that policy, and the other built-ins stay. `schedules:` replaces the whole list (`[]` turns night mode off). `name: null` removes a built-in policy. Defining a new policy doesn't make it active; set `default_policy` or schedule it.
+- **Durations:** any `*_s` setting, and every escalation `at:`, accepts seconds or a duration: `90`, `"90s"`, `"2m"`, `"1h30m"`.
+- **Strict keys:** misspelled keys are rejected at startup, including in env overrides. So are keys from older versions, and the error names where each one moved.
+- **The reference can't go stale:** tests fail if `config.reference.yaml` stops matching the built-in defaults or misses a setting.
+
+**Built-in behavior when you configure nothing else:**
+- **During the day** (`ask_first`): ask with *Keep printing / Pause now / Cancel* buttons, remind at 1 min, pause at 2 min.
+- **22:00–07:00** (`night`): pause immediately with a silent notification.
+- **Never** cancel a print on its own. That's opt-in (see below).
+- Also built in: `pause_now` and `watch_only`.
+
+## Escalation policies
+
+Detection (`decision:`) decides *whether* a print is failing. Escalation (`escalation:`) decides *what happens next*. A failure verdict opens an **incident**, and the active **policy** runs its timed **steps**. Example override: a longer window, and give up on a print left paused for 2 h:
+
+```yaml
+escalation:
+  policies:
+    ask_first:                   # replaces the built-in ask_first; night/pause_now/watch_only stay
+      steps:
+        - {at: 0,   notify: [ntfy, discord, webhook], buttons: [keep, act, stop]}
+        - {at: 3m,  notify: [ntfy], title: "{printer}: still failing, {next_action} in {next_action_in}"}
+        - {at: 5m,  action: pause}
+        - {at: 2h5m, action: stop, notify: [ntfy, discord], priority: 4}
+```
+
+| Step key | Meaning |
+|---|---|
+| `at` | time after detection; steps run in order |
+| `action` | `pause`, `stop` or none. A pause only happens while printing; a stop also cancels a print that's already paused |
+| `notify` | channels (`ntfy`, `discord`, `webhook`); omit = all configured, `[]` = silent |
+| `priority` | ntfy 1–5 (5 breaks through Do Not Disturb on Android). Default 5 |
+| `buttons` | up to 3 of `keep`, `act`, `stop`, `resume`, `mute`, `dashboard`. Omit to get automatic buttons: keep/act/stop before we act, resume/mute/stop after a pause |
+| `title`, `message` | templates with `{printer} {job} {score} {policy} {schedule} {next_action} {next_action_in} {elapsed} {action_taken}` |
+| `attach_image` | include the annotated frame (default true) |
+
+What the buttons do:
+- **keep:** false alarm, keep printing. It also resumes the print if we'd already paused it.
+- **act:** run the next action step now, skipping any reminders before it.
+- **stop:** cancel the print.
+- **resume:** resume the print.
+- **mute:** resume, and no more alerts for this print.
+
+**When an incident ends:**
+- You answer it.
+- You handle it at the printer (pause, resume or stop there).
+- The job ends.
+- The steps run out. The exception is a print we paused: that incident stays open so *Resume* keeps working.
+
+**Schedules:** time windows pick the policy, and the first match wins. Windows can cross midnight, and `days` refers to the day the window starts. With no match, `default_policy` applies. The top-level `timezone` setting (an IANA name) sets the schedule clock.
+
+**How the buttons reach prusa-watch from anywhere:** each button POSTs `<command> <incident-id>` to `notify.ntfy.reply_topic`. prusa-watch keeps an **outbound** streaming subscription to that topic, so the buttons work on LTE with no port forwarding and no VPN. Replies that don't match the open incident, or don't make sense in its current state, are ignored. If `reply_topic` isn't set, the buttons call the dashboard directly, which only works on your LAN or VPN.
+
+The dashboard shows a live countdown to the next action, with buttons for whatever commands currently apply. The webhook payload includes `incident_id`, `policy`, `next_action`, `next_action_ts` and `command_urls`, so Home Assistant can build its own actionable notifications.
 
 ## Notifications
 
-- **ntfy** (default): the image is attached. When `PUBLIC_URL` is set, the notification gets action buttons: *Resume*, *False alarm: resume + mute*, and *Cancel print*. These buttons call the dashboard directly, so they only work while your phone is on the LAN or VPN (Tailscale, WireGuard). Self-host ntfy or use a long random topic. Topics on ntfy.sh are public-by-name.
-- **Discord**: webhook with embedded image.
-- **Webhook**: JSON POST with `kind`, `job_name`, `score`, `action_taken`, and `image_url`. Point it at a Home Assistant webhook trigger to flash lights, announce on speakers, and so on.
+- **Channels:** ntfy (the frame is attached, and the notification has action buttons), Discord (embedded image), or a generic JSON webhook.
+- **Incident notifications** are routed per step, as described above.
+- **Everything else** is routed under `notify:`. `notify.warning` covers the "possible failure" heads-up, `notify.camera` covers the camera going offline or coming back, and `notify.info` covers confirmations. Each has `enabled`, `channels`, `priority` and `cooldown_s`.
+- **ntfy.sh topics are public-by-name.** Use long random names for `topic` and `reply_topic`, or self-host ntfy with ACLs and set `token`.
 
 ## Endpoints
 
@@ -102,11 +170,13 @@ prusa-watch run        # dashboard on http://localhost:8484
 | `GET /api/state` | full JSON state + 2 h score history |
 | `GET /frame.jpg`, `/raw.jpg` | last analyzed (annotated) frame / live frame with ROI box |
 | `POST /api/pause`, `/api/resume[?mute=1]`, `/api/stop`, `/api/mute`, `/api/unmute`, `/api/test` | require `?token=` or `X-Token` when `web.token` is set |
-| `GET /metrics` | Prometheus: score, p, ewm, baseline, inference ms, frame age, camera and printer up, state, counters |
+| `POST /api/incident/{veto,act,stop,resume,mute}` `[?id=]` | answer the open incident (no id = the current one); token required |
+| `GET /metrics` | Prometheus: score, p, ewm, baseline, inference ms, frame age, camera and printer up, state, incident open, seconds to the next action, counters (pauses, stops, vetoes, auto actions, ...) |
 
 ## Security
 
 - Control endpoints can pause or cancel your print. Set `WEB_TOKEN`, and don't port-forward 8484. Use a VPN for remote access.
+- The ntfy **reply topic** can pause, stop, resume or keep a print, but only for the open incident's one-time id. On ntfy.sh, topics are public-by-name, so give it a long random name. Better: self-host ntfy with an ACL and set `token`.
 - PrusaLink is plain HTTP with digest auth. Keep it on the LAN.
 - The Buddy3D RTSP stream is unauthenticated and unencrypted. Anyone on your LAN or Wi-Fi can watch it. Put IoT devices on their own VLAN if that matters to you.
 
@@ -120,7 +190,7 @@ prusa-watch run        # dashboard on http://localhost:8484
 
 ```bash
 pip install -e ".[dev]"
-pytest                                    # 45 tests, synthetic ONNX model, no hardware
+pytest                                    # 107 tests, synthetic ONNX model, no hardware
 python scripts/fake_printer.py &          # PrusaLink simulator (apikey auth, password "test")
 ```
 

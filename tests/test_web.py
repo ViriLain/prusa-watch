@@ -38,3 +38,27 @@ def test_dashboard_state_frames_metrics_and_auth(rig):  # noqa: F811
     assert len(t["detections"]) == 2
     assert c.get("/test.jpg").content[:2] == b"\xff\xd8"
     assert c.get("/healthz").status_code == 200
+
+
+def test_incident_endpoints(rig):  # noqa: F811
+    from test_monitor import _arm, _spaghetti_until_incident
+
+    mon, printer, grabber, clock, sent, cfg = rig
+    c = TestClient(create_app(mon))
+    assert c.post("/api/incident/veto?token=tok").status_code == 409  # nothing open
+    assert c.post("/api/incident/nuke?token=tok").status_code == 404
+    _arm(mon, cfg)
+    inc = _spaghetti_until_incident(mon, printer, grabber, clock, 40)
+    s = c.get("/api/state").json()
+    assert s["incident"]["id"] == inc.id and 0 < s["incident"]["next_action_in_s"] <= 120
+    assert s["incident"]["commands"] == ["veto", "act", "stop"]
+    assert s["policy"]["policy"] == "ask_first"
+    m = c.get("/metrics").text
+    assert 'prusa_watch_incident_open{printer="core-one"} 1' in m and "prusa_watch_next_action_seconds" in m
+    assert c.post(f"/api/incident/veto?id={inc.id}").status_code == 401  # token still required
+    assert c.post("/api/incident/resume?token=tok").status_code == 409  # not applicable yet
+    r = c.post("/api/incident/act?token=tok")  # dashboard: no id -> current incident
+    assert r.status_code == 200 and r.json()["result"] == "paused"
+    assert c.get("/api/state").json()["incident"]["commands"] == ["resume", "mute", "stop", "veto"]
+    assert c.post("/api/incident/mute?token=tok").json()["result"].startswith("resumed")
+    assert c.get("/api/state").json()["incident"] is None

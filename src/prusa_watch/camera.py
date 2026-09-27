@@ -32,10 +32,19 @@ class Frame:
 
 
 class FrameGrabber:
-    def __init__(self, url: str, transport: str = "tcp", reconnect_backoff_s: float = 5.0):
+    def __init__(
+        self,
+        url: str,
+        transport: str = "tcp",
+        reconnect_backoff_s: float = 5.0,
+        open_timeout_s: float = 10.0,
+        read_timeout_s: float = 10.0,
+    ):
         self.url = url
         self.transport = transport
         self.reconnect_backoff_s = reconnect_backoff_s
+        self.open_timeout_ms = int(open_timeout_s * 1000)
+        self.read_timeout_ms = int(read_timeout_s * 1000)
         self._lock = threading.Lock()
         self._latest: Frame | None = None
         self._stop = threading.Event()
@@ -69,7 +78,7 @@ class FrameGrabber:
         if self.url.lower().startswith("rtsp") and self.transport:
             # Must be set before the capture is created; applies to the FFmpeg backend.
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{self.transport}"
-        params = [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10000]
+        params = [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self.open_timeout_ms, cv2.CAP_PROP_READ_TIMEOUT_MSEC, self.read_timeout_ms]
         cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG, params)
         # Keep the internal buffer tiny so we don't analyze stale frames.
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)

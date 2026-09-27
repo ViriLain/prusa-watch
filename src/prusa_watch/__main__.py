@@ -1,7 +1,9 @@
 """Entry point.
 
-    prusa-watch run   [-c config.yaml]   # start monitor + dashboard
-    prusa-watch check [-c config.yaml]   # verify printer, camera and model, then exit
+    prusa-watch run    [-c config.yaml]   # start monitor + dashboard
+    prusa-watch check  [-c config.yaml]   # verify printer, camera, model and escalation, then exit
+    prusa-watch config [-c config.yaml]   # print the effective config (defaults + file + env), secrets masked
+    prusa-watch config --defaults         # print the built-in defaults only
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-from .config import Config, load_config
+from .config import Config, effective_config, load_config
 
 log = logging.getLogger("prusa_watch")
 
@@ -54,7 +56,8 @@ def cmd_check(cfg: Config) -> int:
         print(f"  FAIL {exc}")
 
     print(f"[camera] {cfg.camera.url}")
-    g = FrameGrabber(cfg.camera.url, cfg.camera.transport)
+    c = cfg.camera
+    g = FrameGrabber(c.url, c.transport, c.reconnect_backoff_s, c.open_timeout_s, c.read_timeout_s)
     g.start()
     deadline = time.time() + 20
     while time.time() < deadline and g.latest() is None:
@@ -73,6 +76,23 @@ def cmd_check(cfg: Config) -> int:
         p = Path(cfg.state_dir) / "check_frame.jpg"
         cv2.imwrite(str(p), frame.image)
         print(f"  saved {p}")
+
+    print("[escalation]")
+    from .escalation import PolicyResolver, parse_escalation
+
+    esc = parse_escalation(cfg.escalation)
+    pol, sched = PolicyResolver(esc, cfg.timezone).resolve(time.time())
+    for name, p in esc.policies.items():
+        marks = " (default)" if name == esc.default_policy else ""
+        marks += " <- active now" + (f" via schedule '{sched}'" if sched else "") if name == pol.name else ""
+        print(f"  policy {name}{marks}")
+        for st in p.steps:
+            print(f"    at {st.at:>6.0f}s  action={st.action or '-':5}  notify={st.notify if st.notify is not None else 'all'}  prio={st.priority}")
+    if cfg.notify.ntfy.topic and not cfg.notify.ntfy.reply_topic:
+        print("  note: notify.ntfy.reply_topic not set - buttons only work on your LAN (via web.public_url)")
+    channels = [c for c, on in (("ntfy", cfg.notify.ntfy.topic), ("discord", cfg.notify.discord.webhook_url), ("webhook", cfg.notify.webhook.url)) if on]
+    if not channels:
+        print("  WARNING: no notification channel configured - policies that wait for your answer will just act late")
 
     print(f"[model] {cfg.detector.model_path}")
     if not Path(cfg.detector.model_path).exists():
@@ -128,13 +148,42 @@ def cmd_run(cfg: Config) -> int:
     return 0
 
 
+def cmd_config(args) -> int:
+    import yaml
+
+    if args.defaults:
+        cfg = Config()
+    else:
+        try:
+            cfg = load_config(args.config)
+        except (ValueError, FileNotFoundError) as exc:
+            print(exc, file=sys.stderr)
+            return 2
+    print(yaml.safe_dump(effective_config(cfg, redact=not args.show_secrets), sort_keys=False, allow_unicode=True), end="")
+    if not args.defaults:
+        try:
+            cfg.validate()
+        except ValueError as exc:
+            print(f"\n# {exc}".replace("\n", "\n# "), file=sys.stderr)
+            return 2
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="prusa-watch", description="AI spaghetti detection for Prusa printers + Buddy3D camera")
-    ap.add_argument("command", nargs="?", default="run", choices=["run", "check"])
+    ap.add_argument("command", nargs="?", default="run", choices=["run", "check", "config"])
     ap.add_argument("-c", "--config", default=os.environ.get("PRUSA_WATCH_CONFIG", "config.yaml"))
+    ap.add_argument("--defaults", action="store_true", help="config: show built-in defaults only")
+    ap.add_argument("--show-secrets", action="store_true", help="config: don't mask passwords/tokens/topics")
     args = ap.parse_args(argv)
 
-    cfg = load_config(args.config)
+    if args.command == "config":
+        return cmd_config(args)
+    try:
+        cfg = load_config(args.config)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
     _setup_logging(cfg.log_level)
     try:
         cfg.validate()

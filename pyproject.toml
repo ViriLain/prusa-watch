@@ -17,6 +17,7 @@ dependencies = [
   "pyyaml>=6.0",
   "fastapi>=0.110",
   "uvicorn>=0.29",
+  "tzdata>=2024.1",  # IANA zones for schedules (slim containers ship without them)
 ]
 
 [project.optional-dependencies]
