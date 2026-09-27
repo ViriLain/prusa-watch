@@ -33,18 +33,47 @@ def test_discord_multipart_with_image():
     assert b"payload_json" in body and b"attachment://frame.jpg" in body and b"\xff\xd8jpeg" in body
 
 
-def test_webhook_json_and_ntfy_token():
+def test_webhook_json_and_ntfy_token_and_buttons():
     cfg = NotifyConfig()
     cfg.webhook.url = "http://ha.lan:8123/api/webhook/prusa"
     cfg.ntfy.topic = "t"
     cfg.ntfy.token = "tk_123"
     reqs, t = capture()
-    Notifier(cfg, public_url="http://watch.lan:8484", transport=t).send(ev(action_taken="paused"), blocking=True)
+    ev_ = ev(action_taken="paused", buttons=["resume", "mute", "stop"], incident_id="abc", priority=4)
+    Notifier(cfg, public_url="http://watch.lan:8484", transport=t).send(ev_, blocking=True)
     ntfy, hook = reqs
-    assert ntfy.headers["Authorization"] == "Bearer tk_123"
-    assert "Resume" in ntfy.headers["Actions"]
+    assert ntfy.headers["Authorization"] == "Bearer tk_123" and ntfy.headers["Priority"] == "4"
+    acts = ntfy.headers["Actions"]
+    # no reply topic -> dashboard fallback URLs; label with a comma is quoted
+    assert "http, Resume, http://watch.lan:8484/api/incident/resume?id=abc" in acts
+    assert '"False alarm: resume + mute"' not in acts  # no comma in that label, no quoting needed
     body = json.loads(hook.read())
     assert body["kind"] == "failure" and body["has_image"] and body["image_url"].endswith("/frame.jpg")
+    assert body["command_urls"]["veto"] == "http://watch.lan:8484/api/incident/veto?id=abc"
+
+
+def test_channel_selection():
+    cfg = NotifyConfig()
+    cfg.ntfy.topic, cfg.webhook.url = "t", "http://hook"
+    reqs, t = capture()
+    n = Notifier(cfg, transport=t)
+    n.send(ev(), channels=["webhook"], blocking=True)
+    n.send(ev(), channels=[], blocking=True)
+    n.send(ev(), channels=["discord"], blocking=True)  # not configured -> dropped
+    assert [r.url.host for r in reqs] == ["hook"]
+
+
+def test_reply_topic_buttons():
+    cfg = NotifyConfig()
+    cfg.ntfy.topic, cfg.ntfy.reply_topic = "t", "r"
+    n = Notifier(cfg)
+    acts = n.ntfy_actions(ev(buttons=["keep", "act", "stop"], incident_id="i1", next_action="stop"))
+    assert acts == [
+        "http, Keep printing, https://ntfy.sh/r, method=POST, body=veto i1, clear=true",
+        "http, Stop now, https://ntfy.sh/r, method=POST, body=act i1, clear=true",
+        "http, Cancel print, https://ntfy.sh/r, method=POST, body=stop i1, clear=true",
+    ]
+    assert n.ntfy_actions(ev(buttons=["keep"])) == []  # no incident id -> no reply buttons
 
 
 def test_non_ascii_titles_do_not_crash_headers():

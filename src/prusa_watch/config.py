@@ -36,6 +36,8 @@ class CameraConfig:
     roi: list[float] | None = None
     stale_after_s: float = 30.0  # frame older than this = camera considered down
     reconnect_backoff_s: float = 5.0
+    open_timeout_s: float = 10.0  # RTSP connect/handshake timeout
+    read_timeout_s: float = 10.0  # no frame for this long = reconnect
 
 
 @dataclass
@@ -50,9 +52,9 @@ class DetectorConfig:
 
 @dataclass
 class DecisionConfig:
-    # User-facing knobs
+    # Detection only: *whether* a print is failing. What happens next (pause,
+    # notify, wait for you, ...) is configured in the top-level `escalation:` section.
     sensitivity: float = 1.0  # >1 = more trigger-happy, <1 = more conservative
-    action: str = "pause"  # "pause" | "stop" | "notify"
     # After you resume a print that prusa-watch paused, actions stay disarmed this
     # long. Detection keeps running; if spaghetti is still there afterwards it
     # pauses again. Use "Mute this print" if it was a false positive.
@@ -75,21 +77,6 @@ class DecisionConfig:
     # Only used when no saved state exists. Set 0 for exact Obico behavior.
     baseline_prior_frames: int = 360
 
-    # --- Veto window ---------------------------------------------------------
-    # On a failure verdict, wait this long before pausing/stopping and push an
-    # alert with "Keep printing" / "Pause now" / "Cancel print" buttons. No
-    # response = the action happens (fail-safe). 0 = act immediately.
-    veto_window_s: float = 0.0
-    # "Keep printing" disarms actions for this long (detection keeps running).
-    # 0 = for the rest of the print.
-    veto_snooze_s: float = 1800.0
-    # Time-of-day overrides, first match wins. Each item:
-    #   {name, start: "HH:MM", end: "HH:MM", days: [mon..sun] (optional),
-    #    action: pause|stop|notify (optional), veto_window_s (optional),
-    #    quiet: bool (optional; low-priority, silent notifications)}
-    # Windows may cross midnight (start > end); `days` refers to the day the
-    # window starts.
-    schedules: list = field(default_factory=list)
 
 
 @dataclass
@@ -97,13 +84,12 @@ class NtfyConfig:
     url: str = "https://ntfy.sh"
     topic: str = ""
     token: str = ""  # optional bearer token for protected/self-hosted topics
-    priority_warning: int = 4
-    priority_failure: int = 5
     # Topic prusa-watch SUBSCRIBES to for button replies (Keep printing / Pause
     # now / Cancel). Buttons post to ntfy, prusa-watch reads them over an
     # outbound connection -> works away from home with no port forwarding.
     # Use a long random name (or an ACL-protected topic on self-hosted ntfy).
     reply_topic: str = ""
+    reply_reconnect_s: float = 5.0  # backoff when the reply stream drops
 
 
 @dataclass
@@ -116,13 +102,31 @@ class WebhookConfig:
     url: str = ""  # receives JSON POST (e.g. Home Assistant webhook trigger)
 
 
+CHANNELS = ("ntfy", "discord", "webhook")
+
+
+@dataclass
+class EventNotifyConfig:
+    """Routing for non-escalation notifications."""
+
+    enabled: bool = True
+    channels: list[str] | None = None  # subset of ntfy/discord/webhook; null = every configured channel
+    priority: int = 3  # ntfy priority 1 (min) .. 5 (max, bypasses Do Not Disturb on Android)
+    cooldown_s: float = 0.0  # min seconds between repeats within one print
+
+
 @dataclass
 class NotifyConfig:
     ntfy: NtfyConfig = field(default_factory=NtfyConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
     webhook: WebhookConfig = field(default_factory=WebhookConfig)
-    cooldown_s: float = 300.0  # min seconds between repeated warnings for one print
-    notify_camera_down: bool = True
+    # "Possible failure" heads-up (warning band, below the failure threshold)
+    warning: EventNotifyConfig = field(default_factory=lambda: EventNotifyConfig(priority=4, cooldown_s=300.0))
+    # Camera went stale / came back while printing
+    camera: EventNotifyConfig = field(default_factory=lambda: EventNotifyConfig(priority=3))
+    # Confirmations: "keeping the print running", "resumed", ...
+    info: EventNotifyConfig = field(default_factory=lambda: EventNotifyConfig(priority=3))
+    timeout_s: float = 15.0  # per-request timeout for notification HTTP calls
 
 
 @dataclass
@@ -135,6 +139,7 @@ class WebConfig:
     # Sent as ?token=... or X-Token header. Strongly recommended if the
     # dashboard is reachable from anything but your own LAN.
     token: str = ""
+    history_s: float = 7200.0  # score history kept for the dashboard chart
 
 
 @dataclass
@@ -145,6 +150,11 @@ class Config:
     decision: DecisionConfig = field(default_factory=DecisionConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     web: WebConfig = field(default_factory=WebConfig)
+    # What to do once a failure is detected: timed steps (notify / wait / pause /
+    # stop), per-step channels, priorities, buttons and message templates, and
+    # schedules that pick a policy by time of day. Parsed and validated by
+    # prusa_watch.escalation; see config.example.yaml.
+    escalation: dict = field(default_factory=dict)
     state_dir: str = "data"
     timezone: str = ""  # IANA name for schedules, e.g. America/New_York; empty = system local time
     save_failure_frames: bool = True
@@ -160,20 +170,24 @@ class Config:
             errors.append("printer.auth must be 'digest' or 'apikey'")
         if not self.camera.url:
             errors.append("camera.url is required (rtsp://<camera-ip>/live)")
-        if self.decision.action not in ("pause", "stop", "notify"):
-            errors.append("decision.action must be 'pause', 'stop' or 'notify'")
-        if self.decision.veto_window_s < 0 or self.decision.veto_snooze_s < 0:
-            errors.append("decision.veto_window_s / veto_snooze_s must be >= 0")
-        from .policy import ScheduleError, parse_schedules, resolve_tz
+        from .escalation import EscalationError, parse_escalation
+        from .policy import ScheduleError, resolve_tz
 
         try:
-            parse_schedules(self.decision.schedules)
-        except ScheduleError as exc:
+            parse_escalation(self.escalation)
+        except EscalationError as exc:
             errors.append(str(exc))
         try:
             resolve_tz(self.timezone)
         except ScheduleError as exc:
             errors.append(str(exc))
+        for name in ("warning", "camera", "info"):
+            ev: EventNotifyConfig = getattr(self.notify, name)
+            bad = set(ev.channels or []) - set(CHANNELS)
+            if bad:
+                errors.append(f"notify.{name}.channels: unknown {sorted(bad)} (use {list(CHANNELS)})")
+            if not 1 <= int(ev.priority) <= 5:
+                errors.append(f"notify.{name}.priority must be 1..5")
         if self.camera.roi is not None:
             r = self.camera.roi
             if len(r) != 4 or not (0 <= r[0] < r[2] <= 1 and 0 <= r[1] < r[3] <= 1):
@@ -195,25 +209,72 @@ def _expand(value: Any) -> Any:
     return value
 
 
-def _build(cls, data: dict | None):
+# Keys that existed in earlier versions -> where they live now.
+_MOVED = {
+    ("decision", "action"): "escalation.policies.<name>.steps[].action",
+    ("decision", "veto_window_s"): "escalation.policies.<name>.steps (the step 'at' times)",
+    ("decision", "veto_snooze_s"): "escalation.snooze_s",
+    ("decision", "schedules"): "escalation.schedules (with `policy:` instead of action/veto_window_s/quiet)",
+    ("ntfy", "priority_warning"): "notify.warning.priority",
+    ("ntfy", "priority_failure"): "escalation step `priority`",
+    ("notify", "cooldown_s"): "notify.warning.cooldown_s",
+    ("notify", "notify_camera_down"): "notify.camera.enabled",
+}
+
+_DURATION_RE = re.compile(r"^\s*(?:(\d+(?:\.\d+)?)h)?\s*(?:(\d+(?:\.\d+)?)m)?\s*(?:(\d+(?:\.\d+)?)s)?\s*$")
+
+
+def parse_duration(value: Any) -> float:
+    """Seconds from 90, 90.5, "90", "90s", "2m", "1h30m", "1h 5m 10s"."""
+    if isinstance(value, bool):
+        raise ValueError(f"invalid duration {value!r}")
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().lower()
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    m = _DURATION_RE.match(text)
+    if not text or not m or not any(m.groups()):
+        raise ValueError(f"invalid duration {value!r} (examples: 90, 90s, 2m, 1h30m)")
+    h, mi, se = (float(g) if g else 0.0 for g in m.groups())
+    return h * 3600 + mi * 60 + se
+
+
+def _build(cls, data: dict | None, path: str = ""):
     obj = cls()
     if not data:
         return obj
+    if not isinstance(data, dict):
+        raise ValueError(f"Config section '{path or cls.__name__}' must be a mapping")
     known = {f.name: f for f in fields(cls)}
+    section = path.rsplit(".", 1)[-1]
     for key, value in data.items():
+        where = f"{path}.{key}" if path else key
         if key not in known:
-            raise ValueError(f"Unknown config key '{key}' in section {cls.__name__}")
+            moved = _MOVED.get((section, key))
+            if moved:
+                raise ValueError(f"Config key '{where}' has moved to {moved} (see config.example.yaml)")
+            raise ValueError(f"Unknown config key '{where}'")
         current = getattr(obj, key)
         if is_dataclass(current):
-            setattr(obj, key, _build(type(current), value))
+            setattr(obj, key, _build(type(current), value, where))
         else:
-            setattr(obj, key, _coerce(current, value))
+            try:
+                setattr(obj, key, _coerce(current, value, key))
+            except ValueError as exc:
+                raise ValueError(f"Config key '{where}': {exc}") from exc
     return obj
 
 
-def _coerce(current: Any, value: Any) -> Any:
-    """Coerce env-expanded strings back to the default's type."""
-    if value is None or not isinstance(value, str):
+def _coerce(current: Any, value: Any, key: str = "") -> Any:
+    """Coerce env-expanded strings back to the default's type; *_s fields accept durations."""
+    if value is None:
+        return value
+    if isinstance(current, float) and key.endswith("_s"):
+        return parse_duration(value)
+    if not isinstance(value, str):
         return value
     if isinstance(current, bool):
         return value.strip().lower() in ("1", "true", "yes", "on")

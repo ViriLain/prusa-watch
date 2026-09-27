@@ -1,11 +1,11 @@
 """Listen for button replies on an ntfy topic.
 
-Alert buttons POST a tiny text body ("veto <id>", "act <id>", "stop <id>") to
+Alert buttons POST a tiny text body ("<command> <incident-id>", e.g. "veto x1Y2z3") to
 ``notify.ntfy.reply_topic``. We hold an outbound streaming subscription to that
 topic (``GET /<topic>/json``), so replies arrive whether your phone is on the
 home Wi-Fi or on LTE, with nothing exposed to the internet.
 
-Every command must carry the id of the *current* pending alert; anything else
+Every command must carry the id of the *current* incident; anything else
 (old alerts, replays, junk someone posted to the topic) is ignored.
 """
 
@@ -23,7 +23,7 @@ from .config import NtfyConfig
 
 log = logging.getLogger(__name__)
 
-COMMANDS = ("veto", "act", "stop")
+COMMANDS = ("veto", "act", "stop", "resume", "mute")
 
 
 def parse_command(text: str) -> tuple[str, str] | None:
@@ -39,11 +39,10 @@ class NtfyReplyListener:
         cfg: NtfyConfig,
         handler: Callable[[str, str], str | None],
         transport: httpx.BaseTransport | None = None,
-        backoff_s: float = 5.0,
     ):
         self.cfg = cfg
         self.handler = handler
-        self.backoff_s = backoff_s
+        self.backoff_s = cfg.reply_reconnect_s
         headers = {"Authorization": f"Bearer {cfg.token}"} if cfg.token else {}
         self._client = httpx.Client(headers=headers, transport=transport, timeout=httpx.Timeout(10.0, read=120.0))
         self._since = str(int(time.time()))  # never act on replies older than our start

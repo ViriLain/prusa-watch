@@ -85,36 +85,74 @@ prusa-watch run        # dashboard on http://localhost:8484
 - **ROI (biggest accuracy win):** crop to the build plate so the frame, door, cable chain, and any tool dock or purge area are excluded. Open *Live (raw)* on the dashboard to see the ROI box, then adjust `camera.roi` (normalized `[x1, y1, x2, y2]`).
 - **Test detection** button: runs the model on the current frame without touching decision state. Hold some spaghetti in view to sanity-check it.
 - `decision.sensitivity`: `1.0` is Obico's default. Raise it to about `1.25–1.5` if moderate failures only warn. Lower it if you get false pauses.
-- `decision.action`: start with `notify` for a few prints to watch the scores, then switch to `pause`.
+- `escalation.default_policy`: start with a notify-only policy (the example has `watch_only`) for a few prints to watch the scores, then switch to one that pauses.
 - **False positive mid-print?** Tap *False alarm: resume + mute* in the ntfy notification, or *Mute this print* on the dashboard.
 
-## Veto window and schedules
+## Configuration
 
-Instead of pausing the moment it's confident, prusa-watch can ask first:
+Everything is set in `config.yaml`. [`config.example.yaml`](config.example.yaml) lists **every** setting with its default; a test fails if a new setting isn't documented there.
 
+- Any `*_s` setting, and every escalation `at:`, accepts seconds or a duration: `90`, `"90s"`, `"2m"`, `"1h30m"`.
+- Unknown keys are rejected at startup. So are keys from older versions, and the error names where each one moved (for example, `decision.action` → `escalation.policies.<name>.steps[].action`).
+- `prusa-watch check` prints each policy's steps and which policy is active right now.
+
+## Escalation policies
+
+Detection (`decision:`) decides *whether* a print is failing. Escalation (`escalation:`) decides *what happens next*. A failure verdict opens an **incident**, and the active **policy** runs its timed **steps**:
+
+```yaml
+escalation:
+  default_policy: ask_first
+  snooze_s: 30m                  # after "Keep printing" (or a notify-only policy): no new incident for this long
+  policies:
+    ask_first:
+      steps:
+        - {at: 0,   notify: [ntfy, discord, webhook], priority: 5, buttons: [keep, act, stop]}
+        - {at: 1m,  notify: [ntfy], title: "{printer}: still failing, {next_action} in {next_action_in}"}
+        - {at: 2m,  action: pause}
+        - {at: 2h,  action: stop, notify: [ntfy, discord], priority: 4}   # nobody answered for 2 h
+    night:
+      steps:
+        - {at: 0, action: pause, notify: [ntfy], priority: 2}             # silent notification
+  schedules:
+    - {name: night, start: "22:00", end: "07:00", policy: night}
 ```
-failure verdict ──▶ push: "pausing in 2:00 unless you respond"  [Keep printing] [Pause now] [Cancel print]
-                         │
-          ┌──────────────┼───────────────────────┬──────────────────────────────┐
-     Keep printing    Pause now / Cancel      no response                you pause at the printer
-   snooze 30 min,     act immediately         pause at 2:00 (fail-safe)   pending alert cancelled
-   then re-arm
-```
 
-- `decision.veto_window_s` sets the window length. `0` means act immediately, which was the previous behavior.
-- `decision.veto_snooze_s` sets how long *Keep printing* disarms actions. The default is 30 min, not the rest of the print, so a real failure later still gets caught. Set it to `0` to mute for the rest of the print.
-- `decision.schedules` holds time-of-day overrides; the first match wins. Windows can cross midnight, and `days` refers to the day the window starts. A rule can override `action` and `veto_window_s`, and it can set `quiet: true`, which sends priority-2 notifications that don't make a sound. The example config ships a `night` rule, 22:00–07:00, that pauses immediately and quietly.
-- `timezone` (IANA name) controls the schedule clock. Leave it empty to use the host's time.
+| Step key | Meaning |
+|---|---|
+| `at` | time after detection; steps run in order |
+| `action` | `pause`, `stop` or none. A pause only happens while printing; a stop also cancels a print that's already paused |
+| `notify` | channels (`ntfy`, `discord`, `webhook`); omit = all configured, `[]` = silent |
+| `priority` | ntfy 1–5 (5 breaks through Do Not Disturb on Android). Default 5 |
+| `buttons` | up to 3 of `keep`, `act`, `stop`, `resume`, `mute`, `dashboard`. Omit to get automatic buttons: keep/act/stop before we act, resume/mute/stop after a pause |
+| `title`, `message` | templates with `{printer} {job} {score} {policy} {schedule} {next_action} {next_action_in} {elapsed} {action_taken}` |
+| `attach_image` | include the annotated frame (default true) |
 
-**How the buttons reach prusa-watch from anywhere:** each button POSTs `veto <id>`, `act <id>` or `stop <id>` to `notify.ntfy.reply_topic`. prusa-watch keeps an **outbound** streaming subscription to that topic, so the buttons work on LTE with no port forwarding and no VPN. Every alert has a one-time id, and replies that don't match the current pending alert are ignored. If `reply_topic` isn't set, the buttons call the dashboard directly, which only works on your LAN or VPN.
+What the buttons do:
+- **keep:** false alarm, keep printing. It also resumes the print if we'd already paused it.
+- **act:** run the next action step now, skipping any reminders before it.
+- **stop:** cancel the print.
+- **resume:** resume the print.
+- **mute:** resume, and no more alerts for this print.
 
-The dashboard shows the same countdown with the same three buttons. The generic webhook payload includes `pending_id`, `deadline_ts`, `veto_url` and `act_url`, so Home Assistant can build its own actionable notification.
+**When an incident ends:**
+- You answer it.
+- You handle it at the printer (pause, resume or stop there).
+- The job ends.
+- The steps run out. The exception is a print we paused: that incident stays open so *Resume* keeps working.
+
+**Schedules:** time windows pick the policy, and the first match wins. Windows can cross midnight, and `days` refers to the day the window starts. With no match, `default_policy` applies. The top-level `timezone` setting (an IANA name) sets the schedule clock.
+
+**How the buttons reach prusa-watch from anywhere:** each button POSTs `<command> <incident-id>` to `notify.ntfy.reply_topic`. prusa-watch keeps an **outbound** streaming subscription to that topic, so the buttons work on LTE with no port forwarding and no VPN. Replies that don't match the open incident, or don't make sense in its current state, are ignored. If `reply_topic` isn't set, the buttons call the dashboard directly, which only works on your LAN or VPN.
+
+The dashboard shows a live countdown to the next action, with buttons for whatever commands currently apply. The webhook payload includes `incident_id`, `policy`, `next_action`, `next_action_ts` and `command_urls`, so Home Assistant can build its own actionable notifications.
 
 ## Notifications
 
-- **ntfy** (default): the image is attached. When `PUBLIC_URL` is set, the notification gets action buttons: *Resume*, *False alarm: resume + mute*, and *Cancel print*. These buttons call the dashboard directly, so they only work while your phone is on the LAN or VPN (Tailscale, WireGuard). Self-host ntfy or use a long random topic. Topics on ntfy.sh are public-by-name.
-- **Discord**: webhook with embedded image.
-- **Webhook**: JSON POST with `kind`, `job_name`, `score`, `action_taken`, and `image_url`. Point it at a Home Assistant webhook trigger to flash lights, announce on speakers, and so on.
+- **Channels:** ntfy (the frame is attached, and the notification has action buttons), Discord (embedded image), or a generic JSON webhook.
+- **Incident notifications** are routed per step, as described above.
+- **Everything else** is routed under `notify:`. `notify.warning` covers the "possible failure" heads-up, `notify.camera` covers the camera going offline or coming back, and `notify.info` covers confirmations. Each has `enabled`, `channels`, `priority` and `cooldown_s`.
+- **ntfy.sh topics are public-by-name.** Use long random names for `topic` and `reply_topic`, or self-host ntfy with ACLs and set `token`.
 
 ## Endpoints
 
@@ -124,13 +162,13 @@ The dashboard shows the same countdown with the same three buttons. The generic 
 | `GET /api/state` | full JSON state + 2 h score history |
 | `GET /frame.jpg`, `/raw.jpg` | last analyzed (annotated) frame / live frame with ROI box |
 | `POST /api/pause`, `/api/resume[?mute=1]`, `/api/stop`, `/api/mute`, `/api/unmute`, `/api/test` | require `?token=` or `X-Token` when `web.token` is set |
-| `POST /api/pending/veto`, `/act`, `/stop` `[?id=]` | answer the current veto-window alert (no id = whatever is pending); token required |
-| `GET /metrics` | Prometheus: score, p, ewm, baseline, inference ms, frame age, camera and printer up, state, counters |
+| `POST /api/incident/{veto,act,stop,resume,mute}` `[?id=]` | answer the open incident (no id = the current one); token required |
+| `GET /metrics` | Prometheus: score, p, ewm, baseline, inference ms, frame age, camera and printer up, state, incident open, seconds to the next action, counters (pauses, stops, vetoes, auto actions, ...) |
 
 ## Security
 
 - Control endpoints can pause or cancel your print. Set `WEB_TOKEN`, and don't port-forward 8484. Use a VPN for remote access.
-- The ntfy **reply topic** can pause, stop or keep a print, but only while an alert with a matching one-time id is pending. On ntfy.sh, topics are public-by-name, so give it a long random name. Better: self-host ntfy with an ACL and set `token`.
+- The ntfy **reply topic** can pause, stop, resume or keep a print, but only for the open incident's one-time id. On ntfy.sh, topics are public-by-name, so give it a long random name. Better: self-host ntfy with an ACL and set `token`.
 - PrusaLink is plain HTTP with digest auth. Keep it on the LAN.
 - The Buddy3D RTSP stream is unauthenticated and unencrypted. Anyone on your LAN or Wi-Fi can watch it. Put IoT devices on their own VLAN if that matters to you.
 
@@ -144,7 +182,7 @@ The dashboard shows the same countdown with the same three buttons. The generic 
 
 ```bash
 pip install -e ".[dev]"
-pytest                                    # 73 tests, synthetic ONNX model, no hardware
+pytest                                    # 107 tests, synthetic ONNX model, no hardware
 python scripts/fake_printer.py &          # PrusaLink simulator (apikey auth, password "test")
 ```
 

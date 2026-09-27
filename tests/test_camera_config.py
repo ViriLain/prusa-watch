@@ -48,7 +48,7 @@ def test_config_env_expansion_and_validation(tmp_path, monkeypatch):
         """
 printer: {host: 192.168.1.50, password: "${PL_PASS}"}
 camera: {url: "rtsp://192.168.1.51/live", roi: [0.1, 0.1, 0.9, 0.9]}
-decision: {sensitivity: "${SENS}", action: pause}
+decision: {sensitivity: "${SENS}"}
 notify: {ntfy: {topic: "${NTFY_TOPIC:-default-topic}"}}
 """
     )
@@ -62,8 +62,8 @@ notify: {ntfy: {topic: "${NTFY_TOPIC:-default-topic}"}}
 def test_config_rejects_unknown_keys_and_bad_values(tmp_path):
     p = tmp_path / "c.yaml"
     p.write_text("printer: {hots: x}\n")
-    with pytest.raises(ValueError, match="Unknown config key 'hots'"):
+    with pytest.raises(ValueError, match="Unknown config key 'printer.hots'"):
         load_config(p)
-    p.write_text("printer: {host: x, password: y}\ncamera: {url: rtsp://a/live}\ndecision: {action: explode}\n")
-    with pytest.raises(ValueError, match="decision.action"):
+    p.write_text("printer: {host: x, password: y}\ncamera: {url: rtsp://a/live}\nescalation: {policies: {p: {steps: [{action: explode}]}}}\n")
+    with pytest.raises(ValueError, match="action must be one of"):
         load_config(p).validate()

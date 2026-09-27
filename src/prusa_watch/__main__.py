@@ -54,7 +54,8 @@ def cmd_check(cfg: Config) -> int:
         print(f"  FAIL {exc}")
 
     print(f"[camera] {cfg.camera.url}")
-    g = FrameGrabber(cfg.camera.url, cfg.camera.transport)
+    c = cfg.camera
+    g = FrameGrabber(c.url, c.transport, c.reconnect_backoff_s, c.open_timeout_s, c.read_timeout_s)
     g.start()
     deadline = time.time() + 20
     while time.time() < deadline and g.latest() is None:
@@ -73,6 +74,20 @@ def cmd_check(cfg: Config) -> int:
         p = Path(cfg.state_dir) / "check_frame.jpg"
         cv2.imwrite(str(p), frame.image)
         print(f"  saved {p}")
+
+    print("[escalation]")
+    from .escalation import PolicyResolver, parse_escalation
+
+    esc = parse_escalation(cfg.escalation)
+    pol, sched = PolicyResolver(esc, cfg.timezone).resolve(time.time())
+    for name, p in esc.policies.items():
+        marks = " (default)" if name == esc.default_policy else ""
+        marks += " <- active now" + (f" via schedule '{sched}'" if sched else "") if name == pol.name else ""
+        print(f"  policy {name}{marks}")
+        for st in p.steps:
+            print(f"    at {st.at:>6.0f}s  action={st.action or '-':5}  notify={st.notify if st.notify is not None else 'all'}  prio={st.priority}")
+    if cfg.notify.ntfy.topic and not cfg.notify.ntfy.reply_topic:
+        print("  note: notify.ntfy.reply_topic not set - buttons only work on your LAN (via web.public_url)")
 
     print(f"[model] {cfg.detector.model_path}")
     if not Path(cfg.detector.model_path).exists():
