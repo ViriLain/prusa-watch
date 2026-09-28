@@ -132,7 +132,10 @@ fn schedule_matching_matches_python() {
 
 #[test]
 fn effective_default_config_matches_python() {
-    let got = serde_json::to_value(effective_config(&Config::default(), true)).unwrap();
+    let mut got = serde_json::to_value(effective_config(&Config::default(), true)).unwrap();
+    // settings added after the Python version (field regressions, job 419)
+    got["camera"].as_object_mut().unwrap().remove("ignore");
+    got["decision"].as_object_mut().unwrap().remove("min_frame_p");
     let exp = fixture("effective_defaults.json");
     fn norm(v: &Value) -> Value {
         match v {

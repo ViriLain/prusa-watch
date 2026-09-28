@@ -68,6 +68,10 @@ pub struct CameraConfig {
     pub open_timeout_s: f64,
     /// no frame for this long = reconnect
     pub read_timeout_s: f64,
+    /// Regions to ignore, each normalized [x1, y1, x2, y2] in *full-frame* coordinates
+    /// (same space as `roi`). Detections whose centre falls inside one are dropped before
+    /// scoring: for a spot that glints or collects debris and keeps fooling the model.
+    pub ignore: Vec<Vec<f64>>,
 }
 
 impl Default for CameraConfig {
@@ -80,6 +84,7 @@ impl Default for CameraConfig {
             reconnect_backoff_s: 5.0,
             open_timeout_s: 10.0,
             read_timeout_s: 10.0,
+            ignore: vec![],
         }
     }
 }
@@ -130,6 +135,11 @@ pub struct DecisionConfig {
     /// Fresh-install prior: seed the long-run baseline as if we'd already watched
     /// this many clean (p=0) frames (360 = 1 h). Set 0 for exact Obico behavior.
     pub baseline_prior_frames: i64,
+    /// An incident only opens when the *current* frame's summed confidence is at least
+    /// this. Obico's verdict rides a moving average, which keeps "remembering" a short
+    /// burst (a glint, dust catching the light) after the frame is clean again; without
+    /// this gate that tail can pause a print on a frame with nothing in it. 0 = pure Obico.
+    pub min_frame_p: f64,
 }
 
 impl Default for DecisionConfig {
@@ -146,6 +156,7 @@ impl Default for DecisionConfig {
             rolling_mean_short_multiple: 3.8,
             escalating_factor: 1.75,
             baseline_prior_frames: 360,
+            min_frame_p: 0.3,
         }
     }
 }
@@ -369,6 +380,16 @@ impl Config {
             && (r.len() != 4 || !(0.0 <= r[0] && r[0] < r[2] && r[2] <= 1.0 && 0.0 <= r[1] && r[1] < r[3] && r[3] <= 1.0))
         {
             errors.push("camera.roi must be [x1, y1, x2, y2] with 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1".into());
+        }
+        for (i, r) in self.camera.ignore.iter().enumerate() {
+            if r.len() != 4 || !(0.0 <= r[0] && r[0] < r[2] && r[2] <= 1.0 && 0.0 <= r[1] && r[1] < r[3] && r[3] <= 1.0) {
+                errors.push(format!(
+                    "camera.ignore[{i}] must be [x1, y1, x2, y2] with 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1 (full-frame coordinates)"
+                ));
+            }
+        }
+        if self.decision.min_frame_p < 0.0 {
+            errors.push("decision.min_frame_p must be >= 0".into());
         }
         if errors.is_empty() {
             Ok(())

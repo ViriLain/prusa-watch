@@ -491,13 +491,19 @@ impl Monitor {
                 return;
             }
         };
+        let zones = ignore_zones_in_crop(cfg, roi_img.width(), roi_img.height());
+        let (detections, ignored) = drop_ignored(detections, &zones);
+        if !ignored.is_empty() {
+            tracing::debug!("Analyze: ignored {} box(es) in camera.ignore zones", ignored.len());
+        }
         let confs: Vec<f64> = detections.iter().map(|d| d.confidence).collect();
         let verdict = core.decider.update(&confs);
         let s = core.decider.state.clone();
         core.counters.frames_analyzed += 1;
 
         let label = format!("{}  score {:.2}  p {:.2}", verdict.as_str().to_uppercase(), s.normalized_p, s.current_p);
-        let annotated = annotate(&roi_img, &detections, cfg.detector.visualization_threshold, Some(&label));
+        let mut annotated = annotate(&roi_img, &detections, cfg.detector.visualization_threshold, Some(&label));
+        draw_zones(&mut annotated, &zones);
         let jpeg = Arc::new(encode_jpeg(&annotated, 85));
         let now = self.now();
         let inference_ms = self.detector.last_inference_ms();
@@ -558,6 +564,14 @@ impl Monitor {
             return;
         }
         match verdict {
+            // Obico's verdict rides the moving average, which outlives a short burst; don't act
+            // on a frame that itself shows (almost) nothing.
+            Verdict::Failure if s.current_p < cfg.decision.min_frame_p => tracing::info!(
+                "Monitor: failure verdict on job {} but this frame's p={:.2} < decision.min_frame_p={}; not opening an incident",
+                core.job.job_id.map(|j| j.to_string()).unwrap_or("None".into()),
+                s.current_p,
+                cfg.decision.min_frame_p
+            ),
             Verdict::Failure => self.open_incident(core, status, jpeg, &annotated, now),
             Verdict::Warning => self.on_warning(core, jpeg),
             Verdict::Ok => {}
@@ -1027,9 +1041,12 @@ impl Monitor {
         let frame = self.grabber.latest()?;
         let img = crop_roi(&frame.image, self.cfg.camera.roi.as_deref());
         let dets = self.detector.detect(&img, self.cfg.detector.threshold, self.cfg.detector.nms);
+        let zones = ignore_zones_in_crop(&self.cfg, img.width(), img.height());
+        let (dets, _) = drop_ignored(dets, &zones);
         let total: f64 = dets.iter().map(|d| d.confidence).fold(0.0, |a, b| a + b);
-        let annotated =
+        let mut annotated =
             annotate(&img, &dets, self.cfg.detector.visualization_threshold, Some(&format!("TEST  sum p {total:.2}")));
+        draw_zones(&mut annotated, &zones);
         Some((dets, encode_jpeg(&annotated, 85)))
     }
 
@@ -1073,11 +1090,51 @@ impl Monitor {
                 2,
             );
         }
+        let (w, h) = (img.width() as f64, img.height() as f64);
+        let full: Vec<[f64; 4]> =
+            self.cfg.camera.ignore.iter().filter(|z| z.len() == 4).map(|z| [z[0] * w, z[1] * h, z[2] * w, z[3] * h]).collect();
+        draw_zones(&mut img, &full);
         Some(encode_jpeg(&img, 80))
     }
 
     pub fn weak(&self) -> Weak<Monitor> {
         self.me.clone()
+    }
+}
+
+/// `camera.ignore` zones (full-frame normalized) mapped into pixel coordinates of the
+/// ROI-cropped image the model sees: [x1, y1, x2, y2].
+pub fn ignore_zones_in_crop(cfg: &Config, crop_w: u32, crop_h: u32) -> Vec<[f64; 4]> {
+    let roi: &[f64] = cfg.camera.roi.as_deref().filter(|r| r.len() == 4).unwrap_or(&[0.0, 0.0, 1.0, 1.0]);
+    let (rw, rh) = (roi[2] - roi[0], roi[3] - roi[1]);
+    if rw <= 0.0 || rh <= 0.0 {
+        return vec![];
+    }
+    let (cw, ch) = (crop_w as f64, crop_h as f64);
+    cfg.camera
+        .ignore
+        .iter()
+        .filter(|z| z.len() == 4)
+        .map(|z| {
+            let fx = |x: f64| ((x - roi[0]) / rw).clamp(0.0, 1.0) * cw;
+            let fy = |y: f64| ((y - roi[1]) / rh).clamp(0.0, 1.0) * ch;
+            [fx(z[0]), fy(z[1]), fx(z[2]), fy(z[3])]
+        })
+        .filter(|z| z[2] > z[0] && z[3] > z[1])
+        .collect()
+}
+
+/// Split detections into (kept, ignored) by whether the box centre lies in any zone.
+pub fn drop_ignored(dets: Vec<Detection>, zones: &[[f64; 4]]) -> (Vec<Detection>, Vec<Detection>) {
+    dets.into_iter().partition(|d| {
+        let (cx, cy) = (d.bbox[0], d.bbox[1]);
+        !zones.iter().any(|z| cx >= z[0] && cx <= z[2] && cy >= z[1] && cy <= z[3])
+    })
+}
+
+fn draw_zones(img: &mut RgbImage, zones: &[[f64; 4]]) {
+    for z in zones {
+        draw_rect(img, (z[0] as i64, z[1] as i64), (z[2] as i64, z[3] as i64), Rgb([150, 150, 150]), 1);
     }
 }
 
