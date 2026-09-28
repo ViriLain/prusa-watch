@@ -57,7 +57,12 @@ fn grabber_reads_video_file() {
 fn grabber_survives_bad_url() {
     let g = Grabber::new("/nonexistent/file.mp4", "tcp", 0.1, 10.0, 10.0);
     g.start();
-    std::thread::sleep(Duration::from_millis(500));
+    // Python's in-process OpenCV failed instantly; here ffmpeg has to start and exit first,
+    // which on a cold CI runner can take longer than the original fixed 0.5 s.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while g.0.reconnects() < 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     g.stop();
     assert!(g.latest().is_none());
     assert!(g.0.reconnects() >= 1, "reconnects={}", g.0.reconnects());
