@@ -109,6 +109,10 @@ fn ensure_model(path: &str, force: bool) -> bool {
     }
 }
 
+/// macOS 15+ blocks LAN access for command-line tools whose terminal app lacks the
+/// Local Network permission, and reports it as EHOSTUNREACH. (curl is exempt, which hides it.)
+const MACOS_LOCAL_NETWORK_HINT: &str = "  hint: on macOS this usually means your terminal app lacks the Local Network permission:\n        System Settings > Privacy & Security > Local Network > enable your terminal, then quit (Cmd-Q) and reopen it.";
+
 fn cmd_check(cfg: &Config) -> ExitCode {
     let mut ok = true;
     let p = &cfg.printer;
@@ -131,6 +135,9 @@ fn cmd_check(cfg: &Config) -> ExitCode {
         Err(e) => {
             ok = false;
             println!("  FAIL {e}");
+            if cfg!(target_os = "macos") && e.to_string().contains("No route to host") {
+                println!("{MACOS_LOCAL_NETWORK_HINT}");
+            }
         }
     }
 

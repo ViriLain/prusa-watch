@@ -81,6 +81,7 @@ prusa-watch run            # dashboard on http://localhost:8484
 - The first `check` or `run` downloads the ~200 MB model into `models/`. `prusa-watch fetch-model --force` re-downloads it.
 - `ffmpeg` decodes the camera stream. If it isn't on your `PATH`, set `PRUSA_WATCH_FFMPEG=/path/to/ffmpeg`.
 - On a Mac, keep the machine awake while testing: `caffeinate -i prusa-watch run`.
+- **macOS 15+: "No route to host (os error 65)"** for the printer and camera, while `curl` to the same IP works, means your terminal app lacks the Local Network permission. Command-line tools inherit it from the terminal; Apple's own binaries like curl are exempt. Enable it in *System Settings → Privacy & Security → Local Network*, then quit and reopen the terminal.
 
 `check` saves the grabbed frame to `data/check_frame.jpg`. Look at it before trusting the system.
 
