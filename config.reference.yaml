@@ -43,7 +43,7 @@ detector:
   threshold: 0.08                  # per-box confidence floor (Obico default; don't raise it)
   nms: 0.45
   interval_s: 10                   # decision parameters are tuned for 10 s
-  use_gpu: false                   # CPU is plenty at 1 frame / 10 s
+  use_gpu: false                   # accepted but ignored: inference runs on the CPU (plenty at 1 frame / 10 s)
   visualization_threshold: 0.2     # boxes drawn on the dashboard and in alerts
 
 # ───────────────────────────── decision ─────────────────────────────

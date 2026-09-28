@@ -1,0 +1,163 @@
+{
+ "printer": {
+  "name": "core-one",
+  "host": "",
+  "scheme": "http",
+  "username": "maker",
+  "password": "",
+  "auth": "digest",
+  "poll_interval_s": 5.0,
+  "timeout_s": 5.0
+ },
+ "camera": {
+  "url": "",
+  "transport": "tcp",
+  "roi": null,
+  "stale_after_s": 30.0,
+  "reconnect_backoff_s": 5.0,
+  "open_timeout_s": 10.0,
+  "read_timeout_s": 10.0
+ },
+ "detector": {
+  "model_path": "models/model-weights.onnx",
+  "threshold": 0.08,
+  "nms": 0.45,
+  "interval_s": 10.0,
+  "use_gpu": false,
+  "visualization_threshold": 0.2
+ },
+ "decision": {
+  "sensitivity": 1.0,
+  "resume_grace_s": 120.0,
+  "ewm_span": 12,
+  "rolling_win_short": 310,
+  "rolling_win_long": 7200,
+  "threshold_low": 0.38,
+  "threshold_high": 0.78,
+  "init_safe_frame_num": 30,
+  "rolling_mean_short_multiple": 3.8,
+  "escalating_factor": 1.75,
+  "baseline_prior_frames": 360
+ },
+ "notify": {
+  "ntfy": {
+   "url": "https://ntfy.sh",
+   "topic": "",
+   "token": "",
+   "reply_topic": "",
+   "reply_reconnect_s": 5.0
+  },
+  "discord": {
+   "webhook_url": ""
+  },
+  "webhook": {
+   "url": ""
+  },
+  "warning": {
+   "enabled": true,
+   "channels": null,
+   "priority": 4,
+   "cooldown_s": 300.0
+  },
+  "camera": {
+   "enabled": true,
+   "channels": null,
+   "priority": 3,
+   "cooldown_s": 0.0
+  },
+  "info": {
+   "enabled": true,
+   "channels": null,
+   "priority": 3,
+   "cooldown_s": 0.0
+  },
+  "timeout_s": 15.0
+ },
+ "web": {
+  "enabled": true,
+  "host": "0.0.0.0",
+  "port": 8484,
+  "public_url": "",
+  "token": "",
+  "history_s": 7200.0
+ },
+ "recording": {
+  "history": true,
+  "frames": true,
+  "frame_min_p": 0.3,
+  "max_frames_per_job": 120,
+  "keep_jobs": 50
+ },
+ "escalation": {
+  "default_policy": "ask_first",
+  "snooze_s": "30m",
+  "policies": {
+   "ask_first": {
+    "steps": [
+     {
+      "at": 0,
+      "priority": 5,
+      "buttons": [
+       "keep",
+       "act",
+       "stop"
+      ]
+     },
+     {
+      "at": "1m",
+      "priority": 5,
+      "title": "{printer}: still failing, {next_action} in {next_action_in}",
+      "attach_image": false
+     },
+     {
+      "at": "2m",
+      "action": "pause",
+      "priority": 5
+     }
+    ]
+   },
+   "pause_now": {
+    "steps": [
+     {
+      "at": 0,
+      "action": "pause",
+      "priority": 5
+     }
+    ]
+   },
+   "night": {
+    "steps": [
+     {
+      "at": 0,
+      "action": "pause",
+      "priority": 2
+     }
+    ]
+   },
+   "watch_only": {
+    "steps": [
+     {
+      "at": 0,
+      "priority": 4,
+      "buttons": [
+       "stop",
+       "dashboard"
+      ]
+     }
+    ]
+   }
+  },
+  "schedules": [
+   {
+    "name": "night",
+    "start": "22:00",
+    "end": "07:00",
+    "policy": "night"
+   }
+  ]
+ },
+ "state_dir": "data",
+ "timezone": "",
+ "save_failure_frames": true,
+ "log_level": "INFO"
+}

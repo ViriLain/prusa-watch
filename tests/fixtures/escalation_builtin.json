@@ -1,0 +1,90 @@
+{
+ "default_policy": "ask_first",
+ "snooze_s": 1800.0,
+ "policies": {
+  "ask_first": [
+   {
+    "at": 0.0,
+    "action": null,
+    "notify": null,
+    "priority": 5,
+    "buttons": [
+     "keep",
+     "act",
+     "stop"
+    ],
+    "title": null,
+    "message": null,
+    "attach_image": true
+   },
+   {
+    "at": 60.0,
+    "action": null,
+    "notify": null,
+    "priority": 5,
+    "buttons": null,
+    "title": "{printer}: still failing, {next_action} in {next_action_in}",
+    "message": null,
+    "attach_image": false
+   },
+   {
+    "at": 120.0,
+    "action": "pause",
+    "notify": null,
+    "priority": 5,
+    "buttons": null,
+    "title": null,
+    "message": null,
+    "attach_image": true
+   }
+  ],
+  "pause_now": [
+   {
+    "at": 0.0,
+    "action": "pause",
+    "notify": null,
+    "priority": 5,
+    "buttons": null,
+    "title": null,
+    "message": null,
+    "attach_image": true
+   }
+  ],
+  "night": [
+   {
+    "at": 0.0,
+    "action": "pause",
+    "notify": null,
+    "priority": 2,
+    "buttons": null,
+    "title": null,
+    "message": null,
+    "attach_image": true
+   }
+  ],
+  "watch_only": [
+   {
+    "at": 0.0,
+    "action": null,
+    "notify": null,
+    "priority": 4,
+    "buttons": [
+     "stop",
+     "dashboard"
+    ],
+    "title": null,
+    "message": null,
+    "attach_image": true
+   }
+  ]
+ },
+ "schedules": [
+  {
+   "name": "night",
+   "start": "22:00:00",
+   "end": "07:00:00",
+   "policy": "night",
+   "days": null
+  }
+ ]
+}

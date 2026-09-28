@@ -2,7 +2,7 @@
 config.yaml
 data/
 models/
-.venv/
-**/__pycache__
-.pytest_cache
+target/
 tests/
+examples/
+.git/

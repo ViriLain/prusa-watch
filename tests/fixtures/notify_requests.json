@@ -1,0 +1,477 @@
+[
+ {
+  "event": "incident_buttons",
+  "config": "reply_topic",
+  "requests": [
+   {
+    "method": "PUT",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "core-one: pausing in 2:00 unless you respond",
+     "priority": "5",
+     "tags": "hourglass_flowing_sand,printer",
+     "authorization": "Bearer tk_abc",
+     "actions": "http, Keep printing, https://ntfy.example/pw-reply, method=POST, headers.Authorization=Bearer tk_abc, body=veto abc123, clear=true; http, Pause now, https://ntfy.example/pw-reply, method=POST, headers.Authorization=Bearer tk_abc, body=act abc123, clear=true; http, Cancel print, https://ntfy.example/pw-reply, method=POST, headers.Authorization=Bearer tk_abc, body=stop abc123, clear=true",
+     "click": "http://watch.lan:8484",
+     "filename": "frame.jpg",
+     "message": "Spaghetti detected, respond"
+    },
+    "body_len": 6,
+    "body": null
+   }
+  ]
+ },
+ {
+  "event": "incident_buttons",
+  "config": "lan_only",
+  "requests": [
+   {
+    "method": "PUT",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "core-one: pausing in 2:00 unless you respond",
+     "priority": "5",
+     "tags": "hourglass_flowing_sand,printer",
+     "actions": "http, Keep printing, http://watch.lan:8484/api/incident/veto?token=wt&id=abc123, method=POST, clear=true; http, Pause now, http://watch.lan:8484/api/incident/act?token=wt&id=abc123, method=POST, clear=true; http, Cancel print, http://watch.lan:8484/api/incident/stop?token=wt&id=abc123, method=POST, clear=true",
+     "click": "http://watch.lan:8484",
+     "filename": "frame.jpg",
+     "message": "Spaghetti detected, respond"
+    },
+    "body_len": 6,
+    "body": null
+   }
+  ]
+ },
+ {
+  "event": "incident_buttons",
+  "config": "no_public",
+  "requests": [
+   {
+    "method": "PUT",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "core-one: pausing in 2:00 unless you respond",
+     "priority": "5",
+     "tags": "hourglass_flowing_sand,printer",
+     "filename": "frame.jpg",
+     "message": "Spaghetti detected, respond"
+    },
+    "body_len": 6,
+    "body": null
+   }
+  ]
+ },
+ {
+  "event": "incident_buttons",
+  "config": "all_channels",
+  "requests": [
+   {
+    "method": "PUT",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "core-one: pausing in 2:00 unless you respond",
+     "priority": "5",
+     "tags": "hourglass_flowing_sand,printer",
+     "actions": "http, Keep printing, http://watch.lan:8484/api/incident/veto?id=abc123, method=POST, clear=true; http, Pause now, http://watch.lan:8484/api/incident/act?id=abc123, method=POST, clear=true; http, Cancel print, http://watch.lan:8484/api/incident/stop?id=abc123, method=POST, clear=true",
+     "click": "http://watch.lan:8484",
+     "filename": "frame.jpg",
+     "message": "Spaghetti detected, respond"
+    },
+    "body_len": 6,
+    "body": null
+   },
+   {
+    "method": "POST",
+    "url": "https://discord.example/wh",
+    "headers": {
+     "content-type": "multipart/form-data; boundary=02cb448014e8e35734c9614f15c70194"
+    },
+    "body_len": 496,
+    "body": null
+   },
+   {
+    "method": "POST",
+    "url": "https://ha.example/hook",
+    "headers": {
+     "content-type": "application/json"
+    },
+    "body_len": 756,
+    "body": "{\"kind\":\"incident\",\"title\":\"core-one: pausing in 2:00 unless you respond\",\"message\":\"Spaghetti detected, respond\",\"printer\":\"core-one\",\"job_id\":7,\"job_name\":\"a,b;c.bgcode\",\"score\":0.71,\"action_taken\":null,\"priority\":5,\"buttons\":[\"keep\",\"act\",\"stop\"],\"incident_id\":\"abc123\",\"policy\":\"ask_first\",\"next_action\":\"pause\",\"next_action_ts\":1790000120.0,\"ts\":\"2026-09-27T12:00:00+00:00\",\"has_image\":true,\"image_url\":\"http://watch.lan:8484/frame.jpg\",\"command_urls\":{\"veto\":\"http://watch.lan:8484/api/incident/veto?id=abc123\",\"act\":\"http://watch.lan:8484/api/incident/act?id=abc123\",\"stop\":\"http://watch.lan:8484/api/incident/stop?id=abc123\",\"resume\":\"http://watch.lan:8484/api/incident/resume?id=abc123\",\"mute\":\"http://watch.lan:8484/api/incident/mute?id=abc123\"}}"
+   }
+  ]
+ },
+ {
+  "event": "paused",
+  "config": "reply_topic",
+  "requests": [
+   {
+    "method": "POST",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "core-one: print PAUSED",
+     "priority": "5",
+     "tags": "rotating_light,printer",
+     "authorization": "Bearer tk_abc",
+     "actions": "http, Resume, https://ntfy.example/pw-reply, method=POST, headers.Authorization=Bearer tk_abc, body=resume abc123, clear=true; http, False alarm: resume + mute, https://ntfy.example/pw-reply, method=POST, headers.Authorization=Bearer tk_abc, body=mute abc123, clear=true; http, Cancel print, https://ntfy.example/pw-reply, method=POST, headers.Authorization=Bearer tk_abc, body=stop abc123, clear=true",
+     "click": "http://watch.lan:8484"
+    },
+    "body_len": 7,
+    "body": null
+   }
+  ]
+ },
+ {
+  "event": "paused",
+  "config": "lan_only",
+  "requests": [
+   {
+    "method": "POST",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "core-one: print PAUSED",
+     "priority": "5",
+     "tags": "rotating_light,printer",
+     "actions": "http, Resume, http://watch.lan:8484/api/incident/resume?token=wt&id=abc123, method=POST, clear=true; http, False alarm: resume + mute, http://watch.lan:8484/api/incident/mute?token=wt&id=abc123, method=POST, clear=true; http, Cancel print, http://watch.lan:8484/api/incident/stop?token=wt&id=abc123, method=POST, clear=true",
+     "click": "http://watch.lan:8484"
+    },
+    "body_len": 7,
+    "body": null
+   }
+  ]
+ },
+ {
+  "event": "paused",
+  "config": "no_public",
+  "requests": [
+   {
+    "method": "POST",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "core-one: print PAUSED",
+     "priority": "5",
+     "tags": "rotating_light,printer"
+    },
+    "body_len": 7,
+    "body": null
+   }
+  ]
+ },
+ {
+  "event": "paused",
+  "config": "all_channels",
+  "requests": [
+   {
+    "method": "POST",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "core-one: print PAUSED",
+     "priority": "5",
+     "tags": "rotating_light,printer",
+     "actions": "http, Resume, http://watch.lan:8484/api/incident/resume?id=abc123, method=POST, clear=true; http, False alarm: resume + mute, http://watch.lan:8484/api/incident/mute?id=abc123, method=POST, clear=true; http, Cancel print, http://watch.lan:8484/api/incident/stop?id=abc123, method=POST, clear=true",
+     "click": "http://watch.lan:8484"
+    },
+    "body_len": 7,
+    "body": null
+   },
+   {
+    "method": "POST",
+    "url": "https://discord.example/wh",
+    "headers": {
+     "content-type": "application/json"
+    },
+    "body_len": 128,
+    "body": "{\"embeds\":[{\"title\":\"core-one: print PAUSED\",\"description\":\"Paused.\",\"color\":15026253,\"timestamp\":\"2026-09-27T12:00:00+00:00\"}]}"
+   },
+   {
+    "method": "POST",
+    "url": "https://ha.example/hook",
+    "headers": {
+     "content-type": "application/json"
+    },
+    "body_len": 648,
+    "body": "{\"kind\":\"failure\",\"title\":\"core-one: print PAUSED\",\"message\":\"Paused.\",\"printer\":\"core-one\",\"job_id\":7,\"job_name\":\"x\",\"score\":0.9,\"action_taken\":\"paused\",\"priority\":5,\"buttons\":[\"resume\",\"mute\",\"stop\"],\"incident_id\":\"abc123\",\"policy\":\"night\",\"next_action\":null,\"next_action_ts\":null,\"ts\":\"2026-09-27T12:00:00+00:00\",\"has_image\":false,\"command_urls\":{\"veto\":\"http://watch.lan:8484/api/incident/veto?id=abc123\",\"act\":\"http://watch.lan:8484/api/incident/act?id=abc123\",\"stop\":\"http://watch.lan:8484/api/incident/stop?id=abc123\",\"resume\":\"http://watch.lan:8484/api/incident/resume?id=abc123\",\"mute\":\"http://watch.lan:8484/api/incident/mute?id=abc123\"}}"
+   }
+  ]
+ },
+ {
+  "event": "stop_next",
+  "config": "reply_topic",
+  "requests": [
+   {
+    "method": "POST",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "t",
+     "priority": "4",
+     "tags": "hourglass_flowing_sand,printer",
+     "authorization": "Bearer tk_abc",
+     "actions": "http, Stop now, https://ntfy.example/pw-reply, method=POST, headers.Authorization=Bearer tk_abc, body=act zz9, clear=true; view, Dashboard, http://watch.lan:8484; http, Keep printing, https://ntfy.example/pw-reply, method=POST, headers.Authorization=Bearer tk_abc, body=veto zz9, clear=true",
+     "click": "http://watch.lan:8484"
+    },
+    "body_len": 1,
+    "body": null
+   }
+  ]
+ },
+ {
+  "event": "stop_next",
+  "config": "lan_only",
+  "requests": [
+   {
+    "method": "POST",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "t",
+     "priority": "4",
+     "tags": "hourglass_flowing_sand,printer",
+     "actions": "http, Stop now, http://watch.lan:8484/api/incident/act?token=wt&id=zz9, method=POST, clear=true; view, Dashboard, http://watch.lan:8484; http, Keep printing, http://watch.lan:8484/api/incident/veto?token=wt&id=zz9, method=POST, clear=true",
+     "click": "http://watch.lan:8484"
+    },
+    "body_len": 1,
+    "body": null
+   }
+  ]
+ },
+ {
+  "event": "stop_next",
+  "config": "no_public",
+  "requests": [
+   {
+    "method": "POST",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "t",
+     "priority": "4",
+     "tags": "hourglass_flowing_sand,printer"
+    },
+    "body_len": 1,
+    "body": null
+   }
+  ]
+ },
+ {
+  "event": "stop_next",
+  "config": "all_channels",
+  "requests": [
+   {
+    "method": "POST",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "t",
+     "priority": "4",
+     "tags": "hourglass_flowing_sand,printer",
+     "actions": "http, Stop now, http://watch.lan:8484/api/incident/act?id=zz9, method=POST, clear=true; view, Dashboard, http://watch.lan:8484; http, Keep printing, http://watch.lan:8484/api/incident/veto?id=zz9, method=POST, clear=true",
+     "click": "http://watch.lan:8484"
+    },
+    "body_len": 1,
+    "body": null
+   },
+   {
+    "method": "POST",
+    "url": "https://discord.example/wh",
+    "headers": {
+     "content-type": "application/json"
+    },
+    "body_len": 101,
+    "body": "{\"embeds\":[{\"title\":\"t\",\"description\":\"m\",\"color\":15026253,\"timestamp\":\"2026-09-27T12:00:00+00:00\"}]}"
+   },
+   {
+    "method": "POST",
+    "url": "https://ha.example/hook",
+    "headers": {
+     "content-type": "application/json"
+    },
+    "body_len": 603,
+    "body": "{\"kind\":\"incident\",\"title\":\"t\",\"message\":\"m\",\"printer\":\"core-one\",\"job_id\":7,\"job_name\":null,\"score\":null,\"action_taken\":null,\"priority\":4,\"buttons\":[\"act\",\"dashboard\",\"keep\"],\"incident_id\":\"zz9\",\"policy\":null,\"next_action\":\"stop\",\"next_action_ts\":null,\"ts\":\"2026-09-27T12:00:00+00:00\",\"has_image\":false,\"command_urls\":{\"veto\":\"http://watch.lan:8484/api/incident/veto?id=zz9\",\"act\":\"http://watch.lan:8484/api/incident/act?id=zz9\",\"stop\":\"http://watch.lan:8484/api/incident/stop?id=zz9\",\"resume\":\"http://watch.lan:8484/api/incident/resume?id=zz9\",\"mute\":\"http://watch.lan:8484/api/incident/mute?id=zz9\"}}"
+   }
+  ]
+ },
+ {
+  "event": "warning",
+  "config": "reply_topic",
+  "requests": [
+   {
+    "method": "PUT",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "core-one: possible print failure",
+     "priority": "4",
+     "tags": "warning,printer",
+     "authorization": "Bearer tk_abc",
+     "click": "http://watch.lan:8484",
+     "filename": "frame.jpg",
+     "message": "Not acting yet (score 0.35). ???"
+    },
+    "body_len": 6,
+    "body": null
+   }
+  ]
+ },
+ {
+  "event": "warning",
+  "config": "lan_only",
+  "requests": [
+   {
+    "method": "PUT",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "core-one: possible print failure",
+     "priority": "4",
+     "tags": "warning,printer",
+     "click": "http://watch.lan:8484",
+     "filename": "frame.jpg",
+     "message": "Not acting yet (score 0.35). ???"
+    },
+    "body_len": 6,
+    "body": null
+   }
+  ]
+ },
+ {
+  "event": "warning",
+  "config": "no_public",
+  "requests": [
+   {
+    "method": "PUT",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "core-one: possible print failure",
+     "priority": "4",
+     "tags": "warning,printer",
+     "filename": "frame.jpg",
+     "message": "Not acting yet (score 0.35). ???"
+    },
+    "body_len": 6,
+    "body": null
+   }
+  ]
+ },
+ {
+  "event": "warning",
+  "config": "all_channels",
+  "requests": [
+   {
+    "method": "PUT",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "core-one: possible print failure",
+     "priority": "4",
+     "tags": "warning,printer",
+     "click": "http://watch.lan:8484",
+     "filename": "frame.jpg",
+     "message": "Not acting yet (score 0.35). ???"
+    },
+    "body_len": 6,
+    "body": null
+   },
+   {
+    "method": "POST",
+    "url": "https://discord.example/wh",
+    "headers": {
+     "content-type": "multipart/form-data; boundary=84a26ca75fb2b4c5bc9f87be743307fe"
+    },
+    "body_len": 504,
+    "body": null
+   },
+   {
+    "method": "POST",
+    "url": "https://ha.example/hook",
+    "headers": {
+     "content-type": "application/json"
+    },
+    "body_len": 386,
+    "body": "{\"kind\":\"warning\",\"title\":\"core-one: possible print failure\",\"message\":\"Not acting yet (score 0.35). \u00fc\u00f1\u00ed\",\"printer\":\"core-one\",\"job_id\":7,\"job_name\":null,\"score\":0.35,\"action_taken\":null,\"priority\":4,\"buttons\":[],\"incident_id\":null,\"policy\":null,\"next_action\":null,\"next_action_ts\":null,\"ts\":\"2026-09-27T12:00:00+00:00\",\"has_image\":true,\"image_url\":\"http://watch.lan:8484/frame.jpg\"}"
+   }
+  ]
+ },
+ {
+  "event": "camera_up",
+  "config": "reply_topic",
+  "requests": [
+   {
+    "method": "POST",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "cam up",
+     "priority": "3",
+     "tags": "white_check_mark,camera",
+     "authorization": "Bearer tk_abc",
+     "click": "http://watch.lan:8484"
+    },
+    "body_len": 2,
+    "body": null
+   }
+  ]
+ },
+ {
+  "event": "camera_up",
+  "config": "lan_only",
+  "requests": [
+   {
+    "method": "POST",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "cam up",
+     "priority": "3",
+     "tags": "white_check_mark,camera",
+     "click": "http://watch.lan:8484"
+    },
+    "body_len": 2,
+    "body": null
+   }
+  ]
+ },
+ {
+  "event": "camera_up",
+  "config": "no_public",
+  "requests": [
+   {
+    "method": "POST",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "cam up",
+     "priority": "3",
+     "tags": "white_check_mark,camera"
+    },
+    "body_len": 2,
+    "body": null
+   }
+  ]
+ },
+ {
+  "event": "camera_up",
+  "config": "all_channels",
+  "requests": [
+   {
+    "method": "POST",
+    "url": "https://ntfy.example/pw-topic",
+    "headers": {
+     "title": "cam up",
+     "priority": "3",
+     "tags": "white_check_mark,camera",
+     "click": "http://watch.lan:8484"
+    },
+    "body_len": 2,
+    "body": null
+   },
+   {
+    "method": "POST",
+    "url": "https://discord.example/wh",
+    "headers": {
+     "content-type": "application/json"
+    },
+    "body_len": 106,
+    "body": "{\"embeds\":[{\"title\":\"cam up\",\"description\":\"ok\",\"color\":4088797,\"timestamp\":\"2026-09-27T12:00:00+00:00\"}]}"
+   },
+   {
+    "method": "POST",
+    "url": "https://ha.example/hook",
+    "headers": {
+     "content-type": "application/json"
+    },
+    "body_len": 287,
+    "body": "{\"kind\":\"camera_up\",\"title\":\"cam up\",\"message\":\"ok\",\"printer\":\"core-one\",\"job_id\":null,\"job_name\":null,\"score\":null,\"action_taken\":null,\"priority\":3,\"buttons\":[],\"incident_id\":null,\"policy\":null,\"next_action\":null,\"next_action_ts\":null,\"ts\":\"2026-09-27T12:00:00+00:00\",\"has_image\":false}"
+   }
+  ]
+ }
+]
