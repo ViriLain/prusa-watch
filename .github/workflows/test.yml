@@ -44,7 +44,18 @@ jobs:
       - name: Install ffmpeg (camera tests)
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y ffmpeg; else command -v ffmpeg || brew install ffmpeg; fi
-      - run: cargo test --locked
+      - name: cargo test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --no-fail-fast 2>&1 | tee test.log
+      - name: Report failing tests as annotations
+        if: failure()
+        shell: bash
+        run: |
+          # surface failures in the PR's checks view (and the checks API) without opening the log
+          grep -E "^test .* FAILED$|panicked at" -A3 test.log | grep -v "^--$" | head -60 \
+            | sed -e 's/%/%25/g' | while IFS= read -r line; do echo "::error title=cargo test::$line"; done
 
   docker:
     name: docker build + real model
