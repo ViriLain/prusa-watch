@@ -36,6 +36,10 @@ camera:
   reconnect_backoff_s: 5
   open_timeout_s: 10
   read_timeout_s: 10
+  # Spots to ignore, normalized [x1, y1, x2, y2] in full-frame coordinates (like roi), e.g.
+  # [[0.62, 0.05, 0.88, 0.48]] for a sheet corner that glints. Boxes centred inside are dropped.
+  # Shown as grey rectangles on the dashboard. Clean the bed first; mask only what keeps recurring.
+  ignore: []
 
 # ───────────────────────────── detector ─────────────────────────────
 detector:
@@ -53,6 +57,7 @@ decision:
   init_safe_frame_num: 30          # frames of grace at print start (30 x 10 s = 5 min)
   resume_grace_s: 120              # after you resume an AI-paused print, no new incident for this long
   baseline_prior_frames: 360       # fresh-install prior (see README); 0 = exact Obico behavior
+  min_frame_p: 0.3                 # open an incident only if the current frame shows at least this much; 0 = pure Obico
   # Obico's tuned internals; change only if you know why:
   ewm_span: 12
   rolling_win_short: 310
