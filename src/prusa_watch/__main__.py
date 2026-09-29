@@ -5,6 +5,7 @@
     prusa-watch config [-c config.yaml]   # print the effective config (defaults + file + env), secrets masked
     prusa-watch config --defaults         # print the built-in defaults only
     prusa-watch fetch-model [--force]     # download the detection model (run/check do this if it's missing)
+    prusa-watch report [JOB_ID]           # what the detector saw on a recorded print (default: latest)
 
 A `.env` next to the config file (or in the current directory) is loaded
 automatically; variables already set in the shell win.
@@ -193,6 +194,50 @@ def cmd_fetch_model(args) -> int:
     return 0 if _ensure_model(path, force=args.force) else 1
 
 
+def cmd_report(args) -> int:
+    from .recording import summarize
+
+    state_dir = Path(Config().state_dir)
+    if Path(args.config).exists():
+        try:
+            state_dir = Path(load_config(args.config).state_dir)
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            return 2
+    hist = state_dir / "history"
+    if args.job:
+        path = hist / f"job-{args.job}.csv"
+    else:
+        found = sorted(hist.glob("job-*.csv"), key=lambda p: p.stat().st_mtime) if hist.exists() else []
+        path = found[-1] if found else None
+    if path is None or not path.exists():
+        print(f"No recorded print found in {hist}" + (f" for job {args.job}" if args.job else ""), file=sys.stderr)
+        return 1
+    s = summarize(path)
+    meta = path.with_suffix(".json")
+    name = ""
+    if meta.exists():
+        import json
+
+        name = json.loads(meta.read_text()).get("job_name") or ""
+    print(f"{path.stem}  {name}")
+    if not s["frames"]:
+        print("  no analyzed frames")
+        return 0
+    v = s["verdicts"]
+    print(f"  frames      {s['frames']}  ({s['from']} .. {s['to']})")
+    print(f"  verdicts    ok {v['ok']}  warning {v['warning']}  failure {v['failure']}")
+    print(f"  peak p      {s['peak_p']:.2f} at {s['peak_p_at']}  (summed box confidence per frame)")
+    print(f"  peak score  {s['peak_score']:.2f}  (1/3 = warning line, 2/3 = pause line)")
+    print(f"  baseline    {s['baseline']:.3f}")
+    if s["first_warning"]:
+        print(f"  first warn  {s['first_warning']}")
+    if s["first_failure"]:
+        print(f"  first fail  {s['first_failure']}")
+    print(f"  frames saved {s['frames_saved']} -> {state_dir / 'frames' / path.stem}")
+    return 0
+
+
 def _load_env_files(args) -> None:
     from .dotenv import load_dotenv
 
@@ -209,7 +254,8 @@ def _load_env_files(args) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="prusa-watch", description="AI spaghetti detection for Prusa printers + Buddy3D camera")
-    ap.add_argument("command", nargs="?", default="run", choices=["run", "check", "config", "fetch-model"])
+    ap.add_argument("command", nargs="?", default="run", choices=["run", "check", "config", "fetch-model", "report"])
+    ap.add_argument("job", nargs="?", default=None, help="report: job id (default: the most recent recorded print)")
     ap.add_argument("-c", "--config", default=os.environ.get("PRUSA_WATCH_CONFIG", "config.yaml"))
     ap.add_argument("--env-file", default=None, help="load this .env instead of looking next to the config / in the cwd")
     ap.add_argument("--defaults", action="store_true", help="config: show built-in defaults only")
@@ -222,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_config(args)
     if args.command == "fetch-model":
         return cmd_fetch_model(args)
+    if args.command == "report":
+        return cmd_report(args)
     try:
         cfg = load_config(args.config)
     except FileNotFoundError as exc:

@@ -88,6 +88,7 @@ prusa-watch run        # dashboard on http://localhost:8484
 
 - **ROI (biggest accuracy win):** crop to the build plate so the frame, door, cable chain, and any tool dock or purge area are excluded. Open *Live (raw)* on the dashboard to see the ROI box, then adjust `camera.roi` (normalized `[x1, y1, x2, y2]`).
 - **Test detection** button: runs the model on the current frame without touching decision state. Hold some spaghetti in view to sanity-check it.
+- **After a test print or a false alarm, run `prusa-watch report`** (or `prusa-watch report <job-id>`). It prints the peak summed confidence (`p`), the peak score (1/3 is the warning line, 2/3 the pause line), and when the first warning and failure verdicts happened. The raw data is in `data/history/job-<id>.csv` (one row per analyzed frame), and annotated frames where the model saw something are in `data/frames/job-<id>/`. See `recording:` in [`config.reference.yaml`](config.reference.yaml) for limits and retention.
 - `decision.sensitivity`: `1.0` is Obico's default. Raise it to about `1.25–1.5` if moderate failures only warn. Lower it if you get false pauses.
 - `escalation.default_policy`: start with a notify-only policy (the example has `watch_only`) for a few prints to watch the scores, then switch to one that pauses.
 - **False positive mid-print?** Tap *False alarm: resume + mute* in the ntfy notification, or *Mute this print* on the dashboard.

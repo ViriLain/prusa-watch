@@ -152,6 +152,17 @@ class WebConfig:
 
 
 @dataclass
+class RecordingConfig:
+    """What the detector saw, kept on disk for tuning (state_dir/history, state_dir/frames)."""
+
+    history: bool = True  # one CSV row per analyzed frame: history/job-<id>.csv
+    frames: bool = True  # annotated frames when the model sees something: frames/job-<id>/
+    frame_min_p: float = 0.3  # save a frame once its summed confidence reaches this (warning/failure frames always)
+    max_frames_per_job: int = 120  # cap on saved frames per print (~100 KB each)
+    keep_jobs: int = 50  # history/frames of older prints beyond this many are deleted (0 = keep all)
+
+
+@dataclass
 class Config:
     printer: PrinterConfig = field(default_factory=PrinterConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)
@@ -159,6 +170,7 @@ class Config:
     decision: DecisionConfig = field(default_factory=DecisionConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     web: WebConfig = field(default_factory=WebConfig)
+    recording: RecordingConfig = field(default_factory=RecordingConfig)
     # What to do once a failure is detected: timed steps (notify / wait / pause /
     # stop), per-step channels, priorities, buttons and message templates, and
     # schedules that pick a policy by time of day. Parsed and validated by
@@ -197,6 +209,8 @@ class Config:
                 errors.append(f"notify.{name}.channels: unknown {sorted(bad)} (use {list(CHANNELS)})")
             if not 1 <= int(ev.priority) <= 5:
                 errors.append(f"notify.{name}.priority must be 1..5")
+        if self.recording.max_frames_per_job < 0 or self.recording.keep_jobs < 0:
+            errors.append("recording.max_frames_per_job and recording.keep_jobs must be >= 0")
         if self.camera.roi is not None:
             r = self.camera.roi
             if len(r) != 4 or not (0 <= r[0] < r[2] <= 1 and 0 <= r[1] < r[3] <= 1):
