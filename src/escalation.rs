@@ -62,7 +62,7 @@ fn err<T>(msg: impl Into<String>) -> Result<T, EscalationError> {
     Err(EscalationError(msg.into()))
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Step {
     /// seconds after the incident started
     pub at: f64,
@@ -79,7 +79,7 @@ pub struct Step {
     pub attach_image: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Policy {
     pub name: String,
     pub steps: Vec<Step>,
@@ -176,7 +176,11 @@ pub fn merge_escalation(user: Option<&Mapping>) -> Result<Mapping, EscalationErr
     for key in ["default_policy", "snooze_s", "schedules"] {
         if let Some(v) = user.get(key) {
             let nv = if v.is_null() {
-                if key == "schedules" { Value::Sequence(vec![]) } else { merged[key].clone() }
+                if key == "schedules" {
+                    Value::Sequence(vec![])
+                } else {
+                    merged[key].clone()
+                }
             } else {
                 v.clone()
             };
@@ -244,7 +248,10 @@ pub fn format_template(t: &str, fields: &BTreeMap<&str, String>) -> Result<Strin
                 i += 2;
                 continue;
             }
-            let end = chars[i + 1..].iter().position(|&x| x == '}').ok_or("Single '{' encountered in format string")?;
+            let end = chars[i + 1..]
+                .iter()
+                .position(|&x| x == '}')
+                .ok_or("Single '{' encountered in format string")?;
             let inner: String = chars[i + 1..i + 1 + end].iter().collect();
             if inner.contains('{') {
                 return Err("unexpected '{' in field name".into());
@@ -278,7 +285,9 @@ pub fn format_template(t: &str, fields: &BTreeMap<&str, String>) -> Result<Strin
 }
 
 fn apply_spec(val: &str, spec: Option<&str>) -> Result<String, String> {
-    let Some(spec) = spec.filter(|s| !s.is_empty()) else { return Ok(val.to_string()) };
+    let Some(spec) = spec.filter(|s| !s.is_empty()) else {
+        return Ok(val.to_string());
+    };
     let chars: Vec<char> = spec.chars().collect();
     let (fill, align, rest) = if chars.len() >= 2 && matches!(chars[1], '<' | '>' | '^') {
         (chars[0], chars[1], &chars[2..])
@@ -313,7 +322,9 @@ fn template_example_fields() -> BTreeMap<&'static str, String> {
 }
 
 fn check_template(t: Option<&Value>, where_: &str) -> Result<Option<String>, EscalationError> {
-    let Some(t) = t.filter(|v| !v.is_null()) else { return Ok(None) };
+    let Some(t) = t.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
     let t = kstr(t);
     if let Err(e) = format_template(&t, &template_example_fields()) {
         let fields: Vec<&str> = {
@@ -321,7 +332,10 @@ fn check_template(t: Option<&Value>, where_: &str) -> Result<Option<String>, Esc
             f.sort();
             f
         };
-        return err(format!("{where_}: bad template '{t}' ({e}); fields: {}", py_list(&fields)));
+        return err(format!(
+            "{where_}: bad template '{t}' ({e}); fields: {}",
+            py_list(&fields)
+        ));
     }
     Ok(Some(t))
 }
@@ -337,14 +351,29 @@ fn str_list(v: &Value) -> Option<Vec<String>> {
 }
 
 fn parse_step(raw: &Value, where_: &str) -> Result<Step, EscalationError> {
-    let Some(m) = raw.as_mapping() else { return err(format!("{where_}: must be a mapping")) };
-    let unknown = unknown_keys(m, &["at", "action", "notify", "priority", "buttons", "title", "message", "attach_image"]);
+    let Some(m) = raw.as_mapping() else {
+        return err(format!("{where_}: must be a mapping"));
+    };
+    let unknown = unknown_keys(
+        m,
+        &[
+            "at",
+            "action",
+            "notify",
+            "priority",
+            "buttons",
+            "title",
+            "message",
+            "attach_image",
+        ],
+    );
     if !unknown.is_empty() {
         return err(format!("{where_}: unknown keys {}", py_list(&unknown)));
     }
-    let at = parse_duration(m.get("at").unwrap_or(&Value::from(0))).map_err(|e| EscalationError(format!("{where_}.at: {e}")))?;
-    if at < 0.0 {
-        return err(format!("{where_}.at must be >= 0"));
+    let at = parse_duration(m.get("at").unwrap_or(&Value::from(0)))
+        .map_err(|e| EscalationError(format!("{where_}.at: {e}")))?;
+    if !at.is_finite() || !(0.0..=604_800.0).contains(&at) {
+        return err(format!("{where_}.at must be finite and in 0..=604800 seconds"));
     }
     let action = match m.get("action") {
         None | Some(Value::Null) => None,
@@ -358,13 +387,21 @@ fn parse_step(raw: &Value, where_: &str) -> Result<Step, EscalationError> {
         Some(v) if yaml11_bool(v) == Some(true) => None,
         Some(v) if yaml11_bool(v) == Some(false) => Some(vec![]),
         Some(v) => {
-            let list =
-                str_list(v).ok_or_else(|| EscalationError(format!("{where_}.notify: must be a channel or list of channels")))?;
-            let mut bad: Vec<String> = list.iter().filter(|c| !CHANNELS.contains(&c.as_str())).cloned().collect();
+            let list = str_list(v)
+                .ok_or_else(|| EscalationError(format!("{where_}.notify: must be a channel or list of channels")))?;
+            let mut bad: Vec<String> = list
+                .iter()
+                .filter(|c| !CHANNELS.contains(&c.as_str()))
+                .cloned()
+                .collect();
             if !bad.is_empty() {
                 bad.sort();
                 bad.dedup();
-                return err(format!("{where_}.notify: unknown channels {} (use {})", py_list(&bad), py_list(&CHANNELS)));
+                return err(format!(
+                    "{where_}.notify: unknown channels {} (use {})",
+                    py_list(&bad),
+                    py_list(&CHANNELS)
+                ));
             }
             Some(list)
         }
@@ -372,9 +409,10 @@ fn parse_step(raw: &Value, where_: &str) -> Result<Step, EscalationError> {
     let priority = match m.get("priority") {
         None => 5,
         Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f.trunc() as i64)).unwrap_or(0),
-        Some(Value::String(s)) => {
-            s.trim().parse::<i64>().map_err(|_| EscalationError(format!("{where_}.priority must be 1..5")))?
-        }
+        Some(Value::String(s)) => s
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| EscalationError(format!("{where_}.priority must be 1..5")))?,
         Some(Value::Bool(b)) => *b as i64,
         Some(_) => return err(format!("{where_}.priority must be 1..5")),
     };
@@ -389,7 +427,11 @@ fn parse_step(raw: &Value, where_: &str) -> Result<Step, EscalationError> {
             if !bad.is_empty() {
                 bad.sort();
                 bad.dedup();
-                return err(format!("{where_}.buttons: unknown {} (use {})", py_list(&bad), py_list(&BUTTON_NAMES)));
+                return err(format!(
+                    "{where_}.buttons: unknown {} (use {})",
+                    py_list(&bad),
+                    py_list(&BUTTON_NAMES)
+                ));
             }
             if list.len() > 3 {
                 return err(format!("{where_}.buttons: ntfy allows at most 3"));
@@ -405,13 +447,19 @@ fn parse_step(raw: &Value, where_: &str) -> Result<Step, EscalationError> {
         buttons,
         title: check_template(m.get("title"), &format!("{where_}.title"))?,
         message: check_template(m.get("message"), &format!("{where_}.message"))?,
-        attach_image: m.get("attach_image").is_none_or(|v| yaml11_bool(v).unwrap_or_else(|| is_truthy(v))),
+        attach_image: m
+            .get("attach_image")
+            .is_none_or(|v| yaml11_bool(v).unwrap_or_else(|| is_truthy(v))),
     })
 }
 
 /// Parse the user's escalation section merged over BUILTIN (builtin=false: parse as-is).
 pub fn parse_escalation(user: Option<&Mapping>, builtin: bool) -> Result<EscalationConfig, EscalationError> {
-    let raw = if builtin { merge_escalation(user)? } else { user.cloned().unwrap_or_default() };
+    let raw = if builtin {
+        merge_escalation(user)?
+    } else {
+        user.cloned().unwrap_or_default()
+    };
     let unknown = unknown_keys(&raw, &TOP_KEYS);
     if !unknown.is_empty() {
         return err(format!("escalation: unknown keys {}", py_list(&unknown)));
@@ -453,15 +501,22 @@ pub fn parse_escalation(user: Option<&Mapping>, builtin: bool) -> Result<Escalat
         _ => policies[0].0.clone(),
     };
     if !policies.iter().any(|(n, _)| *n == default) {
-        return err(format!("escalation.default_policy '{default}' is not defined in escalation.policies"));
+        return err(format!(
+            "escalation.default_policy '{default}' is not defined in escalation.policies"
+        ));
     }
     let names: BTreeSet<String> = policies.iter().map(|(n, _)| n.clone()).collect();
     let schedules = parse_schedules(raw.get("schedules"), &names).map_err(|e| EscalationError(e.0))?;
     let snooze = parse_duration(raw.get("snooze_s").unwrap_or(&Value::from(1800))).map_err(EscalationError)?;
-    if snooze < 0.0 {
-        return err("escalation.snooze_s must be >= 0");
+    if !snooze.is_finite() || !(0.0..=604_800.0).contains(&snooze) {
+        return err("escalation.snooze_s must be finite and in 0..=604800 seconds");
     }
-    Ok(EscalationConfig { policies, default_policy: default, schedules, snooze_s: snooze })
+    Ok(EscalationConfig {
+        policies,
+        default_policy: default,
+        schedules,
+        snooze_s: snooze,
+    })
 }
 
 pub struct PolicyResolver {
@@ -471,7 +526,10 @@ pub struct PolicyResolver {
 
 impl PolicyResolver {
     pub fn new(esc: EscalationConfig, tz: &str) -> Result<Self, EscalationError> {
-        Ok(Self { esc, tz: resolve_tz(tz).map_err(|e| EscalationError(e.0))? })
+        Ok(Self {
+            esc,
+            tz: resolve_tz(tz).map_err(|e| EscalationError(e.0))?,
+        })
     }
 
     pub fn resolve(&self, ts: f64) -> (Arc<Policy>, Option<String>) {
@@ -490,21 +548,26 @@ pub fn fmt_duration(seconds: f64) -> String {
     let s = seconds.round_ties_even().max(0.0) as i64;
     let (h, rem) = (s / 3600, s % 3600);
     let (m, sec) = (rem / 60, rem % 60);
-    if h > 0 { format!("{h}:{m:02}:{sec:02}") } else { format!("{m}:{sec:02}") }
+    if h > 0 {
+        format!("{h}:{m:02}:{sec:02}")
+    } else {
+        format!("{m}:{sec:02}")
+    }
 }
 
 pub fn new_incident_id() -> String {
-    let bytes: [u8; 6] = rand::random();
+    let bytes: [u8; 16] = rand::random();
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Incident {
     pub policy: Arc<Policy>,
     pub schedule: Option<String>,
     pub job_id: Option<i64>,
     pub started_ts: f64,
     pub score: f64,
+    #[serde(skip)]
     pub jpeg: Arc<Vec<u8>>,
     pub id: String,
     /// first step not yet executed
@@ -584,7 +647,13 @@ impl Incident {
         b.iter().map(|s| s.to_string()).collect()
     }
 
-    pub fn template_fields(&self, now: f64, printer: &str, job: Option<&str>, score: f64) -> BTreeMap<&'static str, String> {
+    pub fn template_fields(
+        &self,
+        now: f64,
+        printer: &str,
+        job: Option<&str>,
+        score: f64,
+    ) -> BTreeMap<&'static str, String> {
         let na = self.next_action();
         let mut f = BTreeMap::new();
         f.insert("printer", printer.to_string());
@@ -597,8 +666,15 @@ impl Incident {
         f.insert("score", format!("{score:.2}"));
         f.insert("policy", self.policy.name.clone());
         f.insert("schedule", self.schedule.clone().unwrap_or_default());
-        f.insert("next_action", na.map(|(_, s)| s.action.clone().unwrap()).unwrap_or_default());
-        f.insert("next_action_in", na.map(|(_, s)| fmt_duration(self.started_ts + s.at - now)).unwrap_or_default());
+        f.insert(
+            "next_action",
+            na.map(|(_, s)| s.action.clone().unwrap()).unwrap_or_default(),
+        );
+        f.insert(
+            "next_action_in",
+            na.map(|(_, s)| fmt_duration(self.started_ts + s.at - now))
+                .unwrap_or_default(),
+        );
         f.insert("elapsed", fmt_duration(now - self.started_ts));
         f.insert("action_taken", self.acted.clone().unwrap_or_default());
         f

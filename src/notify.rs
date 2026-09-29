@@ -4,8 +4,8 @@
 //! decided by the caller (escalation steps and notify.warning/camera/info config).
 //! Sends run on a background thread so a slow endpoint can never delay a pause.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -80,18 +80,24 @@ fn ascii(s: &str) -> String {
 
 /// ntfy action header values containing , or ; must be quoted
 fn q(v: &str) -> String {
-    if v.contains(',') || v.contains(';') { format!("\"{v}\"") } else { v.to_string() }
+    if v.contains(',') || v.contains(';') {
+        format!("\"{v}\"")
+    } else {
+        v.to_string()
+    }
 }
 
 pub struct Notifier {
     pub cfg: NotifyConfig,
     pub public_url: String,
-    pub control_token: String,
     transport: Arc<dyn Transport>,
     /// send on the caller's thread (tests)
     pub blocking: bool,
-    pub sent: AtomicU64,
-    pub errors: AtomicU64,
+    pub sent: Arc<AtomicU64>,
+    pub errors: Arc<AtomicU64>,
+    workers: Mutex<std::collections::HashMap<String, Arc<crate::worker::Worker<Event>>>>,
+    pub signer: crate::capability::Signer,
+    stopping: Arc<AtomicBool>,
 }
 
 impl Notifier {
@@ -99,15 +105,22 @@ impl Notifier {
         Self::with_transport(cfg, public_url, control_token, Arc::new(ReqwestTransport::new()))
     }
 
-    pub fn with_transport(cfg: NotifyConfig, public_url: &str, control_token: &str, transport: Arc<dyn Transport>) -> Self {
+    pub fn with_transport(
+        cfg: NotifyConfig,
+        public_url: &str,
+        _control_token: &str,
+        transport: Arc<dyn Transport>,
+    ) -> Self {
         Self {
             cfg,
             public_url: public_url.trim_end_matches('/').to_string(),
-            control_token: control_token.into(),
             transport,
             blocking: false,
-            sent: AtomicU64::new(0),
-            errors: AtomicU64::new(0),
+            sent: Arc::new(AtomicU64::new(0)),
+            errors: Arc::new(AtomicU64::new(0)),
+            workers: Mutex::new(std::collections::HashMap::new()),
+            signer: crate::capability::Signer::default(),
+            stopping: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -133,7 +146,11 @@ impl Notifier {
         let configured = self.configured();
         let targets: Vec<&'static str> = match channels {
             None => configured.clone(),
-            Some(list) => configured.iter().filter(|c| list.iter().any(|l| l == *c)).copied().collect(),
+            Some(list) => configured
+                .iter()
+                .filter(|c| list.iter().any(|l| l == *c))
+                .copied()
+                .collect(),
         };
         if targets.is_empty() {
             tracing::info!("Notify (no channel): {} - {}", event.title, event.message);
@@ -142,8 +159,92 @@ impl Notifier {
         if self.blocking {
             self.send_all(&event, &targets);
         } else {
-            let me = self.clone();
-            std::thread::Builder::new().name("notify".into()).spawn(move || me.send_all(&event, &targets)).ok();
+            let mut workers = self.workers.lock().unwrap();
+            for name in targets {
+                let worker = workers.entry(name.into()).or_insert_with(|| {
+                    // A worker owns its sender dependencies, never an Arc back to its owner.
+                    let mut sender =
+                        Notifier::with_transport(self.cfg.clone(), &self.public_url, "", self.transport.clone());
+                    sender.signer = self.signer.clone();
+                    sender.stopping = self.stopping.clone();
+                    let sent = self.sent.clone();
+                    let errors = self.errors.clone();
+                    Arc::new(crate::worker::Worker::new(
+                        &format!("notify-{name}"),
+                        16,
+                        move |event: Event| {
+                            let req = sender.request(name, &event);
+                            for attempt in 0..3 {
+                                if sender.stopping.load(Ordering::Acquire) {
+                                    return Ok(());
+                                }
+                                let response = sender
+                                    .transport
+                                    .send(&req, Duration::from_secs_f64(sender.cfg.timeout_s));
+                                match response {
+                                    Ok(response) if (200..300).contains(&response.status) => {
+                                        sent.fetch_add(1, Ordering::Relaxed);
+                                        return Ok(());
+                                    }
+                                    Ok(response) if response.status != 429 && response.status < 500 => break,
+                                    _ if attempt < 2 => std::thread::sleep(Duration::from_millis(250 << attempt)),
+                                    _ => break,
+                                }
+                            }
+                            errors.fetch_add(1, Ordering::Relaxed);
+                            Err(format!("notification via {name} failed after bounded retries"))
+                        },
+                    ))
+                });
+                if !worker.submit(event.clone()) {
+                    self.errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.stopping.store(true, Ordering::Release);
+        let workers: Vec<_> = self.workers.lock().unwrap().values().cloned().collect();
+        for worker in workers {
+            worker.stop();
+        }
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.workers
+            .lock()
+            .unwrap()
+            .values()
+            .map(|worker| worker.stats.dropped.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    pub fn delivery_health(&self) -> Value {
+        let workers = self.workers.lock().unwrap();
+        Value::Object(
+            workers
+                .iter()
+                .map(|(name, worker)| {
+                    (
+                        name.clone(),
+                        json!({
+                            "sent": worker.stats.completed.load(Ordering::Relaxed),
+                            "errors": worker.stats.errors.load(Ordering::Relaxed),
+                            "dropped": worker.stats.dropped.load(Ordering::Relaxed),
+                            "last_error": worker.stats.last_error.lock().unwrap().clone(),
+                        }),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn request(&self, name: &str, event: &Event) -> HttpRequest {
+        match name {
+            "ntfy" => self.ntfy_request(event),
+            "discord" => self.discord_request(event),
+            _ => self.webhook_request(event),
         }
     }
 
@@ -152,18 +253,21 @@ impl Notifier {
             if !targets.contains(&name) {
                 continue;
             }
-            let req = match name {
-                "ntfy" => self.ntfy_request(event),
-                "discord" => self.discord_request(event),
-                _ => self.webhook_request(event),
-            };
-            let res = self.transport.send(&req, Duration::from_secs_f64(self.cfg.timeout_s.max(0.1))).and_then(|r| {
-                if r.status >= 400 {
-                    Err(format!("HTTP {} {}", r.status, r.text().chars().take(200).collect::<String>()))
-                } else {
-                    Ok(())
-                }
-            });
+            let req = self.request(name, event);
+            let res = self
+                .transport
+                .send(&req, Duration::from_secs_f64(self.cfg.timeout_s.max(0.1)))
+                .and_then(|r| {
+                    if !(200..300).contains(&r.status) {
+                        Err(format!(
+                            "HTTP {} {}",
+                            r.status,
+                            r.text().chars().take(200).collect::<String>()
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                });
             match res {
                 Ok(()) => {
                     self.sent.fetch_add(1, Ordering::Relaxed);
@@ -178,8 +282,16 @@ impl Notifier {
 
     // -- buttons -----------------------------------------------------------
     pub fn dashboard_url(&self, cmd: &str, incident_id: &str) -> String {
-        let q = if self.control_token.is_empty() { "?".to_string() } else { format!("?token={}&", self.control_token) };
-        format!("{}/api/incident/{cmd}{q}id={incident_id}", self.public_url)
+        let mut url = reqwest::Url::parse(&format!("{}/api/incident/{cmd}", self.public_url))
+            .expect("configured dashboard URL must be valid");
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("id", incident_id);
+            let expires = crate::now_ts() as i64 + 3600;
+            query.append_pair("expires", &expires.to_string());
+            query.append_pair("cap", &self.signer.sign(cmd, incident_id, expires));
+        }
+        url.into()
     }
 
     /// Translate button names into ntfy action definitions.
@@ -192,7 +304,11 @@ impl Notifier {
         for b in &e.buttons {
             let Some((cmd, label)) = button(b) else { continue };
             let label = if b == "act" {
-                if e.next_action.as_deref() == Some("stop") { "Stop now" } else { "Pause now" }
+                if e.next_action.as_deref() == Some("stop") {
+                    "Stop now"
+                } else {
+                    "Pause now"
+                }
             } else {
                 label.unwrap_or("")
             };
@@ -202,13 +318,26 @@ impl Notifier {
                 }
                 continue;
             };
-            let Some(iid) = e.incident_id.as_deref().filter(|s| !s.is_empty()) else { continue };
+            let Some(iid) = e.incident_id.as_deref().filter(|s| !s.is_empty()) else {
+                continue;
+            };
             if !c.reply_topic.is_empty() {
                 let url = format!("{}/{}", c.url.trim_end_matches('/'), c.reply_topic);
-                let auth = if c.token.is_empty() { String::new() } else { format!(", headers.Authorization=Bearer {}", c.token) };
-                out.push(format!("http, {}, {url}, method=POST{auth}, body={cmd} {iid}, clear=true", q(label)));
+                let auth = if c.token.is_empty() {
+                    String::new()
+                } else {
+                    format!(", headers.Authorization=Bearer {}", c.token)
+                };
+                out.push(format!(
+                    "http, {}, {url}, method=POST{auth}, body={cmd} {iid}, clear=true",
+                    q(label)
+                ));
             } else if !self.public_url.is_empty() {
-                out.push(format!("http, {}, {}, method=POST, clear=true", q(label), self.dashboard_url(cmd, iid)));
+                out.push(format!(
+                    "http, {}, {}, method=POST, clear=true",
+                    q(label),
+                    self.dashboard_url(cmd, iid)
+                ));
             }
         }
         out.truncate(3);
@@ -243,7 +372,10 @@ impl Notifier {
             req = req.header("Click", self.public_url.clone());
         }
         match e.image() {
-            Some(img) => req.header("Filename", "frame.jpg").header("Message", ascii(&e.message)).body(Body::Bytes(img.to_vec())),
+            Some(img) => req
+                .header("Filename", "frame.jpg")
+                .header("Message", ascii(&e.message))
+                .body(Body::Bytes(img.to_vec())),
             None => req.body(Body::Bytes(e.message.clone().into_bytes())),
         }
     }
@@ -263,7 +395,12 @@ impl Notifier {
         let req = HttpRequest::new("POST", self.cfg.discord.webhook_url.clone());
         match e.image() {
             Some(img) => req.body(Body::Multipart(vec![
-                Part { name: "payload_json".into(), filename: None, content_type: None, data: payload.to_string().into_bytes() },
+                Part {
+                    name: "payload_json".into(),
+                    filename: None,
+                    content_type: None,
+                    data: payload.to_string().into_bytes(),
+                },
                 Part {
                     name: "files[0]".into(),
                     filename: Some("frame.jpg".into()),

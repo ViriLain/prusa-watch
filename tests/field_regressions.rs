@@ -89,6 +89,7 @@ fn job419_rig(tweak: impl FnOnce(&mut Config)) -> Rig {
             detector: Some(Replay::job419()),
             notifier: Some(Arc::new(n)),
             clock: Some(r.clock.as_fn()),
+            ..Default::default()
         },
     )
     .unwrap();
@@ -111,7 +112,11 @@ fn ignore_zone_suppresses_the_glint() {
     r.advance(97);
     assert!(r.printer.calls().is_empty(), "no pause");
     assert_eq!(r.mon.counters().warnings, 0, "not even a warning");
-    assert_eq!(r.mon.snapshot().current_p, 0.0, "the corner's boxes never reached the score");
+    assert_eq!(
+        r.mon.snapshot().current_p,
+        0.0,
+        "the corner's boxes never reached the score"
+    );
 }
 
 #[test]
@@ -129,7 +134,10 @@ fn clean_frame_never_opens_an_incident() {
         (r.printer.count("pause", 419), s.current_p, s.ewm_mean)
     };
     let (pauses, p, ewm) = run(0.0);
-    assert_eq!(pauses, 1, "pure Obico pauses on the decaying average (p={p}, ewm={ewm:.2})");
+    assert_eq!(
+        pauses, 1,
+        "pure Obico pauses on the decaying average (p={p}, ewm={ewm:.2})"
+    );
     let (pauses, _, _) = run(0.3);
     assert_eq!(pauses, 0, "with the gate a clean frame can't open an incident");
 }
@@ -170,7 +178,11 @@ fn ignore_zone_mapping_into_the_roi_crop() {
     assert!((z[0] - (0.62 - 0.14) / 0.74 * 947.0).abs() < 1e-6 && (z[2] - 947.0).abs() < 1e-6);
     assert!((z[1] - 0.05 * 720.0).abs() < 1e-6 && (z[3] - 0.48 * 720.0).abs() < 1e-6);
 
-    let det = |x: f64, y: f64| Detection { label: "failure".into(), confidence: 0.4, bbox: [x, y, 50.0, 50.0] };
+    let det = |x: f64, y: f64| Detection {
+        label: "failure".into(),
+        confidence: 0.4,
+        bbox: [x, y, 50.0, 50.0],
+    };
     let (kept, ignored) = drop_ignored(vec![det(800.0, 100.0), det(300.0, 400.0), det(800.0, 600.0)], &zones);
     assert_eq!(ignored.len(), 1);
     assert_eq!(kept.len(), 2, "outside the zone (left, and below it) is kept");

@@ -7,8 +7,10 @@ services:
     env_file: .env
     environment:
       TZ: America/New_York
+      PRUSA_WATCH__WEB__HOST: 0.0.0.0
+      # WEB_TOKEN in .env is required by config.example.yaml when binding beyond loopback.
     ports:
-      - "8484:8484"
+      - "127.0.0.1:8484:8484"
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       # decision baseline + saved failure frames (relative paths in config resolve under /app)

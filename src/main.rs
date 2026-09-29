@@ -12,6 +12,7 @@
 //! A `.env` next to the config file (or in the current directory) is loaded
 //! automatically; variables already set in the shell win.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -36,7 +37,11 @@ enum Cmd {
 }
 
 #[derive(Parser)]
-#[command(name = "prusa-watch", version, about = "AI spaghetti detection for Prusa printers + Buddy3D camera")]
+#[command(
+    name = "prusa-watch",
+    version,
+    about = "AI spaghetti detection for Prusa printers + Buddy3D camera"
+)]
 struct Args {
     #[arg(value_enum, default_value = "run")]
     command: Cmd,
@@ -66,8 +71,8 @@ fn setup_logging(level: &str) {
         "ERROR" | "CRITICAL" => "error",
         _ => "info",
     };
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(format!("{lvl},hyper=warn,reqwest=warn,tract=warn")));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("{lvl},hyper=warn,reqwest=warn,tract=warn")));
     let timer = tracing_subscriber::fmt::time::ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f".into());
     use std::io::IsTerminal;
     let _ = tracing_subscriber::fmt()
@@ -79,7 +84,7 @@ fn setup_logging(level: &str) {
         .try_init();
 }
 
-fn load_env_files(args: &Args) -> Result<(), ExitCode> {
+fn load_env_files(args: &Args) -> Result<BTreeMap<String, String>, ExitCode> {
     let candidates = match &args.env_file {
         Some(p) => {
             if !p.is_file() {
@@ -90,18 +95,31 @@ fn load_env_files(args: &Args) -> Result<(), ExitCode> {
         }
         None => prusa_watch::dotenv::default_candidates(&args.config),
     };
-    for p in prusa_watch::dotenv::load_dotenv(&candidates, &mut prusa_watch::dotenv::ProcessEnv) {
+    let mut environ = process_env();
+    for p in prusa_watch::dotenv::load_dotenv(&candidates, &mut environ) {
         eprintln!("prusa-watch: loaded {}", p.display());
     }
-    Ok(())
+    Ok(environ)
 }
 
-fn ensure_model(path: &str, force: bool) -> bool {
+fn ensure_model(path: &str, force: bool, expected: &str) -> bool {
     if Path::new(path).exists() && !force {
-        return true;
+        return match prusa_watch::model::verify_digest(Path::new(path), expected) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("{error}");
+                false
+            }
+        };
     }
     match download_model(Path::new(path), DEFAULT_URL, force, &HttpFetch, true, true) {
-        Ok(_) => true,
+        Ok(_) => match prusa_watch::model::verify_digest(Path::new(path), expected) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("{error}");
+                false
+            }
+        },
         Err(e) => {
             eprintln!("{e}\nRetry with:  prusa-watch fetch-model");
             false
@@ -143,7 +161,13 @@ fn cmd_check(cfg: &Config) -> ExitCode {
 
     println!("[camera] {}", cfg.camera.url);
     let c = &cfg.camera;
-    let g = Grabber::new(&c.url, &c.transport, c.reconnect_backoff_s, c.open_timeout_s, c.read_timeout_s);
+    let g = Grabber::new(
+        &c.url,
+        &c.transport,
+        c.reconnect_backoff_s,
+        c.open_timeout_s,
+        c.read_timeout_s,
+    );
     g.start();
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline && g.latest().is_none() {
@@ -172,7 +196,11 @@ fn cmd_check(cfg: &Config) -> ExitCode {
     let resolver = PolicyResolver::new(esc.clone(), &cfg.timezone).expect("validated");
     let (pol, sched) = resolver.resolve(prusa_watch::now_ts());
     for (name, p) in &esc.policies {
-        let mut marks = if *name == esc.default_policy { " (default)".to_string() } else { String::new() };
+        let mut marks = if *name == esc.default_policy {
+            " (default)".to_string()
+        } else {
+            String::new()
+        };
         if *name == pol.name {
             marks += " <- active now";
             if let Some(s) = &sched {
@@ -183,7 +211,10 @@ fn cmd_check(cfg: &Config) -> ExitCode {
         for st in &p.steps {
             let notify = match &st.notify {
                 None => "all".to_string(),
-                Some(n) => format!("[{}]", n.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", ")),
+                Some(n) => format!(
+                    "[{}]",
+                    n.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", ")
+                ),
             };
             println!(
                 "    at {:>6.0}s  action={:<5}  notify={notify}  prio={}",
@@ -198,11 +229,13 @@ fn cmd_check(cfg: &Config) -> ExitCode {
         println!("  note: notify.ntfy.reply_topic not set - buttons only work on your LAN (via web.public_url)");
     }
     if n.ntfy.topic.is_empty() && n.discord.webhook_url.is_empty() && n.webhook.url.is_empty() {
-        println!("  WARNING: no notification channel configured - policies that wait for your answer will just act late");
+        println!(
+            "  WARNING: no notification channel configured - policies that wait for your answer will just act late"
+        );
     }
 
     println!("[model] {}", cfg.detector.model_path);
-    if !ensure_model(&cfg.detector.model_path, false) {
+    if !ensure_model(&cfg.detector.model_path, false, &cfg.detector.expected_sha256) {
         ok = false;
         println!("  FAIL model missing and download failed");
     } else {
@@ -210,9 +243,20 @@ fn cmd_check(cfg: &Config) -> ExitCode {
             Ok(det) => match &frame {
                 Some(f) => {
                     let img = crop_roi(&f.image, cfg.camera.roi.as_deref());
-                    let dets = det.detect(&img, cfg.detector.threshold, cfg.detector.nms);
-                    let sum: f64 = dets.iter().map(|d| d.confidence).fold(0.0, |a, b| a + b);
-                    println!("  OK  {} boxes, sum p={sum:.3}, {:.0} ms", dets.len(), det.last_inference_ms());
+                    match det.try_detect(&img, cfg.detector.threshold, cfg.detector.nms) {
+                        Ok(dets) => {
+                            let sum: f64 = dets.iter().map(|d| d.confidence).fold(0.0, |a, b| a + b);
+                            println!(
+                                "  OK  {} boxes, sum p={sum:.3}, {:.0} ms",
+                                dets.len(),
+                                det.last_inference_ms()
+                            );
+                        }
+                        Err(error) => {
+                            ok = false;
+                            println!("  FAIL inference: {error}");
+                        }
+                    }
                 }
                 None => println!("  OK  loaded"),
             },
@@ -222,12 +266,19 @@ fn cmd_check(cfg: &Config) -> ExitCode {
             }
         }
     }
-    println!("{}", if ok { "\nAll checks passed." } else { "\nSome checks failed." });
+    println!(
+        "{}",
+        if ok {
+            "\nAll checks passed."
+        } else {
+            "\nSome checks failed."
+        }
+    );
     if ok { ExitCode::SUCCESS } else { ExitCode::from(1) }
 }
 
 fn cmd_run(cfg: Config) -> ExitCode {
-    if !ensure_model(&cfg.detector.model_path, false) {
+    if !ensure_model(&cfg.detector.model_path, false, &cfg.detector.expected_sha256) {
         return ExitCode::from(1);
     }
     let web = cfg.web.clone();
@@ -239,7 +290,10 @@ fn cmd_run(cfg: Config) -> ExitCode {
         }
     };
     monitor.start();
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
     let res = rt.block_on(async {
         if web.enabled {
             tracing::info!("Dashboard on http://{}:{}", web.host, web.port);
@@ -249,8 +303,7 @@ fn cmd_run(cfg: Config) -> ExitCode {
             Ok(())
         }
     });
-    let m = monitor.clone();
-    let _ = std::thread::spawn(move || m.stop()).join();
+    let _ = std::thread::spawn(move || monitor.stop()).join();
     match res {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -260,11 +313,11 @@ fn cmd_run(cfg: Config) -> ExitCode {
     }
 }
 
-fn cmd_config(args: &Args) -> ExitCode {
+fn cmd_config(args: &Args, environ: &BTreeMap<String, String>) -> ExitCode {
     let cfg = if args.defaults {
         Config::default()
     } else {
-        match load_config(Some(&args.config), &process_env()) {
+        match load_config(Some(&args.config), environ) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("{e}");
@@ -272,7 +325,10 @@ fn cmd_config(args: &Args) -> ExitCode {
             }
         }
     };
-    print!("{}", serde_yaml::to_string(&effective_config(&cfg, !args.show_secrets)).unwrap_or_default());
+    print!(
+        "{}",
+        serde_yaml::to_string(&effective_config(&cfg, !args.show_secrets)).unwrap_or_default()
+    );
     if !args.defaults
         && let Err(e) = cfg.validate()
     {
@@ -282,9 +338,9 @@ fn cmd_config(args: &Args) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn config_if_present(args: &Args) -> Result<Config, ExitCode> {
+fn config_if_present(args: &Args, environ: &BTreeMap<String, String>) -> Result<Config, ExitCode> {
     if args.config.exists() {
-        load_config(Some(&args.config), &process_env()).map_err(|e| {
+        load_config(Some(&args.config), environ).map_err(|e| {
             eprintln!("{e}");
             ExitCode::from(2)
         })
@@ -293,22 +349,34 @@ fn config_if_present(args: &Args) -> Result<Config, ExitCode> {
     }
 }
 
-fn cmd_fetch_model(args: &Args) -> ExitCode {
-    let path = match config_if_present(args) {
-        Ok(c) => c.detector.model_path,
+fn cmd_fetch_model(args: &Args, environ: &BTreeMap<String, String>) -> ExitCode {
+    let detector = match config_if_present(args, environ) {
+        Ok(c) => c.detector,
         Err(code) => return code,
     };
+    let path = detector.model_path;
     let p = Path::new(&path);
     if p.exists() && !args.force {
+        if !ensure_model(&path, false, &detector.expected_sha256) {
+            return ExitCode::from(1);
+        }
+        if let Err(error) = SpaghettiDetector::load(p, false) {
+            eprintln!("invalid detector model: {error}");
+            return ExitCode::from(1);
+        }
         let mb = std::fs::metadata(p).map(|m| m.len() as f64 / 1e6).unwrap_or(0.0);
         println!("{path} already exists ({mb:.1} MB); use --force to re-download");
         return ExitCode::SUCCESS;
     }
-    if ensure_model(&path, args.force) { ExitCode::SUCCESS } else { ExitCode::from(1) }
+    if ensure_model(&path, args.force, &detector.expected_sha256) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
 }
 
-fn cmd_report(args: &Args) -> ExitCode {
-    let state_dir = match config_if_present(args) {
+fn cmd_report(args: &Args, environ: &BTreeMap<String, String>) -> ExitCode {
+    let state_dir = match config_if_present(args, environ) {
         Ok(c) => PathBuf::from(c.state_dir),
         Err(code) => return code,
     };
@@ -355,9 +423,20 @@ fn cmd_report(args: &Args) -> ExitCode {
     }
     let v = |k: &str| s.verdicts.iter().find(|(n, _)| n == k).map(|(_, c)| *c).unwrap_or(0);
     println!("  frames      {}  ({} .. {})", s.frames, s.from, s.to);
-    println!("  verdicts    ok {}  warning {}  failure {}", v("ok"), v("warning"), v("failure"));
-    println!("  peak p      {:.2} at {}  (summed box confidence per frame)", s.peak_p, s.peak_p_at);
-    println!("  peak score  {:.2}  (1/3 = warning line, 2/3 = pause line)", s.peak_score);
+    println!(
+        "  verdicts    ok {}  warning {}  failure {}",
+        v("ok"),
+        v("warning"),
+        v("failure")
+    );
+    println!(
+        "  peak p      {:.2} at {}  (summed box confidence per frame)",
+        s.peak_p, s.peak_p_at
+    );
+    println!(
+        "  peak score  {:.2}  (1/3 = warning line, 2/3 = pause line)",
+        s.peak_score
+    );
     println!("  baseline    {:.3}", s.baseline);
     if let Some(t) = &s.first_warning {
         println!("  first warn  {t}");
@@ -365,25 +444,33 @@ fn cmd_report(args: &Args) -> ExitCode {
     if let Some(t) = &s.first_failure {
         println!("  first fail  {t}");
     }
-    println!("  frames saved {} -> {}", s.frames_saved, state_dir.join("frames").join(&stem).display());
+    println!(
+        "  frames saved {} -> {}",
+        s.frames_saved,
+        state_dir.join("frames").join(&stem).display()
+    );
     ExitCode::SUCCESS
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    if let Err(code) = load_env_files(&args) {
-        return code;
-    }
+    let environ = match load_env_files(&args) {
+        Ok(environ) => environ,
+        Err(code) => return code,
+    };
     match args.command {
-        Cmd::Config => return cmd_config(&args),
-        Cmd::FetchModel => return cmd_fetch_model(&args),
-        Cmd::Report => return cmd_report(&args),
+        Cmd::Config => return cmd_config(&args, &environ),
+        Cmd::FetchModel => return cmd_fetch_model(&args, &environ),
+        Cmd::Report => return cmd_report(&args, &environ),
         _ => {}
     }
-    let cfg = match load_config(Some(&args.config), &process_env()) {
+    let cfg = match load_config(Some(&args.config), &environ) {
         Ok(c) => c,
         Err(ConfigError::NotFound(p)) => {
-            eprintln!("Config file not found: {p}\nCreate one with:  cp config.example.yaml {}", args.config.display());
+            eprintln!(
+                "Config file not found: {p}\nCreate one with:  cp config.example.yaml {}",
+                args.config.display()
+            );
             return ExitCode::from(2);
         }
         Err(e) => {

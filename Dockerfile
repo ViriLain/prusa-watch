@@ -1,7 +1,7 @@
 # ---- build ----
-FROM rust:1-bookworm AS build
+FROM rust:1.98.1-bookworm AS build
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src ./src
 RUN cargo build --release --locked --bin prusa-watch
 
@@ -23,7 +23,7 @@ VOLUME ["/app/data"]
 EXPOSE 8484
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
-  CMD curl -fsS -o /dev/null http://127.0.0.1:8484/api/state || exit 1
+  CMD curl -fsS -o /dev/null http://127.0.0.1:8484/healthz || exit 1
 
 ENTRYPOINT ["prusa-watch"]
 CMD ["run"]

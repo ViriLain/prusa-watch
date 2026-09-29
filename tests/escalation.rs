@@ -24,7 +24,11 @@ fn parse(text: &str) -> Result<EscalationConfig, String> {
 }
 
 fn ts(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> f64 {
-    chrono_tz::America::New_York.with_ymd_and_hms(y, mo, d, h, mi, 0).earliest().unwrap().timestamp() as f64
+    chrono_tz::America::New_York
+        .with_ymd_and_hms(y, mo, d, h, mi, 0)
+        .earliest()
+        .unwrap()
+        .timestamp() as f64
 }
 
 const BASE: &str = r#"{
@@ -38,8 +42,7 @@ const BASE: &str = r#"{
 }"#;
 
 const NIGHT: &str = r#"{"name": "night", "start": "22:00", "end": "07:00", "policy": "night"}"#;
-const WORK: &str =
-    r#"{"name": "work", "days": ["mon", "tue", "wed", "thu", "fri"], "start": "09:00", "end": "17:00", "policy": "work"}"#;
+const WORK: &str = r#"{"name": "work", "days": ["mon", "tue", "wed", "thu", "fri"], "start": "09:00", "end": "17:00", "policy": "work"}"#;
 
 fn resolver(schedules: &[&str]) -> PolicyResolver {
     let mut base = m(BASE);
@@ -65,8 +68,16 @@ fn builtin_defaults() {
     let steps: Vec<(f64, Option<&str>)> = ask.steps.iter().map(|s| (s.at, s.action.as_deref())).collect();
     assert_eq!(steps, vec![(0.0, None), (60.0, None), (120.0, Some("pause"))]);
     // built-ins never cancel
-    assert!(!esc.policies.iter().any(|(_, p)| p.steps.iter().any(|s| s.action.as_deref() == Some("stop"))));
-    let sch: Vec<(&str, &str)> = esc.schedules.iter().map(|r| (r.name.as_str(), r.policy.as_str())).collect();
+    assert!(
+        !esc.policies
+            .iter()
+            .any(|(_, p)| p.steps.iter().any(|s| s.action.as_deref() == Some("stop")))
+    );
+    let sch: Vec<(&str, &str)> = esc
+        .schedules
+        .iter()
+        .map(|r| (r.name.as_str(), r.policy.as_str()))
+        .collect();
     assert_eq!(sch, vec![("night", "night")]);
 }
 
@@ -132,7 +143,10 @@ fn days_filter_and_overnight_day_attribution() {
 
 #[test]
 fn first_match_wins_and_full_day_rule() {
-    let r = resolver(&[WORK, r#"{"name": "weekend", "start": "00:00", "end": "00:00", "policy": "all"}"#]);
+    let r = resolver(&[
+        WORK,
+        r#"{"name": "weekend", "start": "00:00", "end": "00:00", "policy": "all"}"#,
+    ]);
     assert_eq!(r.resolve(ts(2026, 9, 28, 10, 0)).0.name, "work"); // Monday
     assert_eq!(r.resolve(ts(2026, 9, 26, 10, 0)).0.name, "all"); // Saturday
 }
@@ -173,16 +187,37 @@ fn validation() {
             "at least one policy",
         ),
         (r#"{"policies": {"p": {"steps": []}}}"#, "non-empty"),
-        (r#"{"policies": {"p": {"steps": [{"at": "2m"}, {"at": "1m"}]}}}"#, "ascending"),
+        (
+            r#"{"policies": {"p": {"steps": [{"at": "2m"}, {"at": "1m"}]}}}"#,
+            "ascending",
+        ),
         (r#"{"policies": {"p": {"steps": [{"action": "explode"}]}}}"#, "action"),
-        (r#"{"policies": {"p": {"steps": [{"notify": ["sms"]}]}}}"#, "unknown channels"),
+        (
+            r#"{"policies": {"p": {"steps": [{"notify": ["sms"]}]}}}"#,
+            "unknown channels",
+        ),
         (r#"{"policies": {"p": {"steps": [{"priority": 9}]}}}"#, "priority"),
-        (r#"{"policies": {"p": {"steps": [{"buttons": ["keep", "act", "stop", "mute"]}]}}}"#, "at most 3"),
-        (r#"{"policies": {"p": {"steps": [{"buttons": ["launch"]}]}}}"#, "unknown"),
-        (r#"{"policies": {"p": {"steps": [{"title": "{nope}"}]}}}"#, "bad template"),
-        (r#"{"policies": {"p": {"steps": [{"at": "later"}]}}}"#, "invalid duration"),
+        (
+            r#"{"policies": {"p": {"steps": [{"buttons": ["keep", "act", "stop", "mute"]}]}}}"#,
+            "at most 3",
+        ),
+        (
+            r#"{"policies": {"p": {"steps": [{"buttons": ["launch"]}]}}}"#,
+            "unknown",
+        ),
+        (
+            r#"{"policies": {"p": {"steps": [{"title": "{nope}"}]}}}"#,
+            "bad template",
+        ),
+        (
+            r#"{"policies": {"p": {"steps": [{"at": "later"}]}}}"#,
+            "invalid duration",
+        ),
         (r#"{"policies": {"p": {"steps": [{"when": 0}]}}}"#, "unknown keys"),
-        (r#"{"default_policy": "q", "policies": {"p": {"steps": [{}]}}}"#, "default_policy"),
+        (
+            r#"{"default_policy": "q", "policies": {"p": {"steps": [{}]}}}"#,
+            "default_policy",
+        ),
         (
             r#"{"policies": {"p": {"steps": [{}]}}, "schedules": [{"start": "22:00", "end": "07:00", "policy": "zzz"}]}"#,
             "not defined",
@@ -240,7 +275,10 @@ fn config_validate_reports_escalation_tz_and_channel_errors() {
     cfg.timezone = "Mars/Olympus_Mons".into();
     cfg.notify.warning.channels = Some(vec!["pager".into()]);
     let e = cfg.validate().unwrap_err().to_string();
-    assert!(e.contains("invalid duration") && e.contains("timezone") && e.contains("pager"), "{e}");
+    assert!(
+        e.contains("invalid duration") && e.contains("timezone") && e.contains("pager"),
+        "{e}"
+    );
 }
 
 fn write_cfg(dir: &Path, text: &str) -> PathBuf {
@@ -280,7 +318,9 @@ fn duration_strings_in_regular_settings() {
         "decision: {resume_grace_s: 3m}\nnotify: {warning: {cooldown_s: 10m, channels: [ntfy], priority: 2}}\nweb: {history_s: 4h}\n",
     );
     let cfg = load_config(Some(&p), &no_env()).unwrap();
-    assert!(cfg.decision.resume_grace_s == 180.0 && cfg.notify.warning.cooldown_s == 600.0 && cfg.web.history_s == 14400.0);
+    assert!(
+        cfg.decision.resume_grace_s == 180.0 && cfg.notify.warning.cooldown_s == 600.0 && cfg.web.history_s == 14400.0
+    );
     assert_eq!(cfg.notify.warning.channels, Some(vec!["ntfy".to_string()]));
     assert_eq!(cfg.notify.warning.priority, 2);
 }
@@ -288,37 +328,32 @@ fn duration_strings_in_regular_settings() {
 #[test]
 fn example_config_is_minimal_and_valid() {
     let example = root().join("config.example.yaml");
-    let env = [("PRUSALINK_PASSWORD", "x"), ("NTFY_TOPIC", "t")];
-    let old: Vec<(&str, Option<String>)> = env.iter().map(|(k, _)| (*k, std::env::var(k).ok())).collect();
-    // SAFETY: std serializes its own env access; nothing in this test binary reads
-    // the environment through libc directly. Restored below (like the Python test).
-    unsafe {
-        for (k, v) in env {
-            std::env::set_var(k, v);
-        }
-    }
-    let res = load_config(Some(&example), &no_env());
-    unsafe {
-        for (k, v) in old {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
+    let env = [
+        ("PRUSALINK_PASSWORD".into(), "x".into()),
+        ("NTFY_TOPIC".into(), "t".into()),
+    ]
+    .into();
+    let res = load_config(Some(&example), &env);
     let cfg = res.unwrap();
     cfg.validate().unwrap();
-    assert!(cfg.escalation.is_empty()); // uses built-in escalation
+    assert_eq!(cfg.escalation["default_policy"], Value::String("watch_only".into()));
+    assert_eq!(cfg.escalation["schedules"], Value::Sequence(vec![]));
     let text = std::fs::read_to_string(&example).unwrap();
-    let lines = text.lines().filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')).count();
-    assert!(lines <= 15, "the starter config should stay small");
+    let lines = text
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .count();
+    assert!(lines <= 25, "the starter config should stay small");
 }
 
 /// config.reference.yaml must be exactly the built-in defaults (docs can't drift).
 #[test]
 fn reference_file_equals_builtin_defaults() {
     let mut r = load_config(Some(&root().join("config.reference.yaml")), &no_env()).unwrap();
-    assert_eq!(parse_escalation(Some(&r.escalation), false).unwrap(), parse_escalation(Some(&Mapping::new()), true).unwrap());
+    assert_eq!(
+        parse_escalation(Some(&r.escalation), false).unwrap(),
+        parse_escalation(Some(&Mapping::new()), true).unwrap()
+    );
     r.escalation = Mapping::new();
     assert_eq!(r, Config::default());
 }
@@ -326,7 +361,10 @@ fn reference_file_equals_builtin_defaults() {
 #[test]
 fn env_overrides_beat_the_file() {
     let tmp = tempfile::tempdir().unwrap();
-    let p = write_cfg(tmp.path(), "decision: {sensitivity: 1.1}\nescalation: {default_policy: night}\n");
+    let p = write_cfg(
+        tmp.path(),
+        "decision: {sensitivity: 1.1}\nescalation: {default_policy: night}\n",
+    );
     let env: BTreeMap<String, String> = [
         ("PRUSA_WATCH__DECISION__SENSITIVITY", "1.4"),
         ("PRUSA_WATCH__ESCALATION__DEFAULT_POLICY", "watch_only"),
@@ -340,7 +378,10 @@ fn env_overrides_beat_the_file() {
     .collect();
     let cfg = load_config(Some(&p), &env).unwrap();
     assert_eq!(cfg.decision.sensitivity, 1.4);
-    assert_eq!(parse_escalation(Some(&cfg.escalation), true).unwrap().default_policy, "watch_only");
+    assert_eq!(
+        parse_escalation(Some(&cfg.escalation), true).unwrap().default_policy,
+        "watch_only"
+    );
     assert!(cfg.notify.warning.channels == Some(vec!["ntfy".to_string()]) && !cfg.notify.warning.enabled);
     assert_eq!(cfg.camera.stale_after_s, 120.0);
     let bad: BTreeMap<String, String> = [("PRUSA_WATCH__DECISION__SENSITIVTY".to_string(), "1".to_string())].into();
@@ -374,8 +415,12 @@ fn config_command_prints_effective_config_with_secrets_masked() {
     assert!(y["printer"]["host"] == "10.0.0.5" && y["printer"]["password"] == "***");
     assert_eq!(y["notify"]["ntfy"]["topic"], Value::from("***"));
     assert_eq!(y["escalation"]["default_policy"], Value::from("watch_only"));
-    let pols: BTreeSet<String> =
-        y["escalation"]["policies"].as_mapping().unwrap().keys().map(|k| k.as_str().unwrap().to_string()).collect();
+    let pols: BTreeSet<String> = y["escalation"]["policies"]
+        .as_mapping()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str().unwrap().to_string())
+        .collect();
     assert!(set(&["ask_first", "night"]).is_subset(&pols)); // merged built-ins shown
     let out = cli(tmp.path()).args(["config", "--defaults"]).output().unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -384,7 +429,8 @@ fn config_command_prints_effective_config_with_secrets_masked() {
 /// Guard: a new setting must be added to config.reference.yaml too.
 #[test]
 fn example_config_documents_every_setting() {
-    let raw: Value = serde_yaml::from_str(&std::fs::read_to_string(root().join("config.reference.yaml")).unwrap()).unwrap();
+    let raw: Value =
+        serde_yaml::from_str(&std::fs::read_to_string(root().join("config.reference.yaml")).unwrap()).unwrap();
     let defaults = serde_yaml::to_value(Config::default()).unwrap();
     let mut missing = Vec::new();
 

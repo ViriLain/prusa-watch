@@ -24,10 +24,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.98.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo lint
+      - run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   test:
     name: cargo test (${{ matrix.os }})
@@ -36,14 +40,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@v2
       - name: Install ffmpeg (camera tests)
+        shell: bash
         run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y ffmpeg; else command -v ffmpeg || brew install ffmpeg; fi
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y ffmpeg;
+          elif [ "$RUNNER_OS" = "Windows" ]; then choco install ffmpeg -y --no-progress;
+          else command -v ffmpeg || brew install ffmpeg; fi
       - name: cargo test
         shell: bash
         run: |
@@ -56,6 +65,36 @@ jobs:
           # surface failures in the PR's checks view (and the checks API) without opening the log
           grep -E "^test .* FAILED$|panicked at" -A3 test.log | grep -v "^--$" | head -60 \
             | sed -e 's/%/%25/g' | while IFS= read -r line; do echo "::error title=cargo test::$line"; done
+
+  msrv:
+    name: minimum Rust 1.91
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +1.91.0 check --all-targets --all-features --locked
+
+  vision:
+    name: real model parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Download and verify production model
+        run: cargo run --locked -- fetch-model
+      - name: Independent reference corpus
+        run: cargo test --locked --test parity real_model_matches_python_on_real_frames -- --ignored --nocapture
+        env:
+          PRUSA_WATCH_MODEL: models/model-weights.onnx
+          PRUSA_WATCH_PARITY_DIR: tests/fixtures/vision
 
   docker:
     name: docker build + real model
@@ -70,3 +109,7 @@ jobs:
           docker run --rm prusa-watch:ci config --defaults > /dev/null
           docker run --rm prusa-watch:ci fetch-model | grep "already exists"
           docker run --rm --entrypoint ffmpeg prusa-watch:ci -hide_banner -version | head -1
+      - name: Inference and readiness with a simulated printer
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          python3 scripts/container_smoke.py prusa-watch:ci

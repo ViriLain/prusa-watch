@@ -84,7 +84,11 @@ fn set_state(app: &App, h: &HeaderMap, state: &str) -> Response {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let app = App {
-        sim: Arc::new(Mutex::new(Sim { state: "PRINTING".into(), job_id: 1, progress: 0.0 })),
+        sim: Arc::new(Mutex::new(Sim {
+            state: "PRINTING".into(),
+            job_id: 1,
+            progress: 0.0,
+        })),
         password: Arc::new(args.password),
     };
     let router = Router::new()
@@ -96,11 +100,15 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/api/v1/job/{id}/resume",
-            put(|State(a): State<App>, h: HeaderMap, Path(_id): Path<i64>| async move { set_state(&a, &h, "PRINTING") }),
+            put(
+                |State(a): State<App>, h: HeaderMap, Path(_id): Path<i64>| async move { set_state(&a, &h, "PRINTING") },
+            ),
         )
         .route(
             "/api/v1/job/{id}",
-            delete(|State(a): State<App>, h: HeaderMap, Path(_id): Path<i64>| async move { set_state(&a, &h, "STOPPED") }),
+            delete(
+                |State(a): State<App>, h: HeaderMap, Path(_id): Path<i64>| async move { set_state(&a, &h, "STOPPED") },
+            ),
         )
         .route(
             "/sim/new_job",

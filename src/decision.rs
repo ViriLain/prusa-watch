@@ -45,7 +45,13 @@ impl Verdict {
 
 fn lenient_int<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
     let v = serde_json::Value::deserialize(d)?;
-    v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)).ok_or_else(|| serde::de::Error::custom("expected a number"))
+    v.as_i64()
+        .or_else(|| {
+            v.as_f64()
+                .filter(|f| f.is_finite() && f.fract() == 0.0 && *f >= 0.0 && *f < i64::MAX as f64)
+                .map(|f| f as i64)
+        })
+        .ok_or_else(|| serde::de::Error::custom("expected a whole frame count"))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -63,6 +69,22 @@ pub struct PredictionState {
 }
 
 impl PredictionState {
+    pub fn is_valid(&self) -> bool {
+        self.current_frame_num >= 0
+            && self.lifetime_frame_num >= self.current_frame_num
+            && self.lifetime_frame_num <= 1_000_000_000_000
+            && [
+                self.current_p,
+                self.ewm_mean,
+                self.rolling_mean_short,
+                self.rolling_mean_long,
+            ]
+            .into_iter()
+            .all(|v| v.is_finite() && (0.0..=100_000.0).contains(&v))
+            && self.normalized_p.is_finite()
+            && (0.0..=1.0).contains(&self.normalized_p)
+    }
+
     pub fn reset_for_new_print(&mut self) {
         self.current_frame_num = 0;
         self.current_p = 0.0;
@@ -70,6 +92,14 @@ impl PredictionState {
         self.rolling_mean_short = 0.0;
         self.normalized_p = 0.0;
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Checkpoint {
+    #[serde(default)]
+    version: u32,
+    #[serde(flatten)]
+    state: PredictionState,
 }
 
 fn next_ewm(p: f64, cur: f64, alpha: f64) -> f64 {
@@ -97,14 +127,26 @@ impl FailureDecider {
         if let Some(p) = path.filter(|p| p.exists()) {
             match std::fs::read_to_string(p)
                 .map_err(|e| e.to_string())
-                .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
+                .and_then(|t| serde_json::from_str::<Checkpoint>(&t).map_err(|e| e.to_string()))
             {
-                Ok(s) => return s,
+                Ok(s) if s.version <= 1 && s.state.is_valid() => return s.state,
+                Ok(_) => tracing::warn!("Decision: invalid prediction state; starting fresh"),
                 // corrupt file shouldn't brick the monitor
                 Err(e) => tracing::warn!("Decision: could not load state ({e}); starting fresh"),
             }
         }
-        PredictionState { lifetime_frame_num: cfg.baseline_prior_frames.max(0), ..Default::default() }
+        PredictionState {
+            lifetime_frame_num: cfg.baseline_prior_frames.max(0),
+            ..Default::default()
+        }
+    }
+
+    pub fn checkpoint_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec_pretty(&Checkpoint {
+            version: 1,
+            state: self.state.clone(),
+        })
+        .expect("valid prediction state")
     }
 
     pub fn save(&self) {
@@ -114,7 +156,7 @@ impl FailureDecider {
                 std::fs::create_dir_all(dir)?;
             }
             let tmp = path.with_extension("tmp");
-            std::fs::write(&tmp, serde_json::to_string_pretty(&self.state).unwrap())?;
+            std::fs::write(&tmp, self.checkpoint_bytes())?;
             std::fs::rename(&tmp, path)
         };
         if let Err(e) = write() {

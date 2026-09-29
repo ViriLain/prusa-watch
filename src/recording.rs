@@ -47,7 +47,10 @@ fn job_key(job_id: Option<i64>) -> String {
 }
 
 fn local_dt(ts: f64) -> chrono::DateTime<Local> {
-    Local.timestamp_opt(ts.floor() as i64, ((ts - ts.floor()) * 1e9) as u32).single().unwrap_or_else(Local::now)
+    Local
+        .timestamp_opt(ts.floor() as i64, ((ts - ts.floor()) * 1e9) as u32)
+        .single()
+        .unwrap_or_else(Local::now)
 }
 
 pub fn iso_local(ts: f64) -> String {
@@ -60,6 +63,7 @@ pub struct Recorder {
     pub frames_dir: PathBuf,
     pub key: Option<String>,
     pub frames_saved: i64,
+    pub errors: u64,
 }
 
 /// Everything recorded about one analyzed frame.
@@ -80,7 +84,14 @@ pub struct FrameRecord<'a> {
 impl Recorder {
     pub fn new(cfg: RecordingConfig, state_dir: impl AsRef<Path>) -> Self {
         let d = state_dir.as_ref();
-        Self { cfg, history_dir: d.join("history"), frames_dir: d.join("frames"), key: None, frames_saved: 0 }
+        Self {
+            cfg,
+            history_dir: d.join("history"),
+            frames_dir: d.join("frames"),
+            key: None,
+            frames_saved: 0,
+            errors: 0,
+        }
     }
 
     pub fn csv_path(&self) -> Option<PathBuf> {
@@ -117,13 +128,28 @@ impl Recorder {
             self.prune()
         })();
         if let Err(e) = res {
+            self.errors += 1;
             tracing::warn!("Recording: could not start {key}: {e}");
         }
     }
 
     /// Append one analyzed frame. Returns the saved frame's file name, if any.
-    pub fn record(&mut self, r: &FrameRecord) -> Option<String> {
+    pub fn record(&mut self, r: &FrameRecord<'_>) -> Option<String> {
         let key = self.key.clone()?;
+        if let Err(error) = self.prune() {
+            self.errors += 1;
+            tracing::warn!("Recording retention failed: {error}");
+        }
+        if self.cfg.max_storage_mb > 0
+            && self
+                .total_bytes()
+                .saturating_add(r.annotated_jpeg.map_or(0, |jpeg| jpeg.len() as u64) + 1024)
+                > self.cfg.max_storage_mb.saturating_mul(1024 * 1024)
+        {
+            self.errors += 1;
+            tracing::warn!("Recording budget exhausted by the active print; recording suspended");
+            return None;
+        }
         let p: f64 = r.confidences.iter().fold(0.0, |a, b| a + b);
         let mut frame_file = None;
         if self.cfg.frames
@@ -139,7 +165,10 @@ impl Recorder {
                     self.frames_saved += 1;
                     frame_file = Some(name);
                 }
-                Err(e) => tracing::warn!("Recording: could not save frame: {e}"),
+                Err(e) => {
+                    self.errors += 1;
+                    tracing::warn!("Recording: could not save frame: {e}");
+                }
             }
         }
         if self.cfg.history {
@@ -165,7 +194,9 @@ impl Recorder {
                 fs::create_dir_all(&self.history_dir)?;
                 let new = !path.exists();
                 let f = fs::OpenOptions::new().create(true).append(true).open(&path)?;
-                let mut w = csv::WriterBuilder::new().terminator(csv::Terminator::CRLF).from_writer(f);
+                let mut w = csv::WriterBuilder::new()
+                    .terminator(csv::Terminator::CRLF)
+                    .from_writer(f);
                 if new {
                     w.write_record(COLUMNS)?;
                 }
@@ -174,6 +205,7 @@ impl Recorder {
                 Ok(())
             })();
             if let Err(e) = res {
+                self.errors += 1;
                 tracing::warn!("Recording: could not write history: {e}");
             }
         }
@@ -182,9 +214,6 @@ impl Recorder {
 
     fn prune(&self) -> std::io::Result<()> {
         let keep = self.cfg.keep_jobs;
-        if keep <= 0 {
-            return Ok(());
-        }
         let mut jobs: HashMap<String, std::time::SystemTime> = HashMap::new();
         let mut note = |name: String, path: &Path| {
             if let Ok(m) = fs::metadata(path).and_then(|m| m.modified()) {
@@ -197,8 +226,10 @@ impl Recorder {
         if let Ok(entries) = fs::read_dir(&self.history_dir) {
             for e in entries.filter_map(Result::ok) {
                 let p = e.path();
-                let (Some(stem), Some(ext)) = (p.file_stem().and_then(|s| s.to_str()), p.extension().and_then(|s| s.to_str()))
-                else {
+                let (Some(stem), Some(ext)) = (
+                    p.file_stem().and_then(|s| s.to_str()),
+                    p.extension().and_then(|s| s.to_str()),
+                ) else {
                     continue;
                 };
                 if stem.starts_with("job-") && (ext == "csv" || ext == "json") {
@@ -216,22 +247,93 @@ impl Recorder {
                 }
             }
         }
+        let failures = self.history_dir.parent().unwrap().join("failures");
+        if let Ok(entries) = fs::read_dir(&failures) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if let Some(id) = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.rsplit_once("_job"))
+                {
+                    note(format!("job-{}", id.1), &path);
+                }
+            }
+        }
         if let Some(k) = &self.key {
             jobs.remove(k); // never prune the print we're recording
         }
         let mut sorted: Vec<(String, std::time::SystemTime)> = jobs.into_iter().collect();
-        sorted.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
-        let old: Vec<String> = sorted.into_iter().skip((keep - 1).max(0) as usize).map(|(k, _)| k).collect();
-        for key in &old {
-            for ext in ["csv", "json"] {
-                let _ = fs::remove_file(self.history_dir.join(format!("{key}.{ext}")));
+        sorted.sort_by_key(|(key, t)| (std::cmp::Reverse(*t), std::cmp::Reverse(key.clone())));
+        let mut old = Vec::new();
+        let mut retained = sorted.len() + usize::from(self.key.is_some());
+        let budget = self.cfg.max_storage_mb.saturating_mul(1024 * 1024);
+        // Delete oldest inactive jobs first when count or byte limits are exceeded.
+        for (key, _) in sorted.into_iter().rev() {
+            let over_count = keep > 0 && retained > keep as usize;
+            let over_bytes = budget > 0 && self.total_bytes() > budget;
+            if over_count || over_bytes {
+                old.push(key.clone());
+                retained -= 1;
+                for ext in ["csv", "json"] {
+                    let path = self.history_dir.join(format!("{key}.{ext}"));
+                    if path.exists() {
+                        fs::remove_file(path)?;
+                    }
+                }
+                let path = self.frames_dir.join(&key);
+                if path.exists() {
+                    fs::remove_dir_all(path)?;
+                }
+                if let Ok(entries) = fs::read_dir(&failures) {
+                    for entry in entries.filter_map(Result::ok) {
+                        let path = entry.path();
+                        if path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|s| s.ends_with(&format!("_job{}", key.trim_start_matches("job-"))))
+                        {
+                            fs::remove_file(path)?;
+                        }
+                    }
+                }
             }
-            let _ = fs::remove_dir_all(self.frames_dir.join(key));
         }
         if !old.is_empty() {
             tracing::info!("Recording: pruned {} old job(s)", old.len());
         }
         Ok(())
+    }
+
+    fn total_bytes(&self) -> u64 {
+        fn size(path: &Path) -> u64 {
+            let Ok(metadata) = path.symlink_metadata() else {
+                return 0;
+            };
+            if metadata.is_file() {
+                return metadata.len();
+            }
+            if !metadata.is_dir() {
+                return 0;
+            }
+            fs::read_dir(path)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|entry| size(&entry.path()))
+                .sum()
+        }
+        size(&self.history_dir) + size(&self.frames_dir) + size(&self.history_dir.parent().unwrap().join("failures"))
+    }
+
+    pub fn save_failure(&mut self, path: &Path, jpeg: &[u8]) -> std::io::Result<()> {
+        self.prune()?;
+        if self.cfg.max_storage_mb > 0
+            && self.total_bytes() + jpeg.len() as u64 > self.cfg.max_storage_mb.saturating_mul(1024 * 1024)
+        {
+            return Err(std::io::Error::other("failure image would exceed recording budget"));
+        }
+        crate::storage::atomic_write(path, jpeg)
     }
 }
 
@@ -254,7 +356,10 @@ pub struct Summary {
 pub fn summarize(csv_path: &Path) -> anyhow::Result<Summary> {
     let mut rdr = csv::Reader::from_path(csv_path)?;
     let rows: Vec<HashMap<String, String>> = rdr.deserialize().collect::<Result<_, _>>()?;
-    let mut s = Summary { verdicts: [("ok".into(), 0), ("warning".into(), 0), ("failure".into(), 0)], ..Default::default() };
+    let mut s = Summary {
+        verdicts: [("ok".into(), 0), ("warning".into(), 0), ("failure".into(), 0)],
+        ..Default::default()
+    };
     if rows.is_empty() {
         return Ok(s);
     }
