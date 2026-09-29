@@ -2,9 +2,4 @@
 config.yaml
 data/
 models/
-__pycache__/
-*.egg-info/
-.pytest_cache/
-.venv/
-build/
-dist/
+/target/

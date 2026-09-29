@@ -2,10 +2,10 @@
 
 Local, Bambu-style spaghetti detection for the Prusa Core One. It watches the Buddy3D camera over RTSP, runs Obico's open-source failure-detection model on your own machine, and **pauses the print through PrusaLink** when it's confident the print has failed. It sends an ntfy/Discord/webhook alert with the annotated frame and Resume / Cancel buttons.
 
-No cloud and no OctoPrint. Everything stays on your LAN.
+No cloud and no OctoPrint. Everything stays on your LAN. It's a single Rust binary; the only runtime dependency is `ffmpeg`.
 
 ```
- Buddy3D camera ──RTSP (tcp)──▶ FrameGrabber ──latest frame every 10 s──▶ YOLO (ONNX, CPU)
+ Buddy3D camera ──RTSP (tcp)──▶ ffmpeg ──latest frame every 10 s──▶ YOLO (ONNX via tract, CPU)
                                                                                │ boxes + confidences
  Core One ◀──PUT /api/v1/job/{id}/pause── PrusaLink client ◀── pause ── FailureDecider (Obico EWM/baseline)
      │                                                                         │ warning / failure
@@ -67,22 +67,25 @@ docker compose up -d --build        # the build downloads the ~250 MB model once
 docker compose run --rm prusa-watch check
 ```
 
-### 3b. Or run natively (macOS / Linux / Windows, Python ≥ 3.10)
+### 3b. Or run natively (macOS / Linux / Windows)
+
+Needs a Rust toolchain ([rustup.rs](https://rustup.rs)) and `ffmpeg` (macOS: `brew install ffmpeg`, Debian/Ubuntu: `apt install ffmpeg`).
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate    # Windows: py -m venv .venv; .venv\Scripts\activate
-pip install -e .
-prusa-watch check      # verifies PrusaLink auth, grabs a camera frame, runs the model on it
-prusa-watch run        # dashboard on http://localhost:8484
+cargo install --path .     # builds and installs the `prusa-watch` binary into ~/.cargo/bin
+prusa-watch check          # verifies PrusaLink auth, grabs a camera frame, runs the model on it
+prusa-watch run            # dashboard on http://localhost:8484
 ```
 
 - `.env` is loaded automatically from next to `config.yaml` (or the current directory), the same file Docker uses. Variables already set in your shell win; `--env-file PATH` picks a different file.
-- The first `check` or `run` downloads the ~250 MB model into `models/`. `prusa-watch fetch-model --force` re-downloads it.
+- The first `check` or `run` downloads the ~200 MB model into `models/`. `prusa-watch fetch-model --force` re-downloads it.
+- `ffmpeg` decodes the camera stream. If it isn't on your `PATH`, set `PRUSA_WATCH_FFMPEG=/path/to/ffmpeg`.
 - On a Mac, keep the machine awake while testing: `caffeinate -i prusa-watch run`.
+- **macOS 15+: "No route to host (os error 65)"** for the printer and camera, while `curl` to the same IP works, means your terminal app lacks the Local Network permission. Command-line tools inherit it from the terminal; Apple's own binaries like curl are exempt. Enable it in *System Settings → Privacy & Security → Local Network*, then quit and reopen the terminal.
 
 `check` saves the grabbed frame to `data/check_frame.jpg`. Look at it before trusting the system.
 
-**Host placement:** the monitor only protects prints while it's running. A desktop that sleeps is the wrong host. Use a NAS, homelab node, mini PC, or Pi 5 (arm64 wheels exist for everything). CPU inference is about 50–300 ms per frame on anything modern, so the GPU is irrelevant at one frame every 10 s.
+**Host placement:** the monitor only protects prints while it's running. A desktop that sleeps is the wrong host. Use a NAS, homelab node, mini PC, or Pi 5 (the binary builds for arm64 as well as x86-64). Inference runs on the CPU with [tract](https://github.com/sonos/tract) in roughly 0.5 s per frame on a modern x86 core, which is plenty at one frame every 10 s; `detector.use_gpu` is accepted but ignored.
 
 ### 4. Tune
 
@@ -193,12 +196,14 @@ The dashboard shows a live countdown to the next action, with buttons for whatev
 ## Development
 
 ```bash
-pip install -e ".[dev]"
-pytest                                    # synthetic ONNX model, no hardware needed
-python scripts/fake_printer.py &          # PrusaLink simulator (apikey auth, password "test")
+cargo test                                          # synthetic ONNX model, no hardware needed (needs ffmpeg for the camera tests)
+cargo run --example fake_printer -- --port 8081     # PrusaLink simulator (apikey auth, password "test")
+cargo clippy --all-targets && cargo fmt --check
 ```
 
-The tests build a tiny ONNX model with the same I/O contract as Obico's export (`[1,3,416,416]` → boxes `[1,N,1,4]` and confs `[1,N,1]`). Frame brightness drives confidence, so they exercise the full pipeline: RTSP/file grabber → ONNX Runtime → post-processing and NMS → decision → PrusaLink digest auth → ntfy/Discord/webhook → dashboard and metrics.
+The tests use a tiny ONNX model (`tests/fixtures/fake-model.onnx`) with the same I/O contract as Obico's export (`[1,3,416,416]` → boxes `[1,N,1,4]` and confs `[1,N,1]`). Frame brightness drives confidence, so they exercise the full pipeline: ffmpeg/file grabber → tract → post-processing and NMS → decision → PrusaLink digest auth → ntfy/Discord/webhook → dashboard and metrics.
+
+`tests/parity.rs` pins the behaviour to the original Python implementation: the fixtures in `tests/fixtures/` were produced by it (decision sequences, notification requests, config defaults, escalation built-ins, schedule matching), and the Rust code must reproduce them exactly — the decision algorithm bit for bit. Preprocessing replicates OpenCV's fixed-point bilinear resize bit for bit, so model confidences match ONNX Runtime + OpenCV. To check the real model on your own frames, see `real_model_matches_python_on_real_frames` (run with `cargo test --release -- --ignored`).
 
 ## License
 

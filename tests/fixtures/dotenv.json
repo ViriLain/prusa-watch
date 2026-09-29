@@ -1,0 +1,8 @@
+{
+ "PRUSALINK_PASSWORD": "abc123",
+ "NTFY_TOPIC": "my-topic",
+ "QUOTED": "has # hash and spaces",
+ "SINGLE": "x=y",
+ "URL": "http://192.168.1.10:8484",
+ "EMPTY": ""
+}
