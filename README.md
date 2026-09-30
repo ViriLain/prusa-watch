@@ -87,6 +87,22 @@ prusa-watch run            # dashboard on http://localhost:8484
 
 **Host placement:** the monitor only protects prints while it's running. A desktop that sleeps is the wrong host. Use a NAS, homelab node, mini PC, or Pi 5 (the binary builds for arm64 as well as x86-64). Inference runs on the CPU with [tract](https://github.com/sonos/tract) in roughly 0.5 s per frame on a modern x86 core, which is plenty at one frame every 10 s; `detector.use_gpu` is accepted but ignored.
 
+### Running it always-on
+
+The monitor only protects prints while it's running, and every alert it sends comes from the same process. Three things cover the ways that fails:
+
+- **A supervisor restarts it.** Docker Compose (`restart: unless-stopped`) does this already. For native installs there's a systemd unit in [`deploy/systemd`](deploy/systemd/prusa-watch.service) and a launchd agent in [`deploy/launchd`](deploy/launchd/com.github.virilain.prusa-watch.plist).
+- **It restarts itself when stuck.** If the monitor loop makes no progress for `health.stall_exit_s` (default 5 min), the process exits with status 70 so the supervisor starts a fresh one. The open incident, mute and pending actions survive through the session checkpoint; an action that fell due while it was down is never replayed automatically. After any unclean exit (stall, crash, kill, power loss) the next start sends a `notify.health` alert saying so.
+- **Something outside notices when it's gone.** Set `health.heartbeat_url` to a dead-man's switch such as [healthchecks.io](https://healthchecks.io) (free tier) or a self-hosted Uptime Kuma push monitor. prusa-watch requests it every `heartbeat_interval_s` (60 s) while it can protect a print. If the host sleeps, the container dies or the network drops, the pings stop and that service alerts you, through its own channels. With `heartbeat_fail_url` set, prusa-watch also reports *why* it can't protect the current print (camera stale, printer unreachable mid-print, loop stalled). A printer that is off or idle counts as healthy: there's nothing to protect.
+
+```yaml
+health:
+  heartbeat_url: https://hc-ping.com/<uuid>            # period 1 min, grace ~5 min
+  heartbeat_fail_url: https://hc-ping.com/<uuid>/fail
+```
+
+prusa-watch also alerts (`notify.health`) when the printer stops answering PrusaLink for `health.printer_down_alert_s` (60 s) during a print, since it can't pause anything until the connection returns.
+
 ### 4. Tune
 
 - **ROI (biggest accuracy win):** crop to the build plate so the frame, door, cable chain, and any tool dock or purge area are excluded. Open *Live (raw)* on the dashboard to see the ROI box, then adjust `camera.roi` (normalized `[x1, y1, x2, y2]`).
@@ -168,7 +184,7 @@ The dashboard shows a live countdown to the next action, with buttons for whatev
 
 - **Channels:** ntfy (the frame is attached, and the notification has action buttons), Discord (embedded image), or a generic JSON webhook.
 - **Incident notifications** are routed per step, as described above.
-- **Everything else** is routed under `notify:`. `notify.warning` covers the "possible failure" heads-up, `notify.camera` covers the camera going offline or coming back, and `notify.info` covers confirmations. Each has `enabled`, `channels`, `priority` and `cooldown_s`.
+- **Everything else** is routed under `notify:`. `notify.warning` covers the "possible failure" heads-up, `notify.camera` covers the camera going offline or coming back, and `notify.info` covers confirmations, and `notify.health` covers the watcher itself (printer unreachable mid-print, restarted after a stall or crash). Each has `enabled`, `channels`, `priority` and `cooldown_s`.
 - **ntfy.sh topics are public-by-name.** Use long random names for `topic` and `reply_topic`, or self-host ntfy with ACLs and set `token`.
 
 ## Endpoints

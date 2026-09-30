@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -136,6 +137,9 @@ pub struct Core {
     last_frame_sequence: Option<u64>,
     camera_down_notified: bool,
     printer_error_logged: bool,
+    /// Unreachable while the last known state was an active print: when it started.
+    printer_down_since: Option<f64>,
+    printer_down_notified: bool,
     last_routed: HashMap<String, f64>,
 }
 
@@ -182,6 +186,10 @@ pub struct Monitor {
     stop: (Mutex<bool>, Condvar),
     thread: Mutex<Option<JoinHandle<()>>>,
     replies: Mutex<Option<Arc<NtfyReplyListener>>>,
+    /// Monitor-clock time of construction and of the last completed tick (f64 bits; NaN =
+    /// never). Lock-free so the stall watchdog can't be blocked by what it's watching.
+    created_at: f64,
+    last_tick_bits: AtomicU64,
     me: Weak<Monitor>,
 }
 
@@ -273,6 +281,8 @@ impl Monitor {
             last_frame_sequence: None,
             camera_down_notified: false,
             printer_error_logged: false,
+            printer_down_since: None,
+            printer_down_notified: false,
             last_routed: HashMap::new(),
         };
         let history_max = 10usize.max((cfg.web.history_s / cfg.detector.interval_s.max(1.0)) as usize + 1);
@@ -289,6 +299,7 @@ impl Monitor {
             last_frame: None,
         };
         let storage = crate::storage::Storage::new(cfg.recording.clone(), &state_dir);
+        let created_at = clock();
         Ok(Arc::new_cyclic(|me| Self {
             cfg,
             printer,
@@ -305,6 +316,8 @@ impl Monitor {
             stop: (Mutex::new(false), Condvar::new()),
             thread: Mutex::new(None),
             replies: Mutex::new(None),
+            created_at,
+            last_tick_bits: AtomicU64::new(f64::NAN.to_bits()),
             me: me.clone(),
         }))
     }
@@ -435,7 +448,21 @@ impl Monitor {
             self.analyze(&image, &status, &session_id);
         }
         self.sync_counters(&lock(&self.core));
-        lock(&self.view).last_tick = Some(self.now());
+        let now = self.now();
+        lock(&self.view).last_tick = Some(now);
+        self.last_tick_bits.store(now.to_bits(), AtomicOrdering::Release);
+    }
+
+    /// Seconds since the last completed tick (since construction if none yet). Takes no locks.
+    pub fn loop_age_s(&self) -> f64 {
+        let last = f64::from_bits(self.last_tick_bits.load(AtomicOrdering::Acquire));
+        let since = if last.is_nan() { self.created_at } else { last };
+        (self.now() - since).max(0.0)
+    }
+
+    /// True once `stop()` has been requested.
+    pub fn stopping(&self) -> bool {
+        *lock(&self.stop.0)
     }
 
     fn checkpoint(&self, core: &Core) {
@@ -537,9 +564,12 @@ impl Monitor {
                     tracing::error!("Monitor: printer unreachable: {e}");
                     core.printer_error_logged = true;
                 }
-                let mut v = lock(&self.view);
-                v.snap.printer_reachable = false;
-                v.snap.printer_error = Some(e.to_string());
+                {
+                    let mut v = lock(&self.view);
+                    v.snap.printer_reachable = false;
+                    v.snap.printer_error = Some(e.to_string());
+                }
+                self.handle_printer_down(core, &e.to_string());
                 None
             }
             Ok(status) => {
@@ -547,6 +577,7 @@ impl Monitor {
                     tracing::info!("Monitor: printer reachable again");
                 }
                 core.printer_error_logged = false;
+                self.handle_printer_up(core);
                 let mut v = lock(&self.view);
                 v.snap.printer_reachable = true;
                 v.snap.printer_error = None;
@@ -666,6 +697,66 @@ impl Monitor {
         if core.incident.is_some() {
             self.close_incident(core, "resumed", false);
         }
+    }
+
+    /// A printer that is off or idle is not a fault; one that vanishes mid-print is: nothing
+    /// can pause it until PrusaLink answers again.
+    fn handle_printer_down(&self, core: &mut Core, error: &str) {
+        let was_printing = core.last_status.as_ref().is_some_and(|s| is_active(&s.state));
+        let alert_after = self.cfg.health.printer_down_alert_s;
+        if !was_printing || alert_after <= 0.0 {
+            return;
+        }
+        let now = self.now();
+        let since = *core.printer_down_since.get_or_insert(now);
+        if core.printer_down_notified || now - since < alert_after {
+            return;
+        }
+        core.printer_down_notified = true;
+        let name = &self.cfg.printer.name;
+        tracing::warn!("Monitor: printer unreachable for {:.0}s during a print", now - since);
+        self.notify_routed(
+            core,
+            &self.cfg.notify.health,
+            "printer_down",
+            &format!("{name}: printer unreachable mid-print"),
+            &format!(
+                "prusa-watch has not reached PrusaLink for {} while a print was running, so it \
+                 cannot pause a failure. Check the printer's network connection. ({error})",
+                fmt_duration(now - since)
+            ),
+            None,
+        );
+    }
+
+    fn handle_printer_up(&self, core: &mut Core) {
+        core.printer_down_since = None;
+        if !std::mem::take(&mut core.printer_down_notified) {
+            return;
+        }
+        let name = &self.cfg.printer.name;
+        self.notify_routed(
+            core,
+            &self.cfg.notify.health,
+            "printer_up",
+            &format!("{name}: printer reachable again"),
+            "prusa-watch can act on the print again.",
+            None,
+        );
+    }
+
+    /// Tell the user a previous process was replaced (after the stall watchdog fired).
+    pub fn notify_restarted(&self, reason: &str) {
+        let name = self.cfg.printer.name.clone();
+        let mut core = lock(&self.core);
+        self.notify_routed(
+            &mut core,
+            &self.cfg.notify.health,
+            "restarted",
+            &format!("{name}: prusa-watch restarted"),
+            &format!("The previous process was restarted: {reason}. Monitoring has resumed."),
+            None,
+        );
     }
 
     fn handle_camera_health(&self, core: &mut Core, camera_ok: bool) {
@@ -1580,8 +1671,7 @@ impl Monitor {
 
     /// Process liveness and protection readiness have separate contracts.
     fn loop_budget(&self) -> f64 {
-        (self.cfg.printer.poll_interval_s * 3.0 + self.cfg.printer.timeout_s * 2.0 + self.cfg.detector.interval_s * 2.0)
-            .max(15.0)
+        self.cfg.loop_budget_s()
     }
 
     pub fn readiness(&self) -> Result<(), String> {
@@ -1615,6 +1705,21 @@ impl Monitor {
             }
         }
         Ok(())
+    }
+
+    /// What the dead-man's switch reports. Like `readiness`, except an unreachable printer
+    /// that wasn't printing (off, or idle) is healthy: nothing needs protecting.
+    pub fn protection_health(&self) -> Result<(), String> {
+        let reason = match self.readiness() {
+            Ok(()) => return Ok(()),
+            Err(reason) => reason,
+        };
+        let snap = self.snapshot();
+        let loop_ok = snap.loop_age_s.is_some_and(|age| age <= self.loop_budget());
+        if loop_ok && !snap.printer_reachable && !is_active(&snap.printer_state) && snap.action_error.is_none() {
+            return Ok(());
+        }
+        Err(reason)
     }
 
     pub fn counters(&self) -> Counters {

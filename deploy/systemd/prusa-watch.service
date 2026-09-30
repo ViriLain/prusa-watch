@@ -1,0 +1,35 @@
+# systemd unit for a native Linux install. Assumes:
+#   binary:  /usr/local/bin/prusa-watch   (cargo install --path . --root /usr/local)
+#   files:   /opt/prusa-watch/{config.yaml,.env,models/,data/}
+#   user:    prusa-watch   (sudo useradd --system --home /opt/prusa-watch prusa-watch)
+#
+#   sudo cp deploy/systemd/prusa-watch.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now prusa-watch
+#   journalctl -u prusa-watch -f
+
+[Unit]
+Description=prusa-watch: local AI failure detection for a Prusa printer
+Wants=network-online.target
+After=network-online.target
+# Never give up restarting: an always-on watcher that stops retrying is worse than a noisy one.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=prusa-watch
+WorkingDirectory=/opt/prusa-watch
+ExecStart=/usr/local/bin/prusa-watch run --config /opt/prusa-watch/config.yaml
+# Covers crashes and the stall watchdog's exit (status 70, see health.stall_exit_s).
+Restart=always
+RestartSec=10
+# Time to flush the session checkpoint on shutdown.
+TimeoutStopSec=30
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/opt/prusa-watch
+
+[Install]
+WantedBy=multi-user.target

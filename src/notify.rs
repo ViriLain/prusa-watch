@@ -17,7 +17,8 @@ use crate::http::{Body, HttpRequest, Part, ReqwestTransport, Transport};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {
-    /// "incident" | "failure" | "warning" | "camera_down" | "camera_up" | "info"
+    /// "incident" | "failure" | "warning" | "camera_down" | "camera_up" | "printer_down" |
+    /// "printer_up" | "restarted" | "info"
     pub kind: String,
     pub title: String,
     pub message: String,
@@ -354,6 +355,9 @@ impl Notifier {
             "warning" => "warning,printer",
             "camera_down" => "no_entry_sign,camera",
             "camera_up" => "white_check_mark,camera",
+            "printer_down" => "no_entry_sign,printer",
+            "printer_up" => "white_check_mark,printer",
+            "restarted" => "arrows_counterclockwise,printer",
             _ => "printer",
         };
         let method = if e.image().is_some() { "PUT" } else { "POST" };
@@ -384,7 +388,7 @@ impl Notifier {
         let color: i64 = match e.kind.as_str() {
             "failure" | "incident" => 0xE5484D,
             "warning" => 0xF5A524,
-            "camera_down" => 0x8B8D98,
+            "camera_down" | "printer_down" => 0x8B8D98,
             _ => 0x3E63DD,
         };
         let mut embed = json!({"title": e.title, "description": e.message, "color": color, "timestamp": e.ts});
