@@ -34,7 +34,10 @@ struct Canned {
 
 impl StreamOpener for Canned {
     fn open(&self, url: &str, since: &str, headers: &[(String, String)]) -> Result<Box<dyn BufRead + Send>, String> {
-        self.seen.lock().unwrap().push((url.to_string(), since.to_string(), headers.to_vec()));
+        self.seen
+            .lock()
+            .unwrap()
+            .push((url.to_string(), since.to_string(), headers.to_vec()));
         Ok(Box::new(std::io::Cursor::new(self.body.clone())))
     }
 }
@@ -64,27 +67,48 @@ fn stream_dispatches_messages_and_tracks_since() {
             g.lock().unwrap().push((c.to_string(), i.to_string()));
             "ok".to_string()
         }),
-        Arc::new(Canned { body: body.into_bytes(), seen: seen.clone() }),
+        Arc::new(Canned {
+            body: body.into_bytes(),
+            seen: seen.clone(),
+        }),
     );
     lst.stream_once().unwrap();
 
-    assert_eq!(*got.lock().unwrap(), vec![("veto".to_string(), "abc".to_string()), ("act".to_string(), "xyz".to_string())]);
+    assert_eq!(
+        *got.lock().unwrap(),
+        vec![
+            ("veto".to_string(), "abc".to_string()),
+            ("act".to_string(), "xyz".to_string())
+        ]
+    );
     let seen = seen.lock().unwrap();
     let (url, since, headers) = &seen[0];
     assert_eq!(reqwest::Url::parse(url).unwrap().path(), "/reply-secret/json");
-    let auth = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("authorization")).map(|(_, v)| v.as_str());
+    let auth = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+        .map(|(_, v)| v.as_str());
     assert_eq!(auth, Some("Bearer tk_1"));
     // starts from "now", never replays old replies
-    assert!(!since.is_empty() && since.chars().all(|c| c.is_ascii_digit()), "{since}");
+    assert!(
+        !since.is_empty() && since.chars().all(|c| c.is_ascii_digit()),
+        "{since}"
+    );
     assert_eq!(lst.since(), "m3"); // reconnect resumes after the last message
     assert_eq!(lst.received.load(Ordering::SeqCst), 2);
 }
 
 #[test]
 fn garbage_lines_are_ignored() {
-    let cfg = NtfyConfig { reply_topic: "r".into(), ..Default::default() };
+    let cfg = NtfyConfig {
+        reply_topic: "r".into(),
+        ..Default::default()
+    };
     let lst = NtfyReplyListener::new(cfg, Arc::new(|_: &str, _: &str| "ok".to_string()));
     assert_eq!(lst.handle_line(""), None);
     assert_eq!(lst.handle_line("not json"), None);
-    assert_eq!(lst.handle_line(&json!({"event": "message", "message": "veto"}).to_string()), None);
+    assert_eq!(
+        lst.handle_line(&json!({"event": "message", "message": "veto"}).to_string()),
+        None
+    );
 }

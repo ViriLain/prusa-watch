@@ -24,6 +24,9 @@ printer:
   auth: digest                     # digest | apikey (same secret sent as X-Api-Key)
   poll_interval_s: 5               # how often printer state is polled (and escalation steps checked)
   timeout_s: 5                     # PrusaLink request timeout
+  action_confirmation_s: 60        # accepted commands must produce observed printer state
+  action_retry_s: 15               # backoff after transport errors
+  action_max_attempts: 3           # bounded retries; exhaustion raises a visible fault
 
 # ───────────────────────────── camera ─────────────────────────────
 camera:
@@ -36,10 +39,15 @@ camera:
   reconnect_backoff_s: 5
   open_timeout_s: 10
   read_timeout_s: 10
+  # Spots to ignore, normalized [x1, y1, x2, y2] in full-frame coordinates (like roi), e.g.
+  # [[0.62, 0.05, 0.88, 0.48]] for a sheet corner that glints. Boxes centred inside are dropped.
+  # Shown as grey rectangles on the dashboard. Clean the bed first; mask only what keeps recurring.
+  ignore: []
 
 # ───────────────────────────── detector ─────────────────────────────
 detector:
   model_path: models/model-weights.onnx
+  expected_sha256: 0a6ebd8e30dbf6a450c50f9c0a5406f04ba7eb1c99fd5996e888c78bb383b9aa
   threshold: 0.08                  # per-box confidence floor (Obico default; don't raise it)
   nms: 0.45
   interval_s: 10                   # decision parameters are tuned for 10 s
@@ -53,6 +61,7 @@ decision:
   init_safe_frame_num: 30          # frames of grace at print start (30 x 10 s = 5 min)
   resume_grace_s: 120              # after you resume an AI-paused print, no new incident for this long
   baseline_prior_frames: 360       # fresh-install prior (see README); 0 = exact Obico behavior
+  min_frame_p: 0.3                 # open an incident only if the current frame shows at least this much; 0 = pure Obico
   # Obico's tuned internals; change only if you know why:
   ewm_span: 12
   rolling_win_short: 310
@@ -86,6 +95,9 @@ decision:
 #           resume = resume; mute = resume + no more alerts this print
 # An incident ends when you answer, when you handle it at the printer, when the job ends,
 # or when its steps run out (it stays open while paused by us so Resume keeps working).
+# Notify-only buttons remain valid for max(snooze_s, 60 seconds) before expiry.
+# A queued automatic action remains armed after scores recover or the camera goes offline;
+# mute/veto explicitly retires it. Printer requests are shown as pending until confirmed.
 escalation:
   default_policy: ask_first
   snooze_s: 30m                    # after "keep" or a notify-only incident: no new incident for this long (0 = rest of print)
@@ -173,10 +185,11 @@ notify:
 # ───────────────────────────── web ─────────────────────────────
 web:
   enabled: true
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 8484
   public_url: ""                   # e.g. http://192.168.1.10:8484 (links, and button fallback without reply_topic)
-  token: ""                        # required for pause/resume/stop/incident endpoints when set
+  token: ""                        # set a strong random secret before exposing on the network
+  allow_unauthenticated: false     # explicit opt-in only; non-loopback binding requires a token by default
   history_s: 2h                    # score history kept for the dashboard chart
 
 # ───────────────────────────── recording ─────────────────────────────
@@ -186,7 +199,8 @@ recording:
   frames: true                     # annotated frames when the model sees something: state_dir/frames/job-<id>/
   frame_min_p: 0.3                 # save a frame once its summed box confidence reaches this (warning/failure frames always)
   max_frames_per_job: 120          # cap per print (~100 KB per frame)
-  keep_jobs: 50                    # delete history/frames of older prints beyond this many (0 = keep all)
+  keep_jobs: 50                    # deletes history, frames AND incident failure images (0 = no count limit)
+  max_storage_mb: 1024             # combined recording budget; 0 = unlimited
 
 # ───────────────────────────── misc ─────────────────────────────
 state_dir: data

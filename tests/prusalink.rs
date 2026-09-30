@@ -25,7 +25,10 @@ const NONCE: &str = "abc123";
 
 impl FakeBuddy {
     fn new() -> Arc<Self> {
-        Arc::new(Self { password: "secret".into(), calls: Mutex::new(vec![]) })
+        Arc::new(Self {
+            password: "secret".into(),
+            calls: Mutex::new(vec![]),
+        })
     }
     fn calls(&self) -> Vec<(String, String)> {
         self.calls.lock().unwrap().clone()
@@ -36,7 +39,9 @@ impl FakeBuddy {
             return false;
         }
         let p = parse_authorization(auth);
-        let (Some(uri), Some(nonce)) = (p.get("uri"), p.get("nonce")) else { return false };
+        let (Some(uri), Some(nonce)) = (p.get("uri"), p.get("nonce")) else {
+            return false;
+        };
         let qop = if p.contains_key("qop") {
             match (p.get("nc"), p.get("cnonce")) {
                 (Some(nc), Some(cn)) => Some((nc.as_str(), cn.as_str())),
@@ -61,15 +66,19 @@ impl Transport for FakeBuddy {
     fn send(&self, req: &HttpRequest, _t: Duration) -> Result<HttpResponse, String> {
         let authed = req.get_header("x-api-key") == Some(self.password.as_str()) || self.digest_ok(req);
         if !authed {
-            return Ok(HttpResponse::new(401, vec![])
-                .with_header("WWW-Authenticate", &format!(r#"Digest realm="{REALM}", nonce="{NONCE}", qop="auth""#)));
+            return Ok(HttpResponse::new(401, vec![]).with_header(
+                "WWW-Authenticate",
+                &format!(r#"Digest realm="{REALM}", nonce="{NONCE}", qop="auth""#),
+            ));
         }
         let path = path_of(&req.url);
         let m = req.method.as_str();
         self.calls.lock().unwrap().push((m.to_string(), path.clone()));
         Ok(match (m, path.as_str()) {
             ("GET", "/api/v1/status") => HttpResponse::json(200, status_body()),
-            ("GET", "/api/v1/job") => HttpResponse::json(200, json!({"id": 42, "file": {"display_name": "benchy.bgcode"}})),
+            ("GET", "/api/v1/job") => {
+                HttpResponse::json(200, json!({"id": 42, "file": {"display_name": "benchy.bgcode"}}))
+            }
             ("PUT", "/api/v1/job/42/pause") | ("PUT", "/api/v1/job/42/resume") => HttpResponse::new(204, vec![]),
             ("DELETE", "/api/v1/job/42") => HttpResponse::new(204, vec![]),
             (_, p) if p.starts_with("/api/v1/job/") => HttpResponse::json(404, json!({"title": "Not Found"})),

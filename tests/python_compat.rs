@@ -36,7 +36,12 @@ fn falsy_schedule_name_falls_back() {
 fn empty_image_bytes_mean_no_attachment() {
     let mut cfg = prusa_watch::config::NotifyConfig::default();
     cfg.ntfy.topic = "t".into();
-    let n = Notifier::with_transport(cfg, "http://x", "", Arc::new(prusa_watch::http::ReqwestTransport::new()));
+    let n = Notifier::with_transport(
+        cfg,
+        "http://x",
+        "",
+        Arc::new(prusa_watch::http::ReqwestTransport::new()),
+    );
     let mut e = Event::new("warning", "t", "m", "p");
     e.image_jpeg = Some(Arc::new(vec![]));
     let req = n.ntfy_request(&e);
@@ -48,7 +53,11 @@ fn empty_image_bytes_mean_no_attachment() {
 fn state_file_with_float_counts_still_loads() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("prediction_state.json");
-    std::fs::write(&p, r#"{"current_frame_num": 3.0, "lifetime_frame_num": 603.0, "rolling_mean_long": 0.0157}"#).unwrap();
+    std::fs::write(
+        &p,
+        r#"{"current_frame_num": 3.0, "lifetime_frame_num": 603.0, "rolling_mean_long": 0.0157}"#,
+    )
+    .unwrap();
     let d = prusa_watch::decision::FailureDecider::new(Default::default(), Some(&p));
     assert_eq!(d.state.lifetime_frame_num, 603, "baseline kept, not reset to the prior");
     assert_eq!(d.state.rolling_mean_long, 0.0157);
@@ -91,7 +100,10 @@ fn scalars_python_accepted_still_load() {
     assert!(c.web.enabled);
     assert!(!c.save_failure_frames);
     assert_eq!(c.decision.init_safe_frame_num, 30);
-    assert!(load("decision: {init_safe_frame_num: 30.5}\n").is_err(), "a fractional count is still an error");
+    assert!(
+        load("decision: {init_safe_frame_num: 30.5}\n").is_err(),
+        "a fractional count is still an error"
+    );
 }
 
 #[test]

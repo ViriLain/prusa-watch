@@ -114,7 +114,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let src = "frame", last = null, token = "";
-try { token = localStorage.getItem("pw-token") || ""; } catch (e) {}
+try { token = sessionStorage.getItem("pw-token") || ""; localStorage.removeItem("pw-token"); } catch (e) {}
 
 document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => {
   document.querySelectorAll(".tabs button").forEach(x => x.classList.remove("active"));
@@ -124,21 +124,33 @@ document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => {
 function refreshImage() { $("view").src = `/${src}.jpg?t=${Date.now()}`; }
 $("view").onerror = () => { if (src === "frame") { $("view").src = `/raw.jpg?t=${Date.now()}`; } };
 
-async function call(path, confirmText) {
+let busy = false;
+async function call(path, confirmText, incidentId) {
+  if (busy || !last) return;
+  const owner = { job_id: last.job.job_id, session_id: last.job.session_id };
   if (confirmText && !confirm(confirmText)) return;
   if (last && last.auth_required && !token) {
     token = prompt("Control token (web.token in config):") || "";
-    try { localStorage.setItem("pw-token", token); } catch (e) {}
+    try { sessionStorage.setItem("pw-token", token); } catch (e) {}
   }
   $("msg").textContent = "…";
   try {
-    const r = await fetch(path + (token ? `?token=${encodeURIComponent(token)}` : ""), { method: "POST" });
+    busy = true;
+    document.querySelectorAll(".controls button, #p-btns button").forEach(b => b.disabled = true);
+    const url = new URL(path, location.origin);
+    if (incidentId) url.searchParams.set("id", incidentId);
+    else if (path !== "/api/test") {
+      url.searchParams.set("job_id", owner.job_id);
+      url.searchParams.set("session_id", owner.session_id);
+    }
+    const r = await fetch(url, { method: "POST", headers: token ? { "X-Token": token } : {} });
     const j = await r.json().catch(() => ({}));
-    if (!r.ok) { $("msg").textContent = `Error: ${j.detail || r.status}`; if (r.status === 401) { token = ""; try { localStorage.removeItem("pw-token"); } catch (e) {} } return; }
+    if (!r.ok) { $("msg").textContent = `Error: ${j.detail || r.status}`; if (r.status === 401) { token = ""; try { sessionStorage.removeItem("pw-token"); } catch (e) {} } return; }
     if (path === "/api/test") { $("msg").textContent = `Test: ${j.detections.length} boxes, sum p ${j.sum_p.toFixed(2)}`; document.querySelector('[data-src="test"]').click(); }
     else $("msg").textContent = `OK: ${j.result}`;
     poll();
   } catch (e) { $("msg").textContent = `Error: ${e}`; }
+  finally { busy = false; poll(); }
 }
 $("b-pause").onclick = () => call("/api/pause");
 $("b-resume").onclick = () => call("/api/resume");
@@ -147,14 +159,14 @@ $("b-test").onclick = () => call("/api/test");
 const fmt = s => { s = Math.max(0, Math.round(s)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = String(s % 60).padStart(2, "0");
   return h ? `${h}:${String(m).padStart(2, "0")}:${x}` : `${m}:${x}`; };
 let deadline = null, btnKey = "";
-setInterval(() => { if (deadline) $("p-count").textContent = fmt(deadline - Date.now() / 1000); }, 250);
+setInterval(() => { if (deadline) $("p-count").textContent = fmt(deadline - performance.now() / 1000); }, 250);
 const CMD = {
   veto: ["Keep printing", "keep"], act: [null, ""], stop: ["Cancel print", "danger", "Cancel the print?"],
   resume: ["Resume", "keep"], mute: ["False alarm: resume + mute", ""],
 };
 function incidentButtons(inc) {
   const cmds = inc.commands.filter(c => !(inc.acted === "paused" && c === "veto"));  // resume covers it
-  const key = cmds.join(",") + inc.next_action;
+  const key = inc.id + cmds.join(",") + inc.next_action;
   if (key === btnKey) return;
   btnKey = key;
   $("p-btns").innerHTML = "";
@@ -163,7 +175,8 @@ function incidentButtons(inc) {
     const b = document.createElement("button");
     b.textContent = label || (inc.next_action === "stop" ? "Stop now" : "Pause now");
     if (cls) b.className = cls;
-    b.onclick = () => call(`/api/incident/${c}`, conf);
+    b.disabled = busy || !last.printer_reachable;
+    b.onclick = () => call(`/api/incident/${c}`, conf, inc.id);
     $("p-btns").appendChild(b);
   }
 }
@@ -171,9 +184,9 @@ $("b-mute").onclick = () => call(last && last.job.muted ? "/api/unmute" : "/api/
 
 function chart(hist) {
   const W = 600, H = 120, svg = $("chart");
-  const now = Date.now() / 1000;
+  const now = last.server_time;
   const first = hist.length ? hist[0].ts : now;
-  const span = Math.min(7200, Math.max(600, now - first));  // 10 min .. 2 h, grows with the print
+  const span = Math.min(last.history_s, Math.max(Math.min(600, last.history_s), now - first));  // 10 min .. 2 h, grows with the print
   const x = t => W - ((now - t) / span) * W, y = v => H - Math.min(1, Math.max(0, v)) * H;
   const band = (lo, hi, c) => `<rect x="0" y="${y(hi)}" width="${W}" height="${y(lo) - y(hi)}" fill="${c}" opacity=".08"/>`;
   let d = hist.filter(h => now - h.ts <= span).map((h, i) => `${i ? "L" : "M"}${x(h.ts).toFixed(1)},${y(h.score).toFixed(1)}`).join("");
@@ -186,6 +199,7 @@ async function poll() {
   try {
     const s = await (await fetch("/api/state")).json();
     last = s;
+    document.querySelectorAll(".controls button, #p-btns button").forEach(b => b.disabled = busy || !s.printer_reachable);
     $("pname").textContent = s.printer_name;
     const st = s.printer_reachable ? s.printer_state : "offline";
     $("pstate").textContent = st; $("pstate").className = "pill " + st;
@@ -193,7 +207,7 @@ async function poll() {
     $("score").textContent = s.last_analysis_ts ? s.score.toFixed(2) : "-";
     $("marker").style.left = `${Math.min(100, s.score * 100)}%`;
     $("verdict").textContent = s.verdict; $("verdict").className = "verdict " + s.verdict;
-    $("grace").textContent = s.grace_frames_left > 0 && s.printer_state === "PRINTING" ? `· grace ${s.grace_frames_left} frames` : "";
+    $("grace").textContent = `· ${s.protection_status}${s.action_error ? ": " + s.action_error : ""}`;
     $("p").textContent = s.current_p.toFixed(3);
     $("ewm").textContent = `${s.ewm_mean.toFixed(3)} / ${s.baseline.toFixed(3)}`;
     $("fn").textContent = s.frame_num;
@@ -211,12 +225,12 @@ async function poll() {
       incidentButtons(inc);
       const where = `${inc.policy}${inc.schedule ? " · " + inc.schedule : ""}`;
       if (inc.acted === "paused") {
-        deadline = inc.next_action_in_s != null ? Date.now() / 1000 + inc.next_action_in_s : null;
+        deadline = inc.next_action_in_s != null ? performance.now() / 1000 + inc.next_action_in_s : null;
         $("p-count").textContent = deadline ? fmt(inc.next_action_in_s) : "⏸";
         $("p-title").textContent = deadline ? `Paused by prusa-watch: ${inc.next_action} when the timer runs out` : "Paused by prusa-watch: spaghetti detected";
         $("p-sub").textContent = `Score ${inc.score.toFixed(2)} · ${where}. Resume if it's fine, or cancel the print.`;
       } else if (inc.next_action) {
-        deadline = Date.now() / 1000 + inc.next_action_in_s;
+        deadline = performance.now() / 1000 + inc.next_action_in_s;
         $("p-title").textContent = `Spaghetti detected: ${inc.next_action === "stop" ? "stopping" : "pausing"} when the timer runs out`;
         $("p-sub").textContent = `Score ${inc.score.toFixed(2)} · ${where}. Keep printing if it's a false alarm.`;
       } else {
@@ -227,15 +241,22 @@ async function poll() {
     } else { deadline = null; btnKey = ""; }
     $("b-mute").textContent = s.job.muted ? "Unmute this print" : "Mute this print";
     const active = s.job.job_id != null && ["PRINTING", "PAUSED", "ATTENTION"].includes(s.printer_state);
-    $("b-pause").disabled = !active || s.printer_state !== "PRINTING";
-    $("b-resume").disabled = !active || s.printer_state !== "PAUSED";
-    $("b-stop").disabled = !active; $("b-mute").disabled = !active;
+    $("b-pause").disabled = busy || !s.printer_reachable || !active || s.printer_state !== "PRINTING";
+    $("b-resume").disabled = busy || !s.printer_reachable || !active || s.printer_state !== "PAUSED";
+    $("b-stop").disabled = busy || !s.printer_reachable || !active; $("b-mute").disabled = busy || !s.printer_reachable || !active;
+    $("b-test").disabled = busy || !s.camera_connected;
     const b = $("banner");
+    const failedChannels = Object.entries((s.background_io || {}).channels || {}).filter(([, health]) => health.last_error).map(([name]) => name);
     if (s.job.action_taken === "paused" && s.printer_state === "PAUSED" && !inc) { b.style.display = "block"; b.textContent = "Paused by prusa-watch: spaghetti detected. Check the print, then Resume or Stop."; }
     else if (!s.printer_reachable) { b.style.display = "block"; b.textContent = `Printer unreachable: ${s.printer_error || ""}`; }
+    else if (failedChannels.length) { b.style.display = "block"; b.textContent = `Notifications unavailable (${failedChannels.join(", ")}). Check delivery settings; any active intervention remains armed.`; }
+    else if (s.background_io.storage_errors || s.background_io.storage_dropped) { b.style.display = "block"; b.textContent = "Some diagnostic records could not be saved. Check disk space and recording settings."; }
     else b.style.display = "none";
     chart(s.history);
-  } catch (e) { $("pstate").textContent = "dashboard offline"; $("pstate").className = "pill offline"; }
+  } catch (e) { $("pstate").textContent = "dashboard offline"; $("pstate").className = "pill offline";
+    if (last) last.printer_reachable = false;
+    document.querySelectorAll(".controls button, #p-btns button").forEach(b => b.disabled = true);
+  }
 }
 poll(); refreshImage();
 setInterval(poll, 3000);

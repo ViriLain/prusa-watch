@@ -11,7 +11,6 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 
 use crate::monitor::{Monitor, constant_time_eq};
-use crate::prusalink::PrusaLinkError;
 
 pub const INDEX_HTML: &str = include_str!("static/index.html");
 
@@ -48,7 +47,14 @@ fn require_token(st: &AppState, q: &HashMap<String, String>, headers: &HeaderMap
 
 fn jpeg(data: Option<Vec<u8>>) -> Response {
     match data.filter(|d| !d.is_empty()) {
-        Some(d) => ([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "no-store")], d).into_response(),
+        Some(d) => (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            d,
+        )
+            .into_response(),
         None => detail(StatusCode::NOT_FOUND, "no frame yet"),
     }
 }
@@ -62,63 +68,79 @@ async fn control(
     st: AppState,
     q: HashMap<String, String>,
     headers: HeaderMap,
-    f: impl FnOnce(&Monitor) -> Result<String, PrusaLinkError> + Send + 'static,
+    command: String,
+    mute: bool,
 ) -> Response {
     if let Err(r) = require_token(&st, &q, &headers) {
         return r;
     }
+    let Some(job) = q.get("job_id").and_then(|id| id.parse::<i64>().ok()) else {
+        return detail(StatusCode::CONFLICT, "job id is required; refresh the dashboard");
+    };
+    let Some(session) = q.get("session_id").filter(|s| !s.is_empty()).cloned() else {
+        return detail(StatusCode::CONFLICT, "session id is required; refresh the dashboard");
+    };
     let m = st.monitor.clone();
-    match blocking(move || f(&m)).await {
+    match blocking(move || m.control(job, &session, &command, mute)).await {
         Ok(result) => Json(json!({"ok": true, "result": result})).into_response(),
+        Err(e) if e.0.contains("job/session changed") => detail(StatusCode::CONFLICT, e.to_string()),
         Err(e) => detail(StatusCode::BAD_GATEWAY, e.to_string()),
     }
 }
 
 pub fn router(monitor: Arc<Monitor>) -> Router {
-    let st = AppState { monitor, test_jpeg: Arc::new(Mutex::new(None)) };
+    let st = AppState {
+        monitor,
+        test_jpeg: Arc::new(Mutex::new(None)),
+    };
     Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
         .route("/healthz", get(healthz))
+        .route("/livez", get(|| async { Json(json!({"ok": true})) }))
         .route("/api/state", get(api_state))
         .route(
             "/frame.jpg",
             get(|State(st): State<AppState>| async move { jpeg(st.monitor.annotated_jpeg().map(|j| j.to_vec())) }),
         )
-        .route("/raw.jpg", get(|State(st): State<AppState>| async move { jpeg(blocking(move || st.monitor.raw_jpeg()).await) }))
-        .route("/test.jpg", get(|State(st): State<AppState>| async move { jpeg(st.test_jpeg.lock().unwrap().clone()) }))
+        .route(
+            "/raw.jpg",
+            get(|State(st): State<AppState>| async move { jpeg(blocking(move || st.monitor.raw_jpeg()).await) }),
+        )
+        .route(
+            "/test.jpg",
+            get(|State(st): State<AppState>| async move { jpeg(st.test_jpeg.lock().unwrap().clone()) }),
+        )
         .route(
             "/api/pause",
-            post(|State(st): State<AppState>, q: Q, h: HeaderMap| async move { control(st, q.0, h, |m| m.pause()).await }),
+            post(|State(st): State<AppState>, q: Q, h: HeaderMap| async move {
+                control(st, q.0, h, "pause".into(), false).await
+            }),
         )
         .route(
             "/api/resume",
             post(|State(st): State<AppState>, q: Q, h: HeaderMap| async move {
-                let mute = q.get("mute").is_some_and(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"));
-                control(st, q.0, h, move |m| m.resume(mute)).await
+                let mute = q
+                    .get("mute")
+                    .is_some_and(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"));
+                control(st, q.0, h, "resume".into(), mute).await
             }),
         )
         .route(
             "/api/stop",
-            post(|State(st): State<AppState>, q: Q, h: HeaderMap| async move { control(st, q.0, h, |m| m.stop_print()).await }),
+            post(|State(st): State<AppState>, q: Q, h: HeaderMap| async move {
+                control(st, q.0, h, "stop".into(), false).await
+            }),
         )
         .route(
             "/api/mute",
             post(|State(st): State<AppState>, q: Q, h: HeaderMap| async move {
-                control(st, q.0, h, |m| {
-                    m.set_muted(true);
-                    Ok("muted".into())
-                })
-                .await
+                control(st, q.0, h, "mute".into(), false).await
             }),
         )
         .route(
             "/api/unmute",
             post(|State(st): State<AppState>, q: Q, h: HeaderMap| async move {
-                control(st, q.0, h, |m| {
-                    m.set_muted(false);
-                    Ok("unmuted".into())
-                })
-                .await
+                control(st, q.0, h, "unmute".into(), false).await
             }),
         )
         .route("/api/incident/{cmd}", post(api_incident))
@@ -128,8 +150,14 @@ pub fn router(monitor: Arc<Monitor>) -> Router {
 }
 
 async fn healthz(State(st): State<AppState>) -> Response {
-    let ok = st.monitor.snapshot().printer_reachable;
-    (if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE }, Json(json!({"ok": ok}))).into_response()
+    match st.monitor.readiness() {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "reason": reason})),
+        )
+            .into_response(),
+    }
 }
 
 async fn api_state(State(st): State<AppState>) -> Json<Value> {
@@ -141,7 +169,8 @@ async fn api_state(State(st): State<AppState>) -> Json<Value> {
     d["auth_required"] = json!(!m.cfg.web.token.is_empty());
     d["history"] = serde_json::to_value(m.history_points()).unwrap();
     d["counters"] = serde_json::to_value(m.counters()).unwrap();
-    d["server_time"] = json!(crate::now_ts());
+    d["server_time"] = json!(m.now());
+    d["history_s"] = json!(m.cfg.web.history_s);
     Json(d)
 }
 
@@ -149,12 +178,26 @@ async fn api_incident(State(st): State<AppState>, Path(cmd): Path<String>, q: Q,
     if !crate::replies::COMMANDS.contains(&cmd.as_str()) {
         return detail(StatusCode::NOT_FOUND, "unknown command");
     }
-    if let Err(r) = require_token(&st, &q, &headers) {
-        return r;
-    }
     let m = st.monitor.clone();
-    // dashboard buttons act on whatever incident is open right now
-    let iid = q.get("id").filter(|s| !s.is_empty()).cloned().or_else(|| m.incident_id()).unwrap_or_default();
+    let Some(iid) = q.get("id").filter(|s| !s.is_empty()).cloned() else {
+        return detail(StatusCode::CONFLICT, "incident id is required; refresh the dashboard");
+    };
+    let capability = q
+        .get("expires")
+        .and_then(|expires| expires.parse::<i64>().ok())
+        .zip(q.get("cap"))
+        .is_some_and(|(expires, signature)| {
+            m.notifier
+                .signer
+                .verify(&cmd, &iid, expires, signature, crate::now_ts())
+        });
+    if q.contains_key("cap") || q.contains_key("expires") {
+        if !capability {
+            return detail(StatusCode::UNAUTHORIZED, "invalid or expired incident capability");
+        }
+    } else if let Err(response) = require_token(&st, &q, &headers) {
+        return response;
+    }
     let result = blocking(move || m.handle_reply(&cmd, &iid)).await;
     if result.starts_with("ignored") {
         return detail(StatusCode::CONFLICT, result);
@@ -170,8 +213,10 @@ async fn api_test(State(st): State<AppState>, q: Q, headers: HeaderMap) -> Respo
         return r;
     }
     let m = st.monitor.clone();
-    let Some((dets, img)) = blocking(move || m.test_detection()).await else {
-        return detail(StatusCode::NOT_FOUND, "no camera frame yet");
+    let (dets, img) = match blocking(move || m.test_detection()).await {
+        Ok(Some(result)) => (result.detections, result.jpeg),
+        Ok(None) => return detail(StatusCode::NOT_FOUND, "no camera frame yet"),
+        Err(error) => return detail(StatusCode::BAD_GATEWAY, format!("inference failed: {error}")),
     };
     *st.test_jpeg.lock().unwrap() = Some(img);
     let sum: f64 = dets.iter().map(|d| d.confidence).fold(0.0, |a, b| a + b);
@@ -182,8 +227,27 @@ async fn metrics(State(st): State<AppState>) -> Response {
     let m = &st.monitor;
     let s = m.snapshot();
     let c = m.counters();
-    let lbl = format!("printer=\"{}\"", m.cfg.printer.name);
-    let states = ["IDLE", "BUSY", "PRINTING", "PAUSED", "FINISHED", "STOPPED", "ERROR", "ATTENTION", "READY", "UNKNOWN"];
+    let lbl = format!(
+        "printer=\"{}\"",
+        m.cfg
+            .printer
+            .name
+            .replace('\\', "\\\\")
+            .replace('\n', "\\n")
+            .replace('"', "\\\"")
+    );
+    let states = [
+        "IDLE",
+        "BUSY",
+        "PRINTING",
+        "PAUSED",
+        "FINISHED",
+        "STOPPED",
+        "ERROR",
+        "ATTENTION",
+        "READY",
+        "UNKNOWN",
+    ];
     let next_in = s
         .incident
         .as_ref()
@@ -206,7 +270,10 @@ async fn metrics(State(st): State<AppState>) -> Response {
         "# TYPE prusa_watch_camera_connected gauge".into(),
         format!("prusa_watch_camera_connected{{{lbl}}} {}", s.camera_connected as u8),
         "# TYPE prusa_watch_frame_age_seconds gauge".into(),
-        format!("prusa_watch_frame_age_seconds{{{lbl}}} {}", s.frame_age_s.map(py_float).unwrap_or_else(|| "NaN".into())),
+        format!(
+            "prusa_watch_frame_age_seconds{{{lbl}}} {}",
+            s.frame_age_s.map(py_float).unwrap_or_else(|| "NaN".into())
+        ),
         "# TYPE prusa_watch_printer_reachable gauge".into(),
         format!("prusa_watch_printer_reachable{{{lbl}}} {}", s.printer_reachable as u8),
         "# HELP prusa_watch_incident_open 1 while an escalation incident is open".into(),
@@ -218,7 +285,10 @@ async fn metrics(State(st): State<AppState>) -> Response {
         "# TYPE prusa_watch_printer_state gauge".into(),
     ];
     for st in states {
-        lines.push(format!("prusa_watch_printer_state{{{lbl},state=\"{st}\"}} {}", (s.printer_state == st) as u8));
+        lines.push(format!(
+            "prusa_watch_printer_state{{{lbl},state=\"{st}\"}} {}",
+            (s.printer_state == st) as u8
+        ));
     }
     for (name, help, v) in [
         ("frames_analyzed", "Frames run through the model", c.frames_analyzed),
@@ -227,25 +297,43 @@ async fn metrics(State(st): State<AppState>) -> Response {
         ("pauses", "Prints paused by prusa-watch", c.pauses),
         ("stops", "Prints stopped by prusa-watch", c.stops),
         ("printer_errors", "PrusaLink request failures", c.printer_errors),
-        ("vetoes", "Pending actions cancelled by the user (Keep printing)", c.vetoes),
-        ("auto_actions", "Pending actions that fired because nobody responded", c.auto_actions),
+        (
+            "vetoes",
+            "Pending actions cancelled by the user (Keep printing)",
+            c.vetoes,
+        ),
+        (
+            "auto_actions",
+            "Pending actions that fired because nobody responded",
+            c.auto_actions,
+        ),
     ] {
         lines.push(format!("# HELP prusa_watch_{name}_total {help}"));
         lines.push(format!("# TYPE prusa_watch_{name}_total counter"));
         lines.push(format!("prusa_watch_{name}_total{{{lbl}}} {v}"));
     }
-    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], lines.join("\n") + "\n").into_response()
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        lines.join("\n") + "\n",
+    )
+        .into_response()
 }
 
 /// Python's repr() for floats: always shows a decimal point (1.0, 0.1, 1e-05).
 fn py_float(v: f64) -> String {
     let s = format!("{v:?}");
-    if s.contains('.') || s.contains('e') || s.contains("inf") || s.contains("NaN") { s } else { format!("{s}.0") }
+    if s.contains('.') || s.contains('e') || s.contains("inf") || s.contains("NaN") {
+        s
+    } else {
+        format!("{s}.0")
+    }
 }
 
 pub async fn serve(monitor: Arc<Monitor>, host: &str, port: u16) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
-    axum::serve(listener, router(monitor)).with_graceful_shutdown(shutdown_signal()).await?;
+    axum::serve(listener, router(monitor))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
 

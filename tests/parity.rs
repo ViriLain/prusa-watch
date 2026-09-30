@@ -37,7 +37,12 @@ fn decision_sequences_match_python_bit_for_bit() {
                 d.reset_for_new_print();
                 continue;
             }
-            let confs: Vec<f64> = step["confs"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+            let confs: Vec<f64> = step["confs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap())
+                .collect();
             let v = d.update(&confs);
             assert_eq!(v.as_str(), step["verdict"].as_str().unwrap(), "{name} step {i}");
             let st = serde_json::to_value(&d.state).unwrap();
@@ -61,7 +66,9 @@ fn decision_sequences_match_python_bit_for_bit() {
 fn durations_match_python() {
     let f = fixture("durations.json");
     for (input, expected) in f["ok"].as_object().unwrap() {
-        let v: serde_yaml::Value = serde_json::from_str::<Value>(input).map(|j| serde_yaml::to_value(j).unwrap()).unwrap();
+        let v: serde_yaml::Value = serde_json::from_str::<Value>(input)
+            .map(|j| serde_yaml::to_value(j).unwrap())
+            .unwrap();
         assert_eq!(parse_duration(&v).unwrap(), expected.as_f64().unwrap(), "{input}");
     }
     for case in f["bad"].as_array().unwrap() {
@@ -125,14 +132,37 @@ fn schedule_matching_matches_python() {
     for case in fixture("schedule_cases.json").as_array().unwrap() {
         let dt = NaiveDateTime::parse_from_str(case["dt"].as_str().unwrap(), "%Y-%m-%dT%H:%M:%S").unwrap();
         let got: Vec<bool> = rules.iter().map(|r| r.matches(dt)).collect();
-        let exp: Vec<bool> = case["matches"].as_array().unwrap().iter().map(|v| v.as_bool().unwrap()).collect();
+        let exp: Vec<bool> = case["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_bool().unwrap())
+            .collect();
         assert_eq!(got, exp, "{dt}");
     }
 }
 
 #[test]
 fn effective_default_config_matches_python() {
-    let got = serde_json::to_value(effective_config(&Config::default(), true)).unwrap();
+    let mut got = serde_json::to_value(effective_config(&Config::default(), true)).unwrap();
+    // settings added after the Python version (field regressions, job 419)
+    got["camera"].as_object_mut().unwrap().remove("ignore");
+    got["decision"].as_object_mut().unwrap().remove("min_frame_p");
+    assert_eq!(got["web"]["host"], "127.0.0.1");
+    got["web"]["host"] = serde_json::json!("0.0.0.0"); // intentional security default migration
+    for (section, names) in [
+        (
+            "printer",
+            vec!["action_confirmation_s", "action_retry_s", "action_max_attempts"],
+        ),
+        ("detector", vec!["expected_sha256"]),
+        ("web", vec!["allow_unauthenticated"]),
+        ("recording", vec!["max_storage_mb"]),
+    ] {
+        for name in names {
+            got[section].as_object_mut().unwrap().remove(name);
+        }
+    }
     let exp = fixture("effective_defaults.json");
     fn norm(v: &Value) -> Value {
         match v {
@@ -230,6 +260,42 @@ fn event(name: &str) -> Event {
     e
 }
 
+// Link credentials intentionally changed; preserve all other Python wire semantics.
+fn normalized_links(value: &str) -> String {
+    regex::Regex::new(r#"https?://[^\s,;"]+"#)
+        .unwrap()
+        .replace_all(value, |capture: &regex::Captures<'_>| {
+            let Ok(mut url) = reqwest::Url::parse(&capture[0]) else {
+                return capture[0].to_string();
+            };
+            let pairs: Vec<(String, String)> = url
+                .query_pairs()
+                .filter(|(key, _)| !["token", "expires", "cap"].contains(&key.as_ref()))
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            url.set_query(None);
+            if !pairs.is_empty() {
+                url.query_pairs_mut().extend_pairs(pairs);
+            }
+            url.to_string()
+        })
+        .into_owned()
+}
+
+fn normalized_json_links(value: &Value) -> Value {
+    match value {
+        Value::String(s) => Value::String(normalized_links(s)),
+        Value::Array(items) => Value::Array(items.iter().map(normalized_json_links).collect()),
+        Value::Object(items) => Value::Object(
+            items
+                .iter()
+                .map(|(key, value)| (key.clone(), normalized_json_links(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 #[test]
 fn notification_requests_match_python() {
     for case in fixture("notify_requests.json").as_array().unwrap() {
@@ -269,19 +335,33 @@ fn notification_requests_match_python() {
                 if k == "content-type" {
                     continue; // set by the HTTP client from the body kind
                 }
-                assert_eq!(g.get_header(k), Some(v.as_str().unwrap()), "{ctx} header {k}");
+                assert_eq!(
+                    normalized_links(g.get_header(k).unwrap()),
+                    normalized_links(v.as_str().unwrap()),
+                    "{ctx} header {k}"
+                );
             }
-            let extra: Vec<&str> =
-                g.headers.iter().map(|(k, _)| k.as_str()).filter(|k| !eh.contains_key(&k.to_lowercase())).collect();
+            let extra: Vec<&str> = g
+                .headers
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .filter(|k| !eh.contains_key(&k.to_lowercase()))
+                .collect();
             assert!(extra.is_empty(), "{ctx}: unexpected headers {extra:?}");
             match &g.body {
                 Body::Json(v) => {
                     let exp_body: Value = serde_json::from_str(e["body"].as_str().unwrap()).unwrap();
-                    assert_eq!(v, &exp_body, "{ctx} body");
+                    assert_eq!(normalized_json_links(v), normalized_json_links(&exp_body), "{ctx} body");
                 }
                 Body::Bytes(b) => assert_eq!(b.len() as u64, e["body_len"].as_u64().unwrap(), "{ctx}"),
                 Body::Multipart(parts) => {
-                    assert!(e["headers"]["content-type"].as_str().unwrap().starts_with("multipart/form-data"), "{ctx}");
+                    assert!(
+                        e["headers"]["content-type"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("multipart/form-data"),
+                        "{ctx}"
+                    );
                     assert_eq!(parts[0].name, "payload_json");
                     let exp_payload = serde_json::json!({"embeds": [{"title": "core-one: possible print failure", "description": "Not acting yet (score 0.35). üñí", "color": 0xF5A524, "timestamp": "2026-09-27T12:00:00+00:00", "image": {"url": "attachment://frame.jpg"}}]});
                     if ev_name == "warning" {
@@ -300,8 +380,11 @@ fn notification_requests_match_python() {
 fn reference_file_equals_builtin_defaults() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.reference.yaml");
     let reference = prusa_watch::config::load_config(Some(&path), &BTreeMap::new()).unwrap();
-    assert_eq!(parse_escalation(Some(&reference.escalation), false).unwrap(), parse_escalation(None, true).unwrap());
-    let mut r = reference.clone();
+    assert_eq!(
+        parse_escalation(Some(&reference.escalation), false).unwrap(),
+        parse_escalation(None, true).unwrap()
+    );
+    let mut r = reference;
     r.escalation = Default::default();
     assert_eq!(r, Config::default());
 }
@@ -310,9 +393,19 @@ fn check_dets(got: &[prusa_watch::detector::Detection], exp: &Value, ctx: &str, 
     let exp = exp.as_array().unwrap();
     assert_eq!(got.len(), exp.len(), "{ctx}: {got:?}");
     for (g, e) in got.iter().zip(exp) {
-        assert!((g.confidence - e[0].as_f64().unwrap()).abs() < tol, "{ctx}: conf {} vs {}", g.confidence, e[0]);
+        assert!(
+            (g.confidence - e[0].as_f64().unwrap()).abs() < tol,
+            "{ctx}: conf {} vs {}",
+            g.confidence,
+            e[0]
+        );
         for (a, b) in g.bbox.iter().zip(e[1].as_array().unwrap()) {
-            assert!((a - b.as_f64().unwrap()).abs() < 1e-3, "{ctx}: box {:?} vs {}", g.bbox, e[1]);
+            assert!(
+                (a - b.as_f64().unwrap()).abs() < 1e-3,
+                "{ctx}: box {:?} vs {}",
+                g.bbox,
+                e[1]
+            );
         }
     }
 }
@@ -325,8 +418,13 @@ fn detector_on_synthetic_model_matches_python() {
     let golden = fixture("detector_fake.json");
     for v in [0u8, 128, 255] {
         let img = image::RgbImage::from_pixel(640, 360, image::Rgb([v, v, v]));
-        let dets = det.detect(&img, 0.08, 0.45);
-        check_dets(&dets, &golden[format!("fake_solid{v}")]["dets"], &format!("solid{v}"), 1e-6);
+        let dets = det.try_detect(&img, 0.08, 0.45).unwrap();
+        check_dets(
+            &dets,
+            &golden[format!("fake_solid{v}")]["dets"],
+            &format!("solid{v}"),
+            1e-6,
+        );
     }
 }
 
@@ -337,25 +435,42 @@ fn detector_on_synthetic_model_matches_python() {
 #[ignore]
 fn real_model_matches_python_on_real_frames() {
     use prusa_watch::detector::{Detect, SpaghettiDetector};
-    let (Ok(dir), Ok(model)) = (std::env::var("PRUSA_WATCH_PARITY_DIR"), std::env::var("PRUSA_WATCH_MODEL")) else {
-        eprintln!("skipped: set PRUSA_WATCH_PARITY_DIR and PRUSA_WATCH_MODEL");
-        return;
-    };
+    let dir = std::env::var("PRUSA_WATCH_PARITY_DIR").expect("explicit parity run requires PRUSA_WATCH_PARITY_DIR");
+    let model = std::env::var("PRUSA_WATCH_MODEL").expect("explicit parity run requires PRUSA_WATCH_MODEL");
+    prusa_watch::model::verify_digest(std::path::Path::new(&model), prusa_watch::model::DEFAULT_SHA256).unwrap();
     let det = SpaghettiDetector::load(&model, false).unwrap();
     let golden: Value = serde_json::from_str(&std::fs::read_to_string(format!("{dir}/golden.json")).unwrap()).unwrap();
     for (name, g) in golden.as_object().unwrap() {
         if name.starts_with("fake_") {
             continue;
         }
-        let img = image::open(format!("{dir}/{name}.ppm")).unwrap().to_rgb8();
-        let dets = det.detect(&img, 0.08, 0.45);
+        let file = g["file"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{name}.ppm"));
+        let path = std::path::Path::new(&dir).join(file);
+        if let Some(expected) = g["sha256"].as_str() {
+            use sha2::{Digest, Sha256};
+            assert_eq!(
+                hex::encode(Sha256::digest(std::fs::read(&path).unwrap())),
+                expected,
+                "{name}: input hash"
+            );
+        }
+        let img = image::open(path).unwrap().to_rgb8();
+        let dets = det.try_detect(&img, 0.08, 0.45).unwrap();
         let p: f64 = dets.iter().map(|d| d.confidence).fold(0.0, |a, b| a + b);
-        eprintln!("{name}: {} dets, p={p:.4} (python p={}) in {:.0} ms", dets.len(), g["p"], det.last_inference_ms());
+        eprintln!(
+            "{name}: {} dets, p={p:.4} (python p={}) in {:.0} ms",
+            dets.len(),
+            g["p"],
+            det.last_inference_ms()
+        );
         check_dets(&dets, &g["dets"], name, 1e-5);
     }
 }
 
-/// OpenCV INTER_LINEAR parity on non-uniform images of assorted sizes, including an
+/// OpenCV INTER_LINEAR_EXACT parity on non-uniform images of assorted sizes, including an
 /// odd width, an upscale and an exact 2x downscale (which OpenCV routes to INTER_AREA).
 #[test]
 fn resize_matches_opencv_bit_for_bit() {
@@ -375,10 +490,21 @@ fn resize_matches_opencv_bit_for_bit() {
         });
         let out = prusa_watch::imaging::resize_linear(&img, 416, 416);
         let px = |x, y| out.get_pixel(x, y).0.iter().map(|v| *v as i64).collect::<Vec<_>>();
-        let expect = |k: &str| exp[k].as_array().unwrap().iter().map(|v| v.as_i64().unwrap()).collect::<Vec<_>>();
+        let expect = |k: &str| {
+            exp[k]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_i64().unwrap())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(px(0, 0), expect("first"), "{size} first pixel");
         assert_eq!(px(208, 208), expect("center"), "{size} center pixel");
         assert_eq!(px(415, 415), expect("last"), "{size} last pixel");
-        assert_eq!(hex::encode(Sha256::digest(out.as_raw())), exp["sha256"].as_str().unwrap(), "{size} whole image");
+        assert_eq!(
+            hex::encode(Sha256::digest(out.as_raw())),
+            exp["sha256"].as_str().unwrap(),
+            "{size} whole image"
+        );
     }
 }

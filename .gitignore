@@ -3,3 +3,12 @@ config.yaml
 data/
 models/
 /target/
+
+.DS_Store
+
+# Local diagnostics and remnants of the retired Python implementation.
+review/
+build/
+test-prints/
+__pycache__/
+*.egg-info/

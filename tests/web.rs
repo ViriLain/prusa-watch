@@ -18,23 +18,54 @@ struct Client {
 
 impl Client {
     fn new(mon: Arc<Monitor>) -> Self {
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
         let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
         let addr = listener.local_addr().unwrap();
         rt.spawn(async move {
             axum::serve(listener, prusa_watch::web::router(mon)).await.unwrap();
         });
         let http = reqwest::blocking::Client::builder().no_proxy().build().unwrap();
-        Self { base: format!("http://{addr}"), http, _rt: rt }
+        Self {
+            base: format!("http://{addr}"),
+            http,
+            _rt: rt,
+        }
     }
     fn get(&self, path: &str) -> reqwest::blocking::Response {
         self.http.get(format!("{}{path}", self.base)).send().unwrap()
     }
+    fn bound(&self, path: &str) -> String {
+        if ["/api/pause", "/api/resume", "/api/stop", "/api/mute", "/api/unmute"]
+            .iter()
+            .any(|route| path.split('?').next() == Some(route))
+        {
+            let state = self.json("/api/state");
+            format!(
+                "{path}{}job_id={}&session_id={}",
+                if path.contains('?') { "&" } else { "?" },
+                state["job"]["job_id"],
+                state["job"]["session_id"].as_str().unwrap()
+            )
+        } else {
+            path.into()
+        }
+    }
     fn post(&self, path: &str) -> reqwest::blocking::Response {
-        self.http.post(format!("{}{path}", self.base)).send().unwrap()
+        self.http
+            .post(format!("{}{}", self.base, self.bound(path)))
+            .send()
+            .unwrap()
     }
     fn post_h(&self, path: &str, k: &str, v: &str) -> reqwest::blocking::Response {
-        self.http.post(format!("{}{path}", self.base)).header(k, v).send().unwrap()
+        self.http
+            .post(format!("{}{}", self.base, self.bound(path)))
+            .header(k, v)
+            .send()
+            .unwrap()
     }
     fn json(&self, path: &str) -> Value {
         self.get(path).json().unwrap()
@@ -66,7 +97,10 @@ fn dashboard_state_frames_metrics_and_auth() {
     assert_eq!(&bytes(c.get("/raw.jpg"))[..2], b"\xff\xd8");
 
     let m = c.get("/metrics").text().unwrap();
-    assert!(m.contains(r#"prusa_watch_printer_state{printer="core-one",state="PRINTING"} 1"#), "{m}");
+    assert!(
+        m.contains(r#"prusa_watch_printer_state{printer="core-one",state="PRINTING"} 1"#),
+        "{m}"
+    );
     assert!(m.contains("prusa_watch_frames_analyzed_total"));
 
     // control endpoints require the token
@@ -137,17 +171,58 @@ fn incident_endpoints() {
     assert_eq!(s["policy"]["policy"], "ask_first");
     let m = c.get("/metrics").text().unwrap();
     assert!(
-        m.contains(r#"prusa_watch_incident_open{printer="core-one"} 1"#) && m.contains("prusa_watch_next_action_seconds"),
+        m.contains(r#"prusa_watch_incident_open{printer="core-one"} 1"#)
+            && m.contains("prusa_watch_next_action_seconds"),
         "{m}"
     );
     assert_eq!(c.post(&format!("/api/incident/veto?id={inc}")).status(), 401); // token still required
     assert_eq!(c.post("/api/incident/resume?token=tok").status(), 409); // not applicable yet
-    let resp = c.post("/api/incident/act?token=tok"); // dashboard: no id -> current incident
+    assert_eq!(c.post("/api/incident/act?token=tok").status(), 409);
+    let resp = c.post(&format!("/api/incident/act?token=tok&id={inc}"));
     assert_eq!(resp.status(), 200);
     let j: Value = resp.json().unwrap();
     assert_eq!(j["result"], "paused");
-    assert_eq!(c.json("/api/state")["incident"]["commands"], serde_json::json!(["resume", "mute", "stop", "veto"]));
-    let j: Value = c.post("/api/incident/mute?token=tok").json().unwrap();
+    assert_eq!(
+        c.json("/api/state")["incident"]["commands"],
+        serde_json::json!(["resume", "mute", "stop", "veto"])
+    );
+    let j: Value = c
+        .post(&format!("/api/incident/mute?token=tok&id={inc}"))
+        .json()
+        .unwrap();
     assert!(j["result"].as_str().unwrap().starts_with("resumed"), "{j}");
     assert!(c.json("/api/state")["incident"].is_null());
+}
+
+#[test]
+fn controls_reject_stale_owners_and_scoped_links_reject_tampering() {
+    let r = rig_with(arm);
+    let c = Client::new(r.mon.clone());
+    let id = spaghetti_until_incident(&r, 40);
+    let owner = r.mon.snapshot().job;
+    let bad = format!("/api/pause?job_id=40&session_id={}", owner.session_id);
+    r.printer.set("PRINTING", Some(41));
+    r.advance(1);
+    let response = c
+        .http
+        .post(format!("{}{bad}", c.base))
+        .header("X-Token", "tok")
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    assert!(r.printer.calls().is_empty());
+    assert_eq!(c.post(&format!("/api/incident/stop?token=tok&id={id}")).status(), 409);
+    let expires = prusa_watch::now_ts() as i64 + 60;
+    let signature = r.mon.notifier.signer.sign("veto", &id, expires);
+    assert_eq!(
+        c.post(&format!("/api/incident/stop?id={id}&expires={expires}&cap={signature}"))
+            .status(),
+        401
+    );
+    let expired = r.mon.notifier.signer.sign("veto", &id, 0);
+    assert_eq!(
+        c.post(&format!("/api/incident/veto?id={id}&expires=0&cap={expired}"))
+            .status(),
+        401
+    );
 }

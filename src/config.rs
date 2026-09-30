@@ -7,7 +7,7 @@
 //!   3. Environment overrides: `PRUSA_WATCH__<SECTION>__<KEY>=value`, e.g.
 //!      `PRUSA_WATCH__DECISION__SENSITIVITY=1.25`,
 //!      `PRUSA_WATCH__ESCALATION__DEFAULT_POLICY=watch_only`.
-//!      Values are parsed as YAML (numbers, true/false, [lists]).
+//!      Values are parsed as YAML (numbers, true/false, `[lists]`).
 //!
 //! `prusa-watch config` prints the effective result; config.reference.yaml lists
 //! every setting with its default.
@@ -35,6 +35,10 @@ pub struct PrinterConfig {
     pub auth: String,
     pub poll_interval_s: f64,
     pub timeout_s: f64,
+    /// Deadline to observe a requested state change at the printer.
+    pub action_confirmation_s: f64,
+    pub action_retry_s: f64,
+    pub action_max_attempts: u32,
 }
 
 impl Default for PrinterConfig {
@@ -48,6 +52,9 @@ impl Default for PrinterConfig {
             auth: "digest".into(),
             poll_interval_s: 5.0,
             timeout_s: 5.0,
+            action_confirmation_s: 60.0,
+            action_retry_s: 15.0,
+            action_max_attempts: 3,
         }
     }
 }
@@ -55,7 +62,7 @@ impl Default for PrinterConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CameraConfig {
-    /// rtsp://<camera-ip>/live (or a file path / http URL for testing)
+    /// `rtsp://<camera-ip>/live` (or a file path / http URL for testing)
     pub url: String,
     /// RTSP transport; TCP avoids smeared frames on lossy Wi-Fi
     pub transport: String,
@@ -68,6 +75,10 @@ pub struct CameraConfig {
     pub open_timeout_s: f64,
     /// no frame for this long = reconnect
     pub read_timeout_s: f64,
+    /// Regions to ignore, each normalized [x1, y1, x2, y2] in *full-frame* coordinates
+    /// (same space as `roi`). Detections whose centre falls inside one are dropped before
+    /// scoring: for a spot that glints or collects debris and keeps fooling the model.
+    pub ignore: Vec<Vec<f64>>,
 }
 
 impl Default for CameraConfig {
@@ -80,6 +91,7 @@ impl Default for CameraConfig {
             reconnect_backoff_s: 5.0,
             open_timeout_s: 10.0,
             read_timeout_s: 10.0,
+            ignore: vec![],
         }
     }
 }
@@ -88,6 +100,8 @@ impl Default for CameraConfig {
 #[serde(default)]
 pub struct DetectorConfig {
     pub model_path: String,
+    /// Empty explicitly allows a custom unverified model; otherwise pin its SHA-256.
+    pub expected_sha256: String,
     /// per-box confidence floor (Obico default)
     pub threshold: f64,
     pub nms: f64,
@@ -101,6 +115,7 @@ impl Default for DetectorConfig {
     fn default() -> Self {
         Self {
             model_path: "models/model-weights.onnx".into(),
+            expected_sha256: crate::model::DEFAULT_SHA256.into(),
             threshold: 0.08,
             nms: 0.45,
             interval_s: 10.0,
@@ -130,6 +145,11 @@ pub struct DecisionConfig {
     /// Fresh-install prior: seed the long-run baseline as if we'd already watched
     /// this many clean (p=0) frames (360 = 1 h). Set 0 for exact Obico behavior.
     pub baseline_prior_frames: i64,
+    /// An incident only opens when the *current* frame's summed confidence is at least
+    /// this. Obico's verdict rides a moving average, which keeps "remembering" a short
+    /// burst (a glint, dust catching the light) after the frame is clean again; without
+    /// this gate that tail can pause a print on a frame with nothing in it. 0 = pure Obico.
+    pub min_frame_p: f64,
 }
 
 impl Default for DecisionConfig {
@@ -146,6 +166,7 @@ impl Default for DecisionConfig {
             rolling_mean_short_multiple: 3.8,
             escalating_factor: 1.75,
             baseline_prior_frames: 360,
+            min_frame_p: 0.3,
         }
     }
 }
@@ -205,7 +226,12 @@ pub struct EventNotifyConfig {
 
 impl Default for EventNotifyConfig {
     fn default() -> Self {
-        Self { enabled: true, channels: None, priority: 3, cooldown_s: 0.0 }
+        Self {
+            enabled: true,
+            channels: None,
+            priority: 3,
+            cooldown_s: 0.0,
+        }
     }
 }
 
@@ -231,9 +257,19 @@ impl Default for NotifyConfig {
             ntfy: NtfyConfig::default(),
             discord: DiscordConfig::default(),
             webhook: WebhookConfig::default(),
-            warning: EventNotifyConfig { priority: 4, cooldown_s: 300.0, ..Default::default() },
-            camera: EventNotifyConfig { priority: 3, ..Default::default() },
-            info: EventNotifyConfig { priority: 3, ..Default::default() },
+            warning: EventNotifyConfig {
+                priority: 4,
+                cooldown_s: 300.0,
+                ..Default::default()
+            },
+            camera: EventNotifyConfig {
+                priority: 3,
+                ..Default::default()
+            },
+            info: EventNotifyConfig {
+                priority: 3,
+                ..Default::default()
+            },
             timeout_s: 15.0,
         }
     }
@@ -249,6 +285,8 @@ pub struct WebConfig {
     pub public_url: String,
     /// Optional shared secret for control endpoints (pause/resume/stop/mute).
     pub token: String,
+    /// Explicit opt-in for network-accessible controls without authentication.
+    pub allow_unauthenticated: bool,
     /// score history kept for the dashboard chart
     pub history_s: f64,
 }
@@ -257,10 +295,11 @@ impl Default for WebConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            host: "0.0.0.0".into(),
+            host: "127.0.0.1".into(),
             port: 8484,
             public_url: String::new(),
             token: String::new(),
+            allow_unauthenticated: false,
             history_s: 7200.0,
         }
     }
@@ -270,9 +309,9 @@ impl Default for WebConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RecordingConfig {
-    /// one CSV row per analyzed frame: history/job-<id>.csv
+    /// one CSV row per analyzed frame: `history/job-<id>.csv`
     pub history: bool,
-    /// annotated frames when the model sees something: frames/job-<id>/
+    /// annotated frames when the model sees something: `frames/job-<id>/`
     pub frames: bool,
     /// save a frame once its summed confidence reaches this (warning/failure frames always)
     pub frame_min_p: f64,
@@ -280,11 +319,20 @@ pub struct RecordingConfig {
     pub max_frames_per_job: i64,
     /// history/frames of older prints beyond this many are deleted (0 = keep all)
     pub keep_jobs: i64,
+    /// Combined history, frames and failures budget; 0 explicitly disables the byte limit.
+    pub max_storage_mb: u64,
 }
 
 impl Default for RecordingConfig {
     fn default() -> Self {
-        Self { history: true, frames: true, frame_min_p: 0.3, max_frames_per_job: 120, keep_jobs: 50 }
+        Self {
+            history: true,
+            frames: true,
+            frame_min_p: 0.3,
+            max_frames_per_job: 120,
+            keep_jobs: 50,
+            max_storage_mb: 1024,
+        }
     }
 }
 
@@ -347,8 +395,17 @@ impl Config {
         if let Err(e) = crate::policy::resolve_tz(&self.timezone) {
             errors.push(e.to_string());
         }
-        for (name, ev) in [("warning", &self.notify.warning), ("camera", &self.notify.camera), ("info", &self.notify.info)] {
-            let mut bad: Vec<&String> = ev.channels.iter().flatten().filter(|c| !CHANNELS.contains(&c.as_str())).collect();
+        for (name, ev) in [
+            ("warning", &self.notify.warning),
+            ("camera", &self.notify.camera),
+            ("info", &self.notify.info),
+        ] {
+            let mut bad: Vec<&String> = ev
+                .channels
+                .iter()
+                .flatten()
+                .filter(|c| !CHANNELS.contains(&c.as_str()))
+                .collect();
             if !bad.is_empty() {
                 bad.sort();
                 bad.dedup();
@@ -362,18 +419,138 @@ impl Config {
                 errors.push(format!("notify.{name}.priority must be 1..5"));
             }
         }
+        if self.recording.max_storage_mb > 1_000_000 {
+            errors.push("recording.max_storage_mb must be <= 1000000".into());
+        }
         if self.recording.max_frames_per_job < 0 || self.recording.keep_jobs < 0 {
             errors.push("recording.max_frames_per_job and recording.keep_jobs must be >= 0".into());
         }
         if let Some(r) = &self.camera.roi
-            && (r.len() != 4 || !(0.0 <= r[0] && r[0] < r[2] && r[2] <= 1.0 && 0.0 <= r[1] && r[1] < r[3] && r[3] <= 1.0))
+            && (r.len() != 4
+                || !(0.0 <= r[0] && r[0] < r[2] && r[2] <= 1.0 && 0.0 <= r[1] && r[1] < r[3] && r[3] <= 1.0))
         {
             errors.push("camera.roi must be [x1, y1, x2, y2] with 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1".into());
+        }
+        for (i, r) in self.camera.ignore.iter().enumerate() {
+            if r.len() != 4 || !(0.0 <= r[0] && r[0] < r[2] && r[2] <= 1.0 && 0.0 <= r[1] && r[1] < r[3] && r[3] <= 1.0)
+            {
+                errors.push(format!(
+                    "camera.ignore[{i}] must be [x1, y1, x2, y2] with 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1 (full-frame coordinates)"
+                ));
+            }
+        }
+        let mut range = |name: &str, value: f64, min: f64, max: f64| {
+            if !value.is_finite() || !(min..=max).contains(&value) {
+                errors.push(format!("{name} must be finite and in {min}..={max}"));
+            }
+        };
+        for (name, value) in [
+            ("printer.poll_interval_s", self.printer.poll_interval_s),
+            ("printer.timeout_s", self.printer.timeout_s),
+            ("printer.action_confirmation_s", self.printer.action_confirmation_s),
+            ("printer.action_retry_s", self.printer.action_retry_s),
+            ("camera.stale_after_s", self.camera.stale_after_s),
+            ("camera.reconnect_backoff_s", self.camera.reconnect_backoff_s),
+            ("camera.open_timeout_s", self.camera.open_timeout_s),
+            ("camera.read_timeout_s", self.camera.read_timeout_s),
+            ("detector.interval_s", self.detector.interval_s),
+            ("notify.timeout_s", self.notify.timeout_s),
+            ("notify.ntfy.reply_reconnect_s", self.notify.ntfy.reply_reconnect_s),
+        ] {
+            range(name, value, 0.01, 3600.0);
+        }
+        for (name, value) in [
+            ("detector.threshold", self.detector.threshold),
+            ("detector.nms", self.detector.nms),
+            (
+                "detector.visualization_threshold",
+                self.detector.visualization_threshold,
+            ),
+        ] {
+            range(name, value, 0.0, 1.0);
+        }
+        for (name, value) in [
+            ("decision.resume_grace_s", self.decision.resume_grace_s),
+            ("notify.warning.cooldown_s", self.notify.warning.cooldown_s),
+            ("notify.camera.cooldown_s", self.notify.camera.cooldown_s),
+            ("notify.info.cooldown_s", self.notify.info.cooldown_s),
+        ] {
+            range(name, value, 0.0, 604_800.0);
+        }
+        for (name, value) in [
+            ("decision.ewm_span", self.decision.ewm_span),
+            ("decision.rolling_win_short", self.decision.rolling_win_short),
+            ("decision.rolling_win_long", self.decision.rolling_win_long),
+        ] {
+            range(name, value as f64, 1.0, 1_000_000_000.0);
+        }
+        for (name, value) in [
+            ("decision.init_safe_frame_num", self.decision.init_safe_frame_num),
+            ("decision.baseline_prior_frames", self.decision.baseline_prior_frames),
+        ] {
+            range(name, value as f64, 0.0, 1_000_000_000.0);
+        }
+        range("decision.sensitivity", self.decision.sensitivity, 0.001, 100.0);
+        range("decision.threshold_low", self.decision.threshold_low, 0.001, 10_000.0);
+        range("decision.threshold_high", self.decision.threshold_high, 0.001, 10_000.0);
+        range(
+            "decision.escalating_factor",
+            self.decision.escalating_factor,
+            1.0,
+            100.0,
+        );
+        range(
+            "decision.rolling_mean_short_multiple",
+            self.decision.rolling_mean_short_multiple,
+            0.001,
+            1000.0,
+        );
+        range("decision.min_frame_p", self.decision.min_frame_p, 0.0, 10_000.0);
+        range("recording.frame_min_p", self.recording.frame_min_p, 0.0, 10_000.0);
+        range("web.history_s", self.web.history_s, 0.0, 604_800.0);
+        range(
+            "printer.action_max_attempts",
+            self.printer.action_max_attempts as f64,
+            1.0,
+            10.0,
+        );
+        if self.decision.threshold_low >= self.decision.threshold_high {
+            errors.push("decision.threshold_low must be less than threshold_high".into());
+        }
+        if self.web.history_s / self.detector.interval_s > 100_000.0 {
+            errors.push("web.history_s / detector.interval_s must be <= 100000 history points".into());
+        }
+        let loopback = self
+            .web
+            .host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+            || self.web.host == "localhost";
+        if self.web.enabled && !loopback && self.web.token.is_empty() && !self.web.allow_unauthenticated {
+            errors.push(
+                "web.token is required for a non-loopback web.host (or explicitly set web.allow_unauthenticated)"
+                    .into(),
+            );
+        }
+        if !["http", "https"].contains(&self.printer.scheme.as_str()) {
+            errors.push("printer.scheme must be http or https".into());
+        }
+        if !["tcp", "udp"].contains(&self.camera.transport.as_str()) {
+            errors.push("camera.transport must be tcp or udp".into());
+        }
+        if !self.detector.expected_sha256.is_empty()
+            && (self.detector.expected_sha256.len() != 64
+                || !self.detector.expected_sha256.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            errors.push("detector.expected_sha256 must be empty or a 64-digit SHA-256 digest".into());
         }
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(ConfigError::Invalid(format!("Invalid config:\n  - {}", errors.join("\n  - "))))
+            Err(ConfigError::Invalid(format!(
+                "Invalid config:\n  - {}",
+                errors.join("\n  - ")
+            )))
         }
     }
 }
@@ -388,16 +565,22 @@ pub enum ConfigError {
 
 // ------------------------------------------------------------------ durations
 
-static DURATION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(?:(\d+(?:\.\d+)?)h)?\s*(?:(\d+(?:\.\d+)?)m)?\s*(?:(\d+(?:\.\d+)?)s)?\s*$").unwrap());
+static DURATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*(?:(\d+(?:\.\d+)?)h)?\s*(?:(\d+(?:\.\d+)?)m)?\s*(?:(\d+(?:\.\d+)?)s)?\s*$").unwrap()
+});
 
 /// Seconds from 90, 90.5, "90", "90s", "2m", "1h30m", "1h 5m 10s".
 pub fn parse_duration(value: &Value) -> Result<f64, String> {
     match value {
         Value::Bool(_) => Err(format!("invalid duration {}", yaml_repr(value))),
-        Value::Number(n) => n.as_f64().ok_or_else(|| format!("invalid duration {}", yaml_repr(value))),
+        Value::Number(n) => n
+            .as_f64()
+            .ok_or_else(|| format!("invalid duration {}", yaml_repr(value))),
         Value::String(s) => parse_duration_str(s),
-        _ => Err(format!("invalid duration {} (examples: 90, 90s, 2m, 1h30m)", yaml_repr(value))),
+        _ => Err(format!(
+            "invalid duration {} (examples: 90, 90s, 2m, 1h30m)",
+            yaml_repr(value)
+        )),
     }
 }
 
@@ -469,17 +652,20 @@ fn yaml_repr(v: &Value) -> String {
 
 static ENV_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}").unwrap());
 
-fn expand(value: &mut Value) {
+fn expand(value: &mut Value, environ: &BTreeMap<String, String>) {
     match value {
         Value::String(s) if s.contains("${") => {
             *s = ENV_RE
-                .replace_all(s, |c: &regex::Captures| {
-                    std::env::var(&c[1]).unwrap_or_else(|_| c.get(2).map(|m| m.as_str().to_string()).unwrap_or_default())
+                .replace_all(s, |c: &regex::Captures<'_>| {
+                    environ
+                        .get(&c[1])
+                        .cloned()
+                        .unwrap_or_else(|| c.get(2).map(|m| m.as_str().to_string()).unwrap_or_default())
                 })
                 .into_owned();
         }
-        Value::Mapping(m) => m.values_mut().for_each(expand),
-        Value::Sequence(s) => s.iter_mut().for_each(expand),
+        Value::Mapping(m) => m.values_mut().for_each(|value| expand(value, environ)),
+        Value::Sequence(s) => s.iter_mut().for_each(|value| expand(value, environ)),
         _ => {}
     }
 }
@@ -488,14 +674,20 @@ fn expand(value: &mut Value) {
 
 pub const ENV_PREFIX: &str = "PRUSA_WATCH__";
 
-/// `PRUSA_WATCH__A__B__C=value` -> data["a"]["b"]["c"] = yaml(value).
+/// `PRUSA_WATCH__A__B__C=value` -> `data["a"]["b"]["c"] = yaml(value)`.
 pub fn apply_env_overrides(data: &mut Value, environ: &BTreeMap<String, String>) {
     if !data.is_mapping() {
         *data = Value::Mapping(Mapping::new());
     }
     for (name, raw) in environ {
-        let Some(rest) = name.strip_prefix(ENV_PREFIX) else { continue };
-        let path: Vec<String> = rest.split("__").filter(|p| !p.is_empty()).map(|p| p.to_lowercase()).collect();
+        let Some(rest) = name.strip_prefix(ENV_PREFIX) else {
+            continue;
+        };
+        let path: Vec<String> = rest
+            .split("__")
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_lowercase())
+            .collect();
         if path.is_empty() {
             continue;
         }
@@ -513,7 +705,9 @@ pub fn apply_env_overrides(data: &mut Value, environ: &BTreeMap<String, String>)
             }
             node = map.get_mut(&k).unwrap();
         }
-        node.as_mapping_mut().unwrap().insert(Value::String(path.last().unwrap().clone()), value);
+        node.as_mapping_mut()
+            .unwrap()
+            .insert(Value::String(path.last().unwrap().clone()), value);
     }
 }
 
@@ -526,9 +720,15 @@ pub fn process_env() -> BTreeMap<String, String> {
 /// Keys that existed in earlier versions -> where they live now.
 const MOVED: &[((&str, &str), &str)] = &[
     (("decision", "action"), "escalation.policies.<name>.steps[].action"),
-    (("decision", "veto_window_s"), "escalation.policies.<name>.steps (the step 'at' times)"),
+    (
+        ("decision", "veto_window_s"),
+        "escalation.policies.<name>.steps (the step 'at' times)",
+    ),
     (("decision", "veto_snooze_s"), "escalation.snooze_s"),
-    (("decision", "schedules"), "escalation.schedules (with `policy:` instead of action/veto_window_s/quiet)"),
+    (
+        ("decision", "schedules"),
+        "escalation.schedules (with `policy:` instead of action/veto_window_s/quiet)",
+    ),
     (("ntfy", "priority_warning"), "notify.warning.priority"),
     (("ntfy", "priority_failure"), "escalation step `priority`"),
     (("notify", "cooldown_s"), "notify.warning.cooldown_s"),
@@ -552,7 +752,11 @@ fn coerce_section(schema: &Mapping, data: &mut Mapping, path: &str) -> Result<()
     let keys: Vec<Value> = data.keys().cloned().collect();
     for k in keys {
         let key = key_str(&k);
-        let where_ = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
+        let where_ = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
         let Some(default) = schema.get(Value::String(key.clone())) else {
             if let Some((_, moved)) = MOVED.iter().find(|((s, n), _)| *s == section && *n == key) {
                 return Err(ConfigError::Invalid(format!(
@@ -566,7 +770,9 @@ fn coerce_section(schema: &Mapping, data: &mut Mapping, path: &str) -> Result<()
             if value.is_null() {
                 *value = Value::Mapping(Mapping::new());
             } else if !value.is_mapping() {
-                return Err(ConfigError::Invalid(format!("Config key '{where_}': must be a mapping")));
+                return Err(ConfigError::Invalid(format!(
+                    "Config key '{where_}': must be a mapping"
+                )));
             }
             continue;
         }
@@ -577,7 +783,9 @@ fn coerce_section(schema: &Mapping, data: &mut Mapping, path: &str) -> Result<()
                     continue;
                 }
                 let Some(m) = value.as_mapping_mut() else {
-                    return Err(ConfigError::Invalid(format!("Config section '{where_}' must be a mapping")));
+                    return Err(ConfigError::Invalid(format!(
+                        "Config section '{where_}' must be a mapping"
+                    )));
                 };
                 coerce_section(sub, m, &where_)?;
             }
@@ -588,7 +796,8 @@ fn coerce_section(schema: &Mapping, data: &mut Mapping, path: &str) -> Result<()
                     }
                     continue;
                 }
-                coerce_scalar(default, value, &key).map_err(|e| ConfigError::Invalid(format!("Config key '{where_}': {e}")))?;
+                coerce_scalar(default, value, &key)
+                    .map_err(|e| ConfigError::Invalid(format!("Config key '{where_}': {e}")))?;
             }
         }
     }
@@ -605,7 +814,9 @@ fn coerce_scalar(default: &Value, value: &mut Value, key: &str) -> Result<(), St
         // Python stored whatever YAML produced; convert to the field's type the way it was used.
         match (default, &*value) {
             (Value::String(_), Value::Number(n)) => *value = Value::String(n.to_string()),
-            (Value::String(_), Value::Bool(b)) => *value = Value::String(if *b { "True".into() } else { "False".into() }),
+            (Value::String(_), Value::Bool(b)) => {
+                *value = Value::String(if *b { "True".into() } else { "False".into() })
+            }
             (Value::Bool(_), Value::Number(n)) => *value = Value::Bool(n.as_f64().is_some_and(|f| f != 0.0)),
             (Value::Number(d), Value::Number(n)) if !d.is_f64() && n.is_f64() => {
                 let f = n.as_f64().unwrap();
@@ -615,7 +826,11 @@ fn coerce_scalar(default: &Value, value: &mut Value, key: &str) -> Result<(), St
                 *value = Value::from(f as i64);
             }
             (Value::Number(d), Value::Bool(b)) => {
-                *value = if d.is_f64() { Value::from(*b as i64 as f64) } else { Value::from(*b as i64) }
+                *value = if d.is_f64() {
+                    Value::from(*b as i64 as f64)
+                } else {
+                    Value::from(*b as i64)
+                }
             }
             _ => {}
         }
@@ -623,12 +838,23 @@ fn coerce_scalar(default: &Value, value: &mut Value, key: &str) -> Result<(), St
     };
     let s = s.clone();
     match default {
-        Value::Bool(_) => *value = Value::Bool(matches!(s.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on")),
+        Value::Bool(_) => {
+            *value = Value::Bool(match s.trim().to_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => return Err(format!("expected true/false (also yes/no, on/off, 1/0), got {s:?}")),
+            })
+        }
         Value::Number(n) if n.is_f64() => {
-            *value = Value::from(parse_python_float(&s).ok_or_else(|| format!("could not convert string to float: {s:?}"))?)
+            *value =
+                Value::from(parse_python_float(&s).ok_or_else(|| format!("could not convert string to float: {s:?}"))?)
         }
         Value::Number(_) => {
-            *value = Value::from(s.trim().parse::<i64>().map_err(|_| format!("invalid literal for int(): {s:?}"))?)
+            *value = Value::from(
+                s.trim()
+                    .parse::<i64>()
+                    .map_err(|_| format!("invalid literal for int(): {s:?}"))?,
+            )
         }
         _ => {}
     }
@@ -665,13 +891,16 @@ pub fn load_config(path: Option<&Path>, environ: &BTreeMap<String, String>) -> R
                 data = Value::Mapping(Mapping::new());
             }
             if !data.is_mapping() {
-                return Err(ConfigError::Invalid(format!("{}: top level must be a mapping", p.display())));
+                return Err(ConfigError::Invalid(format!(
+                    "{}: top level must be a mapping",
+                    p.display()
+                )));
             }
         } else {
             return Err(ConfigError::NotFound(p.display().to_string()));
         }
     }
-    expand(&mut data);
+    expand(&mut data, environ);
     apply_env_overrides(&mut data, environ);
     build_config(data)
 }
@@ -682,7 +911,9 @@ const SECRET_KEYS: &[&str] = &["password", "token", "webhook_url", "topic", "rep
 pub fn effective_config(cfg: &Config, redact: bool) -> Value {
     let mut v = serde_yaml::to_value(cfg).unwrap();
     let merged = crate::escalation::merge_escalation(Some(&cfg.escalation)).unwrap_or_else(|_| cfg.escalation.clone());
-    v.as_mapping_mut().unwrap().insert("escalation".into(), Value::Mapping(merged));
+    v.as_mapping_mut()
+        .unwrap()
+        .insert("escalation".into(), Value::Mapping(merged));
     if redact {
         scrub(&mut v, "");
     }

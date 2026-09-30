@@ -91,7 +91,15 @@ pub struct PrusaLink {
 
 impl PrusaLink {
     pub fn new(host: &str, password: &str, username: &str, auth: &str, scheme: &str, timeout_s: f64) -> Self {
-        Self::with_transport(host, password, username, auth, scheme, timeout_s, Arc::new(ReqwestTransport::new()))
+        Self::with_transport(
+            host,
+            password,
+            username,
+            auth,
+            scheme,
+            timeout_s,
+            Arc::new(ReqwestTransport::new()),
+        )
     }
 
     pub fn with_transport(
@@ -134,8 +142,14 @@ impl PrusaLink {
         let md5 = |s: String| hex::encode(Md5::digest(s.as_bytes()));
         let ha1 = md5(format!("{}:{}:{}", self.username, ch.realm, self.password));
         let ha2 = md5(format!("{method}:{uri}"));
-        let mut h = format!(r#"Digest username="{}", realm="{}", nonce="{}", uri="{}""#, self.username, ch.realm, ch.nonce, uri);
-        let qop_auth = ch.qop.as_deref().is_some_and(|q| q.split(',').any(|x| x.trim() == "auth"));
+        let mut h = format!(
+            r#"Digest username="{}", realm="{}", nonce="{}", uri="{}""#,
+            self.username, ch.realm, ch.nonce, uri
+        );
+        let qop_auth = ch
+            .qop
+            .as_deref()
+            .is_some_and(|q| q.split(',').any(|x| x.trim() == "auth"));
         if qop_auth {
             ch.nc += 1;
             let nc = format!("{:08x}", ch.nc);
@@ -183,7 +197,9 @@ impl PrusaLink {
             }
         }
         if resp.status == 401 {
-            return Err(PrusaLinkError(format!("{method} {path}: 401 Unauthorized (check printer.password / printer.auth)")));
+            return Err(PrusaLinkError(format!(
+                "{method} {path}: 401 Unauthorized (check printer.password / printer.auth)"
+            )));
         }
         if resp.status >= 400 {
             let text: String = resp.text().chars().take(200).collect();
@@ -198,7 +214,10 @@ impl PrusaLink {
 }
 
 fn parse_challenge(h: &str) -> Option<Challenge> {
-    let rest = h.trim().strip_prefix("Digest").or_else(|| h.trim().strip_prefix("digest"))?;
+    let rest = h
+        .trim()
+        .strip_prefix("Digest")
+        .or_else(|| h.trim().strip_prefix("digest"))?;
     let mut params = std::collections::HashMap::new();
     let mut chars = rest.trim().chars().peekable();
     loop {
@@ -215,7 +234,10 @@ fn parse_challenge(h: &str) -> Option<Challenge> {
             chars.next();
             v
         } else {
-            std::iter::from_fn(|| chars.next_if(|c| *c != ',')).collect::<String>().trim().to_string()
+            std::iter::from_fn(|| chars.next_if(|c| *c != ','))
+                .collect::<String>()
+                .trim()
+                .to_string()
         };
         params.insert(key.trim().to_lowercase(), val);
     }
@@ -237,7 +259,11 @@ impl Printer for PrusaLink {
     fn status(&self) -> Result<PrinterStatus, PrusaLinkError> {
         let r = self.request("GET", "/api/v1/status")?;
         let data = self.json(&r, "GET /api/v1/status")?;
-        let printer = data.get("printer").filter(|v| v.is_object()).cloned().unwrap_or_default();
+        let printer = data
+            .get("printer")
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or_default();
         let job = data.get("job").filter(|v| v.is_object()).cloned().unwrap_or_default();
         let state = match printer.get("state") {
             Some(Value::String(s)) => s.to_uppercase(),
@@ -304,7 +330,9 @@ pub fn digest_expected(
 /// Parse an `Authorization: Digest ...` header into its parameters.
 pub fn parse_authorization(h: &str) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
-    let Some(rest) = h.trim().strip_prefix("Digest") else { return out };
+    let Some(rest) = h.trim().strip_prefix("Digest") else {
+        return out;
+    };
     for part in split_params(rest) {
         if let Some((k, v)) = part.split_once('=') {
             out.insert(k.trim().to_lowercase(), v.trim().trim_matches('"').to_string());

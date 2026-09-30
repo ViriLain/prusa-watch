@@ -2,7 +2,7 @@
 
 Local, Bambu-style spaghetti detection for the Prusa Core One. It watches the Buddy3D camera over RTSP, runs Obico's open-source failure-detection model on your own machine, and **pauses the print through PrusaLink** when it's confident the print has failed. It sends an ntfy/Discord/webhook alert with the annotated frame and Resume / Cancel buttons.
 
-No cloud and no OctoPrint. Everything stays on your LAN. It's a single Rust binary; the only runtime dependency is `ffmpeg`.
+Inference and PrusaLink control run locally. Notifications use the services you configure, including self-hosted ntfy. It's a single Rust binary; the only runtime dependency is `ffmpeg`.
 
 ```
  Buddy3D camera ──RTSP (tcp)──▶ ffmpeg ──latest frame every 10 s──▶ YOLO (ONNX via tract, CPU)
@@ -55,7 +55,7 @@ Simulated time to action (10 s frames, default sensitivity, established baseline
 ### 2. Configure
 
 ```bash
-cp config.example.yaml config.yaml   # ~10 lines: printer IP, camera URL, timezone
+cp config.example.yaml config.yaml   # a small starter file: printer IP, camera URL, timezone
 cp .env.example .env                 # PRUSALINK_PASSWORD, NTFY_TOPIC, NTFY_REPLY_TOPIC, WEB_TOKEN, PUBLIC_URL
 prusa-watch config                   # see the effective settings
 ```
@@ -67,7 +67,7 @@ docker compose up -d --build        # the build downloads the ~250 MB model once
 docker compose run --rm prusa-watch check
 ```
 
-### 3b. Or run natively (macOS / Linux / Windows)
+### 3b. Or run natively (macOS / Linux)
 
 Needs a Rust toolchain ([rustup.rs](https://rustup.rs)) and `ffmpeg` (macOS: `brew install ffmpeg`, Debian/Ubuntu: `apt install ffmpeg`).
 
@@ -90,6 +90,8 @@ prusa-watch run            # dashboard on http://localhost:8484
 ### 4. Tune
 
 - **ROI (biggest accuracy win):** crop to the build plate so the frame, door, cable chain, and any tool dock or purge area are excluded. Open *Live (raw)* on the dashboard to see the ROI box, then adjust `camera.roi` (normalized `[x1, y1, x2, y2]`).
+- **A spot that keeps fooling the model** (dust or a sheet texture that glints at one bed height): clean the bed first. If it recurs, mask it with `camera.ignore`, a list of `[x1, y1, x2, y2]` rectangles in full-frame coordinates (same space as `roi`, drawn grey on the dashboard). Boxes centred inside are dropped before scoring. Keep zones tight: spaghetti inside a zone is invisible too.
+- `decision.min_frame_p` (default 0.3): an incident only opens if the current frame itself shows something. Obico's verdict follows a moving average that outlives short bursts; without this gate the tail of a glint can pause a print on a clean frame. `0` restores pure Obico behaviour.
 - **Test detection** button: runs the model on the current frame without touching decision state. Hold some spaghetti in view to sanity-check it.
 - **After a test print or a false alarm, run `prusa-watch report`** (or `prusa-watch report <job-id>`). It prints the peak summed confidence (`p`), the peak score (1/3 is the warning line, 2/3 the pause line), and when the first warning and failure verdicts happened. The raw data is in `data/history/job-<id>.csv` (one row per analyzed frame), and annotated frames where the model saw something are in `data/frames/job-<id>/`. See `recording:` in [`config.reference.yaml`](config.reference.yaml) for limits and retention.
 - `decision.sensitivity`: `1.0` is Obico's default. Raise it to about `1.25–1.5` if moderate failures only warn. Lower it if you get false pauses.
@@ -98,7 +100,7 @@ prusa-watch run            # dashboard on http://localhost:8484
 
 ## Configuration
 
-Sensible defaults are built in, so your `config.yaml` only lists what's different. The starter [`config.example.yaml`](config.example.yaml) is about 10 lines: printer IP, camera URL, ntfy topic and timezone.
+Sensible defaults are built in, so your `config.yaml` only lists what's different. The starter [`config.example.yaml`](config.example.yaml) is a small file: printer IP, camera URL, ntfy topic and timezone.
 
 | Layer (low → high) | Where | Example |
 |---|---|---|
@@ -176,13 +178,17 @@ The dashboard shows a live countdown to the next action, with buttons for whatev
 | `GET /` | dashboard |
 | `GET /api/state` | full JSON state + 2 h score history |
 | `GET /frame.jpg`, `/raw.jpg` | last analyzed (annotated) frame / live frame with ROI box |
-| `POST /api/pause`, `/api/resume[?mute=1]`, `/api/stop`, `/api/mute`, `/api/unmute`, `/api/test` | require `?token=` or `X-Token` when `web.token` is set |
-| `POST /api/incident/{veto,act,stop,resume,mute}` `[?id=]` | answer the open incident (no id = the current one); token required |
+| `POST /api/pause`, `/api/resume`, `/api/stop`, `/api/mute`, `/api/unmute` | `X-Token` plus the rendered `job_id` and `session_id`; resume accepts `mute=1` |
+| `POST /api/test` | `X-Token`; inference failures return 502 |
+| `POST /api/incident/{veto,act,stop,resume,mute}?id=...` | explicit incident ID plus `X-Token` or a scoped, expiring notification capability |
+| `GET /livez`, `/healthz` | process liveness / monitor readiness; readiness returns 503 for stale polling, frames, inference or action faults |
 | `GET /metrics` | Prometheus: score, p, ewm, baseline, inference ms, frame age, camera and printer up, state, incident open, seconds to the next action, counters (pauses, stops, vetoes, auto actions, ...) |
 
 ## Security
 
-- Control endpoints can pause or cancel your print. Set `WEB_TOKEN`, and don't port-forward 8484. Use a VPN for remote access.
+- Native runs bind to `127.0.0.1` by default. Set `web.host: 0.0.0.0` and a strong `WEB_TOKEN` to reach them over a trusted LAN/VPN. Docker Compose publishes only on host loopback by default; change its port binding for LAN use. Network binding without a token requires explicit `web.allow_unauthenticated: true`.
+- Browser controls send the token in a header and retain it only for the browser session. Notification links contain command-specific HMAC permissions that expire after one hour and become unusable when the incident closes. Keep `data/control-key` private; a replacement key invalidates outstanding links. Read-only state and camera endpoints have no token requirement.
+- Control endpoints can pause or cancel your print. Do not port-forward 8484; use a VPN for remote access.
 - The ntfy **reply topic** can pause, stop, resume or keep a print, but only for the open incident's one-time id. On ntfy.sh, topics are public-by-name, so give it a long random name. Better: self-host ntfy with an ACL and set `token`.
 - PrusaLink is plain HTTP with digest auth. Keep it on the LAN.
 - The Buddy3D RTSP stream is unauthenticated and unencrypted. Anyone on your LAN or Wi-Fi can watch it. Put IoT devices on their own VLAN if that matters to you.
@@ -190,7 +196,10 @@ The dashboard shows a live countdown to the next action, with buttons for whatev
 ## Limitations
 
 - The model is Obico's general-purpose model (single class, "failure"). It's good at spaghetti and blobs. It won't catch layer shifts, warping corners, or under-extrusion.
-- It only runs while PrusaLink reports `PRINTING`. When the camera is stale for 30 s during a print, you get a "camera offline" alert and no protection until it's back.
+- Inference runs while PrusaLink reports `PRINTING`; each newly decoded frame contributes once. When frames go stale, new visual evidence stops and an offline alert is sent. An existing incident remains armed until you veto/mute it, handle the print at the printer, or end the job. Lower scores alone do not cancel its scheduled intervention.
+- Printer commands remain pending until fresh status confirms their effect. Confirmation deadlines and retry limits are configurable. Exhausted attempts produce a visible fault and urgent notification.
+- Versioned checkpoints retain same-print mute, grace, incident and action ownership. Recovery requires matching configuration, job ID/name and plausible elapsed print time. An overdue intervention is retired with a visible fault; it is never replayed automatically.
+- Notification delivery has ordered bounded queues per channel and three bounded attempts. Recording has a separate bounded worker and combined count/byte retention, including failure images. Queue drops and I/O errors appear in `/api/state`; a saturated or failed disk can lose diagnostic records. Printer writes remain serialized with control state to prevent conflicting commands.
 - Once you resume an AI-paused print, the short per-print mean has already absorbed the mess. The monitor will warn again, but it only re-pauses if things get worse. That's Obico's semantics.
 
 ## Development
@@ -198,12 +207,23 @@ The dashboard shows a live countdown to the next action, with buttons for whatev
 ```bash
 cargo test                                          # synthetic ONNX model, no hardware needed (needs ffmpeg for the camera tests)
 cargo run --example fake_printer -- --port 8081     # PrusaLink simulator (apikey auth, password "test")
-cargo clippy --all-targets && cargo fmt --check
+cargo lint && cargo fmt --check                    # warnings are errors
+cargo check-all                                    # locked dependencies, all targets/features
 ```
 
 The tests use a tiny ONNX model (`tests/fixtures/fake-model.onnx`) with the same I/O contract as Obico's export (`[1,3,416,416]` → boxes `[1,N,1,4]` and confs `[1,N,1]`). Frame brightness drives confidence, so they exercise the full pipeline: ffmpeg/file grabber → tract → post-processing and NMS → decision → PrusaLink digest auth → ntfy/Discord/webhook → dashboard and metrics.
 
-`tests/parity.rs` pins the behaviour to the original Python implementation: the fixtures in `tests/fixtures/` were produced by it (decision sequences, notification requests, config defaults, escalation built-ins, schedule matching), and the Rust code must reproduce them exactly — the decision algorithm bit for bit. Preprocessing replicates OpenCV's fixed-point bilinear resize bit for bit, so model confidences match ONNX Runtime + OpenCV. To check the real model on your own frames, see `real_model_matches_python_on_real_frames` (run with `cargo test --release -- --ignored`).
+Rust 1.98.1 is pinned with rustfmt and Clippy; the supported minimum is 1.91. Configuration forbids unsafe code, rejects ignored results and unfinished debug/TODO macros, and enables correctness, suspicious-code, lock and clone checks. The format uses edition 2024, 120 columns and Unix line endings. See [CONTRIBUTING.md](CONTRIBUTING.md) for the validation workflow.
+
+`tests/parity.rs` preserves the original Python decision mathematics bit for bit. Intentional security/configuration migrations have explicit assertions. Preprocessing uses OpenCV `INTER_LINEAR_EXACT` with independent resize hashes. The production-model corpus is checked in CI with a pinned SHA-256:
+
+```bash
+cargo run --locked -- fetch-model
+PRUSA_WATCH_MODEL=models/model-weights.onnx PRUSA_WATCH_PARITY_DIR=tests/fixtures/vision \
+  cargo test --locked --test parity real_model_matches_python_on_real_frames -- --ignored --nocapture
+```
+
+The corpus compares implementations on identical pixels; its saved field inputs are already annotated and do not establish detection accuracy. See [fixture provenance](tests/fixtures/vision/README.md), [review changes](docs/REVIEW_HARDENING.md), and [field evaluation](docs/FIELD_EVALUATION.md).
 
 ## License
 

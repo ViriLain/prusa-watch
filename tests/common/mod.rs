@@ -25,7 +25,8 @@ pub fn fake_model_path() -> String {
 
 pub fn fake_detector() -> Arc<SpaghettiDetector> {
     static DET: OnceLock<Arc<SpaghettiDetector>> = OnceLock::new();
-    DET.get_or_init(|| Arc::new(SpaghettiDetector::load(fake_model_path(), false).unwrap())).clone()
+    DET.get_or_init(|| Arc::new(SpaghettiDetector::load(fake_model_path(), false).unwrap()))
+        .clone()
 }
 
 pub fn solid(v: u8) -> RgbImage {
@@ -124,13 +125,19 @@ impl Printer for FakePrinter {
         })
     }
     fn job(&self) -> Result<Option<Value>, PrusaLinkError> {
-        Ok(self.s().job_id.map(|id| json!({"id": id, "file": {"display_name": format!("part-{id}.bgcode")}})))
+        Ok(self
+            .s()
+            .job_id
+            .map(|id| json!({"id": id, "file": {"display_name": format!("part-{id}.bgcode")}})))
     }
     fn job_name(&self) -> Option<String> {
         self.s().job_id.map(|id| format!("part-{id}.bgcode"))
     }
     fn pause(&self, job_id: i64) -> Result<(), PrusaLinkError> {
         let mut s = self.s();
+        if s.job_id != Some(job_id) || s.state != "PRINTING" {
+            return Err(PrusaLinkError("pause: wrong job or state".into()));
+        }
         s.calls.push(("pause".into(), job_id));
         if s.fail_pause {
             return Err(PrusaLinkError("PUT pause: HTTP 409".into()));
@@ -144,12 +151,18 @@ impl Printer for FakePrinter {
     }
     fn resume(&self, job_id: i64) -> Result<(), PrusaLinkError> {
         let mut s = self.s();
+        if s.job_id != Some(job_id) || s.state != "PAUSED" {
+            return Err(PrusaLinkError("resume: wrong job or state".into()));
+        }
         s.calls.push(("resume".into(), job_id));
         s.state = "PRINTING".into();
         Ok(())
     }
     fn stop(&self, job_id: i64) -> Result<(), PrusaLinkError> {
         let mut s = self.s();
+        if s.job_id != Some(job_id) || !["PRINTING", "PAUSED", "ATTENTION"].contains(&s.state.as_str()) {
+            return Err(PrusaLinkError("stop: wrong job or state".into()));
+        }
         s.calls.push(("stop".into(), job_id));
         s.state = "STOPPED".into();
         Ok(())
@@ -160,6 +173,8 @@ pub struct GrabberState {
     pub image: Option<RgbImage>,
     pub connected: bool,
     pub stale: bool,
+    pub sequence: u64,
+    pub decoded_at: f64,
 }
 
 pub struct FakeGrabber {
@@ -169,13 +184,29 @@ pub struct FakeGrabber {
 
 impl FakeGrabber {
     pub fn new(clock: Clock) -> Arc<Self> {
-        Arc::new(Self { clock, st: Mutex::new(GrabberState { image: Some(solid(0)), connected: true, stale: false }) })
+        let decoded_at = clock.t();
+        Arc::new(Self {
+            clock,
+            st: Mutex::new(GrabberState {
+                image: Some(solid(0)),
+                connected: true,
+                stale: false,
+                sequence: 1,
+                decoded_at,
+            }),
+        })
     }
     pub fn set_image(&self, img: Option<RgbImage>) {
         self.st.lock().unwrap().image = img;
+        self.publish();
     }
     pub fn set_stale(&self, stale: bool) {
         self.st.lock().unwrap().stale = stale;
+    }
+    pub fn publish(&self) {
+        let mut state = self.st.lock().unwrap();
+        state.sequence += 1;
+        state.decoded_at = self.clock.t();
     }
 }
 
@@ -185,7 +216,13 @@ impl FrameSource for FakeGrabber {
     fn latest(&self) -> Option<Frame> {
         let s = self.st.lock().unwrap();
         let img = s.image.clone()?;
-        Some(Frame { image: Arc::new(img), ts: self.clock.t() - if s.stale { 120.0 } else { 0.1 } })
+        let ts = s.decoded_at - if s.stale { 120.0 } else { 0.0 };
+        Some(Frame {
+            sequence: s.sequence,
+            image: Arc::new(img),
+            ts,
+            monotonic_ts: ts,
+        })
     }
     fn connected(&self) -> bool {
         self.st.lock().unwrap().connected
@@ -256,7 +293,12 @@ pub fn rig_with(tweak: impl FnOnce(&mut Config)) -> Rig {
     let printer = FakePrinter::new();
     let grabber = FakeGrabber::new(clock.clone());
     let transport = Arc::new(RecordingTransport::default());
-    let mut notifier = Notifier::with_transport(cfg.notify.clone(), &cfg.web.public_url, &cfg.web.token, transport.clone());
+    let mut notifier = Notifier::with_transport(
+        cfg.notify.clone(),
+        &cfg.web.public_url,
+        &cfg.web.token,
+        transport.clone(),
+    );
     notifier.blocking = true;
     let mon = Monitor::new(
         cfg,
@@ -266,10 +308,18 @@ pub fn rig_with(tweak: impl FnOnce(&mut Config)) -> Rig {
             detector: Some(fake_detector()),
             notifier: Some(Arc::new(notifier)),
             clock: Some(clock.as_fn()),
+            ..Default::default()
         },
     )
     .unwrap();
-    Rig { mon, printer, grabber, clock, transport, dir }
+    Rig {
+        mon,
+        printer,
+        grabber,
+        clock,
+        transport,
+        dir,
+    }
 }
 
 impl Rig {
@@ -279,14 +329,19 @@ impl Rig {
     pub fn advance_by(&self, n: usize, step: f64) {
         for _ in 0..n {
             self.clock.add(step);
+            self.grabber.publish();
             self.mon.tick();
+            let _ = self.mon.flush_storage(); // write faults are asserted through monitor telemetry
         }
     }
     pub fn sent(&self) -> Vec<HttpRequest> {
         self.transport.requests()
     }
     pub fn ntfy(&self) -> Vec<HttpRequest> {
-        self.sent().into_iter().filter(|r| r.url.contains("ntfy.example")).collect()
+        self.sent()
+            .into_iter()
+            .filter(|r| r.url.contains("ntfy.example"))
+            .collect()
     }
     pub fn hooks(&self) -> Vec<Value> {
         self.sent()
@@ -299,10 +354,16 @@ impl Rig {
             .collect()
     }
     pub fn with_priority(&self, p: &str) -> Vec<HttpRequest> {
-        self.sent().into_iter().filter(|r| r.get_header("Priority") == Some(p)).collect()
+        self.sent()
+            .into_iter()
+            .filter(|r| r.get_header("Priority") == Some(p))
+            .collect()
     }
     pub fn titles(&self) -> Vec<String> {
-        self.sent().iter().filter_map(|r| r.get_header("Title").map(str::to_string)).collect()
+        self.sent()
+            .iter()
+            .filter_map(|r| r.get_header("Title").map(str::to_string))
+            .collect()
     }
     pub fn state_dir(&self) -> std::path::PathBuf {
         std::path::PathBuf::from(&self.mon.cfg.state_dir)

@@ -13,14 +13,25 @@ camera:
 
 notify:
   ntfy:
+    url: ${NTFY_URL:-https://ntfy.sh}
     topic: ${NTFY_TOPIC}
+    token: ${NTFY_TOKEN:-}
     reply_topic: ${NTFY_REPLY_TOPIC:-}  # makes the alert buttons work away from home
+  discord:
+    webhook_url: ${DISCORD_WEBHOOK_URL:-}
+  webhook:
+    url: ${WEBHOOK_URL:-}
 
 web:
   public_url: ${PUBLIC_URL:-}
   token: ${WEB_TOKEN:-}
 
-timezone: America/New_York              # for the built-in night schedule (22:00-07:00: pause silently)
+timezone: America/New_York              # used when you enable time-based schedules
+
+# Start with observation during both day and night. Enable automatic actions after tuning.
+escalation:
+  default_policy: watch_only
+  schedules: []
 
 # ── Common overrides (uncomment what you need) ─────────────────────────────
 #

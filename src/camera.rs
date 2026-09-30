@@ -26,9 +26,12 @@ use crate::now_ts;
 
 #[derive(Clone)]
 pub struct Frame {
+    /// Increases once per decoded frame, including across reconnects.
+    pub sequence: u64,
     pub image: Arc<RgbImage>,
     /// unix time when decoded
     pub ts: f64,
+    pub monotonic_ts: f64,
 }
 
 /// What the monitor needs from a camera (the ffmpeg grabber, or a fake in tests).
@@ -44,7 +47,10 @@ pub trait FrameSource: Send + Sync {
 const OUTPUT_FPS: u32 = 2;
 
 pub fn ffmpeg_bin() -> String {
-    std::env::var("PRUSA_WATCH_FFMPEG").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "ffmpeg".into())
+    std::env::var("PRUSA_WATCH_FFMPEG")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ffmpeg".into())
 }
 
 struct Shared {
@@ -98,7 +104,9 @@ impl FfmpegGrabber {
 
     fn is_live(url: &str) -> bool {
         let u = url.to_lowercase();
-        ["rtsp://", "rtsps://", "http://", "https://"].iter().any(|p| u.starts_with(p))
+        ["rtsp://", "rtsps://", "http://", "https://"]
+            .iter()
+            .any(|p| u.starts_with(p))
     }
 
     fn command(&self) -> Command {
@@ -137,7 +145,9 @@ impl FfmpegGrabber {
     fn wait(shared: &Shared, secs: f64) {
         let (lock, cv) = &shared.wake;
         let guard = lock.lock().unwrap();
-        let _ = cv.wait_timeout_while(guard, Duration::from_secs_f64(secs.max(0.0)), |_| !shared.stop.load(Ordering::Relaxed));
+        let _ = cv.wait_timeout_while(guard, Duration::from_secs_f64(secs.max(0.0)), |_| {
+            !shared.stop.load(Ordering::Relaxed)
+        });
     }
 
     fn run(self: Arc<Self>) {
@@ -215,8 +225,13 @@ impl FfmpegGrabber {
                     tracing::info!("Camera: connected to {url}");
                 }
                 *last_frame.lock().unwrap() = Some(Instant::now());
-                *sh.latest.lock().unwrap() = Some(Frame { image: Arc::new(img), ts: now_ts() });
-                sh.frames_decoded.fetch_add(1, Ordering::Relaxed);
+                let sequence = sh.frames_decoded.fetch_add(1, Ordering::Relaxed) + 1;
+                *sh.latest.lock().unwrap() = Some(Frame {
+                    sequence,
+                    image: Arc::new(img),
+                    ts: now_ts(),
+                    monotonic_ts: crate::monotonic_ts(),
+                });
                 if sh.stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -232,11 +247,20 @@ impl FfmpegGrabber {
             if sh.stop.load(Ordering::Relaxed) {
                 break;
             }
-            let detail = errors.lock().unwrap().last().cloned().map(|e| format!(" ({e})")).unwrap_or_default();
+            let detail = errors
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .map(|e| format!(" ({e})"))
+                .unwrap_or_default();
             if got_any {
                 tracing::warn!("Camera: stream read failed{detail}, reconnecting");
             } else {
-                tracing::warn!("Camera: could not open {url}{detail}; retrying in {:.0}s", self.reconnect_backoff_s);
+                tracing::warn!(
+                    "Camera: could not open {url}{detail}; retrying in {:.0}s",
+                    self.reconnect_backoff_s
+                );
             }
             sh.reconnects.fetch_add(1, Ordering::Relaxed);
             Self::wait(&sh, self.reconnect_backoff_s);
@@ -249,7 +273,13 @@ pub struct Grabber(pub Arc<FfmpegGrabber>);
 
 impl Grabber {
     pub fn new(url: &str, transport: &str, reconnect_backoff_s: f64, open_timeout_s: f64, read_timeout_s: f64) -> Self {
-        Self(Arc::new(FfmpegGrabber::new(url, transport, reconnect_backoff_s, open_timeout_s, read_timeout_s)))
+        Self(Arc::new(FfmpegGrabber::new(
+            url,
+            transport,
+            reconnect_backoff_s,
+            open_timeout_s,
+            read_timeout_s,
+        )))
     }
 }
 
@@ -261,7 +291,12 @@ impl FrameSource for Grabber {
         }
         self.0.shared.stop.store(false, Ordering::Relaxed);
         let me = self.0.clone();
-        *t = Some(std::thread::Builder::new().name("frame-grabber".into()).spawn(move || me.run()).expect("spawn grabber"));
+        *t = Some(
+            std::thread::Builder::new()
+                .name("frame-grabber".into())
+                .spawn(move || me.run())
+                .expect("spawn grabber"),
+        );
     }
 
     fn stop(&self) {
@@ -295,7 +330,11 @@ pub fn read_ppm<R: BufRead>(r: &mut R) -> std::io::Result<Option<RgbImage>> {
         loop {
             let mut b = [0u8; 1];
             if r.read(&mut b)? == 0 {
-                return Ok(if tok.is_empty() { None } else { Some(String::from_utf8_lossy(&tok).into_owned()) });
+                return Ok(if tok.is_empty() {
+                    None
+                } else {
+                    Some(String::from_utf8_lossy(&tok).into_owned())
+                });
             }
             match b[0] {
                 b'#' if tok.is_empty() => {
@@ -316,8 +355,12 @@ pub fn read_ppm<R: BufRead>(r: &mut R) -> std::io::Result<Option<RgbImage>> {
     if magic != "P6" {
         return Err(bad("not a P6 PPM"));
     }
-    let mut num =
-        || -> std::io::Result<u32> { token(r)?.ok_or_else(|| bad("truncated header"))?.parse().map_err(|_| bad("bad header")) };
+    let mut num = || -> std::io::Result<u32> {
+        token(r)?
+            .ok_or_else(|| bad("truncated header"))?
+            .parse()
+            .map_err(|_| bad("bad header"))
+    };
     let (w, h, max) = (num()?, num()?, num()?);
     if max != 255 || w == 0 || h == 0 || w > 16384 || h > 16384 {
         return Err(bad("unsupported PPM"));

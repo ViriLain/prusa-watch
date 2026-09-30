@@ -45,7 +45,7 @@ fn spaghetti_pauses_print_and_notifies_with_image() {
     assert_eq!(&body_bytes(req)[..2], b"\xff\xd8", "JPEG attached");
     assert!(header(req, "Message").contains("PAUSED"));
     let acts = header(req, "Actions");
-    assert!(acts.contains("/api/incident/resume?token=tok&id="));
+    assert!(acts.contains("/api/incident/resume?id="));
     assert!(acts.contains("False alarm") && acts.contains("Cancel print"));
 
     // snapshot of the failure saved to disk
@@ -135,7 +135,8 @@ fn notify_only_mode_does_not_touch_printer() {
 
 #[test]
 fn stop_mode() {
-    let r = rig_with(|c| c.escalation = yaml("{default_policy: kill, policies: {kill: {steps: [{at: 0, action: stop}]}}}"));
+    let r =
+        rig_with(|c| c.escalation = yaml("{default_policy: kill, policies: {kill: {steps: [{at: 0, action: stop}]}}}"));
     r.printer.set("PRINTING", Some(4));
     r.advance(60);
     r.grabber.set_image(Some(solid(255)));
@@ -151,7 +152,11 @@ fn failed_pause_is_reported_loudly() {
     r.advance(60);
     r.grabber.set_image(Some(solid(255)));
     r.advance(30);
-    assert!(r.with_priority("5").iter().any(|q| header(q, "Title").contains("pause FAILED")));
+    assert!(
+        r.with_priority("5")
+            .iter()
+            .any(|q| header(q, "Title").contains("pause FAILED"))
+    );
 }
 
 #[test]
@@ -270,8 +275,17 @@ fn policy_steps_run_on_schedule_with_per_step_routing() {
     );
     let hook = r.hooks().last().cloned().unwrap();
     assert!(hook["action_taken"] == "paused" && hook["incident_id"] == inc.as_str() && hook["next_action"] == "stop");
-    assert!(hook["command_urls"]["resume"].as_str().unwrap().ends_with(&format!("id={inc}")));
-    assert_eq!(incident_id(&r).as_deref(), Some(inc.as_str()), "stays open while paused so Resume works");
+    assert!(
+        hook["command_urls"]["resume"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("id={inc}&expires="))
+    );
+    assert_eq!(
+        incident_id(&r).as_deref(),
+        Some(inc.as_str()),
+        "stays open while paused so Resume works"
+    );
 
     r.advance(179); // nobody answered for 30 min -> stop
     assert!(!r.printer.calls().contains(&("stop".into(), 30)));
@@ -286,7 +300,11 @@ fn policy_steps_run_on_schedule_with_per_step_routing() {
 fn keep_printing_closes_incident_and_snoozes() {
     let r = armed();
     let inc = spaghetti_until_incident(&r, 31);
-    assert!(r.mon.handle_reply("veto", &inc).starts_with("vetoed (no new alerts for 10:00)"));
+    assert!(
+        r.mon
+            .handle_reply("veto", &inc)
+            .starts_with("vetoed (no new alerts for 10:00)")
+    );
     assert!(incident_id(&r).is_none());
     assert_eq!(r.mon.counters().vetoes, 1);
     r.advance(55); // 550 s inside the 10 min snooze
@@ -315,7 +333,10 @@ fn act_now_skips_reminders_and_stop_and_bad_ids() {
     let r = armed();
     let inc = spaghetti_until_incident(&r, 33);
     assert!(r.mon.handle_reply("veto", "wrong").starts_with("ignored"));
-    assert!(r.mon.handle_reply("resume", &inc).starts_with("ignored"), "not paused yet");
+    assert!(
+        r.mon.handle_reply("resume", &inc).starts_with("ignored"),
+        "not paused yet"
+    );
     assert_eq!(r.mon.handle_reply("act", &inc), "paused");
     assert_eq!(r.printer.calls(), vec![("pause".to_string(), 33)]);
     let before = r.ntfy().len();
@@ -333,7 +354,10 @@ fn resume_reply_rearms_after_grace() {
     r.mon.handle_reply("act", &inc);
     assert_eq!(r.mon.handle_reply("resume", &inc), "resumed");
     assert!(r.printer.state() == "PRINTING" && incident_id(&r).is_none());
-    assert_eq!(r.mon.core().job.rearm_at, r.clock.t() + r.mon.cfg.decision.resume_grace_s);
+    assert_eq!(
+        r.mon.core().job.rearm_at,
+        r.clock.t() + r.mon.cfg.decision.resume_grace_s
+    );
 }
 
 #[test]
@@ -365,16 +389,31 @@ fn schedule_picks_policy() {
 
 #[test]
 fn notify_only_policy_cools_down() {
-    let r = rig_with(|c| arm(c, Some(ask_first_with("{default_policy: watch, snooze_s: 300}")), "reply-xyz", true));
+    let r = rig_with(|c| {
+        arm(
+            c,
+            Some(ask_first_with("{default_policy: watch, snooze_s: 300}")),
+            "reply-xyz",
+            true,
+        )
+    });
     r.printer.set("PRINTING", Some(37));
     r.advance(60);
     r.grabber.set_image(Some(solid(255)));
     r.advance(12);
     assert_eq!(r.mon.counters().failures, 1);
-    assert!(incident_id(&r).is_none(), "notify-only closes right away");
+    assert!(
+        incident_id(&r).is_some(),
+        "notify-only buttons stay actionable until expiry"
+    );
     assert!(r.printer.calls().is_empty());
     assert!(header(r.ntfy().last().unwrap(), "Message").contains("does not act"));
-    assert!(r.mon.core().job.rearm_at > r.clock.t(), "cooldown = escalation.snooze_s");
+    r.advance(30);
+    assert!(incident_id(&r).is_none());
+    assert!(
+        r.mon.core().job.rearm_at > r.clock.t(),
+        "cooldown follows button expiry"
+    );
     r.advance(20);
     assert_eq!(r.mon.counters().failures, 1);
 }
@@ -388,9 +427,13 @@ fn silent_step_and_dashboard_fallback_links() {
     let inc = spaghetti_until_incident(&r, 38);
     assert!(r.ntfy().iter().all(|q| !header(q, "Tags").contains("hourglass")));
     r.advance(3);
-    let alert = r.ntfy().into_iter().rfind(|q| header(q, "Tags").contains("hourglass")).unwrap();
+    let alert = r
+        .ntfy()
+        .into_iter()
+        .rfind(|q| header(q, "Tags").contains("hourglass"))
+        .unwrap();
     let acts = header(&alert, "Actions");
-    assert!(acts.contains(&format!("http://watch.lan:8484/api/incident/veto?token=tok&id={inc}")));
+    assert!(acts.contains(&format!("http://watch.lan:8484/api/incident/veto?id={inc}")));
     assert!(acts.contains("view, Dashboard, http://watch.lan:8484"));
     let n = r.sent().len();
     r.advance(4);
@@ -417,11 +460,16 @@ fn pause_in_flight_is_not_mistaken_for_a_resume() {
     }
     assert_eq!(r.printer.count("pause", 7), 1);
     let inc = incident_id(&r).expect("incident");
-    assert_eq!(r.mon.core().incident.as_ref().unwrap().acted.as_deref(), Some("paused"));
+    assert_eq!(r.mon.core().incident.as_ref().unwrap().acted, None);
+    assert!(r.mon.snapshot().pending_action.is_some());
 
     r.advance(3); // PRINTING (in flight), then PAUSED
     assert_eq!(r.printer.state(), "PAUSED");
-    assert_eq!(incident_id(&r).as_deref(), Some(inc.as_str()), "incident closed by a phantom resume");
+    assert_eq!(
+        incident_id(&r).as_deref(),
+        Some(inc.as_str()),
+        "incident closed by a phantom resume"
+    );
     assert_eq!(r.mon.core().job.action_taken.as_deref(), Some("paused"));
     assert_eq!(r.mon.handle_reply("resume", &inc), "resumed");
     assert_eq!(r.printer.state(), "PRINTING");
@@ -441,20 +489,32 @@ fn failed_pause_is_retried_until_it_works() {
         assert!(i.id == inc && i.acted.is_none() && i.next_idx == 0);
     }
     r.advance_by(3, 5.0); // still failing: retried each poll, incident stays open
-    assert_eq!(r.printer.count("pause", 5), 4);
-    assert_eq!(r.mon.core().incident.as_ref().unwrap().action_errors, 4);
-    assert_eq!(r.titles().iter().filter(|t| t.contains("pause FAILED")).count(), 1, "FAILED alert once, not every retry");
+    assert_eq!(r.printer.count("pause", 5), 2);
+    assert!(r.mon.core().incident.as_ref().unwrap().action_errors >= 2);
+    assert_eq!(
+        r.titles().iter().filter(|t| t.contains("pause FAILED")).count(),
+        1,
+        "FAILED alert once, not every retry"
+    );
 
     r.printer.s().fail_pause = false;
-    r.advance_by(1, 5.0);
+    r.advance_by(3, 5.0);
     assert_eq!(r.printer.state(), "PAUSED");
     let core = r.mon.core();
-    assert_eq!(core.incident.as_ref().map(|i| i.id.clone()), Some(inc), "paused incidents stay open");
+    assert_eq!(
+        core.incident.as_ref().map(|i| i.id.clone()),
+        Some(inc),
+        "paused incidents stay open"
+    );
     assert_eq!(core.incident.as_ref().unwrap().acted.as_deref(), Some("paused"));
     assert_eq!(core.job.action_taken.as_deref(), Some("paused"));
     drop(core);
     assert!(r.titles().iter().any(|t| t.contains("print PAUSED")));
-    assert_eq!(r.mon.core().job.rearm_at, 0.0, "a failed attempt must not snooze detection");
+    assert_eq!(
+        r.mon.core().job.rearm_at,
+        0.0,
+        "a failed attempt must not snooze detection"
+    );
 }
 
 #[test]
@@ -463,9 +523,15 @@ fn act_reply_reports_failed_pause_and_keeps_retrying() {
     let inc = spaghetti_until_incident(&r, 12);
     r.printer.s().fail_pause = true;
     assert!(r.mon.handle_reply("act", &inc).starts_with("failed:"));
-    assert!(r.mon.core().incident.as_ref().is_some_and(|i| i.id == inc && i.acted.is_none()));
+    assert!(
+        r.mon
+            .core()
+            .incident
+            .as_ref()
+            .is_some_and(|i| i.id == inc && i.acted.is_none())
+    );
     r.printer.s().fail_pause = false;
-    r.advance_by(1, 5.0); // the loop retries the pending pause on the next poll
+    r.advance_by(3, 5.0); // retry after the configured backoff
     assert_eq!(r.printer.state(), "PAUSED");
     assert_eq!(r.mon.core().incident.as_ref().unwrap().acted.as_deref(), Some("paused"));
 }
