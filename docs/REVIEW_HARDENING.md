@@ -57,7 +57,7 @@ YAML compatibility stays at the loading boundary, using maintained
 single fallible inference method. Preview results have a named type rather than
 a nested tuple. Rust/package metadata, a pinned toolchain/formatter, strong
 Clippy rules, locked Cargo aliases and contributor guidance support maintenance.
-CI adds minimum-version, Windows, dependency-audit, production-model and
+CI adds minimum-version, dependency-audit, production-model and
 container inference/readiness checks.
 
 ## Validation and remaining evidence
@@ -65,7 +65,7 @@ container inference/readiness checks.
 Local validation: 152 tests passed with one opt-in vision test skipped; the explicit
 production-model comparison also passed on six inputs. Formatting, Clippy with
 warnings as errors, documentation with warnings as errors, and Rust 1.91 checks
-passed. GitHub CI supplies the Linux/Windows and container evidence; Docker is
+passed. GitHub CI supplies the Linux/macOS and container evidence; Docker is
 unavailable on the implementation host. See the PR checks for their status.
 Deterministic tests cover restart, stale ownership, expiry, queue saturation,
 slow inference, background lifecycle, fake-printer failures and actual local

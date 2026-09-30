@@ -67,7 +67,7 @@ docker compose up -d --build        # the build downloads the ~250 MB model once
 docker compose run --rm prusa-watch check
 ```
 
-### 3b. Or run natively (macOS / Linux / Windows)
+### 3b. Or run natively (macOS / Linux)
 
 Needs a Rust toolchain ([rustup.rs](https://rustup.rs)) and `ffmpeg` (macOS: `brew install ffmpeg`, Debian/Ubuntu: `apt install ffmpeg`).
 

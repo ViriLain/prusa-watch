@@ -13,7 +13,7 @@ cargo +1.91.0 check --all-targets --all-features --locked
 ```
 
 The minimum-version check requires `rustup toolchain install 1.91.0 --profile minimal`.
-CI additionally checks Linux, macOS, Windows, production-model parity, Docker
+CI additionally checks Linux, macOS, production-model parity, Docker
 inference/readiness and dependency advisories. Use `cargo test --locked` when
 including documentation tests locally.
 

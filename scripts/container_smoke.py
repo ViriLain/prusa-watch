@@ -1,5 +1,6 @@
 """Exercise the shipped container, real inference and readiness without printer hardware."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -58,7 +59,9 @@ with tempfile.TemporaryDirectory() as directory:
               "web": {"port": web_port, "token": "smoke-test-control"}, "state_dir": "/smoke/data",
               "escalation": {"default_policy": "watch_only", "schedules": []}}
     (root / "config.json").write_text(json.dumps(config))
-    subprocess.run(["docker", "run", "-d", "--name", name, "--network", "host", "-v", f"{root}:/smoke",
+    # Run as the invoking user so files written under /smoke stay removable by the temp-dir cleanup.
+    subprocess.run(["docker", "run", "-d", "--name", name, "--network", "host", "--user", f"{os.getuid()}:{os.getgid()}",
+                    "-v", f"{root}:/smoke",
                     "-e", "PRUSA_WATCH_CONFIG=/smoke/config.json", sys.argv[1]], check=True)
     try:
         deadline = time.monotonic() + 90
@@ -87,6 +90,6 @@ with tempfile.TemporaryDirectory() as directory:
         subprocess.run(["docker", "logs", name], check=False)
         raise
     finally:
-        subprocess.run(["docker", "stop", "--time", "20", name], check=False)
+        subprocess.run(["docker", "stop", "--timeout", "20", name], check=False)
         subprocess.run(["docker", "rm", "-f", name], check=False)
         server.shutdown()
