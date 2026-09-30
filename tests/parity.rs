@@ -148,6 +148,9 @@ fn effective_default_config_matches_python() {
     // settings added after the Python version (field regressions, job 419)
     got["camera"].as_object_mut().unwrap().remove("ignore");
     got["decision"].as_object_mut().unwrap().remove("min_frame_p");
+    // watcher health (always-on recovery), added after the Python version
+    got.as_object_mut().unwrap().remove("health");
+    got["notify"].as_object_mut().unwrap().remove("health");
     assert_eq!(got["web"]["host"], "127.0.0.1");
     got["web"]["host"] = serde_json::json!("0.0.0.0"); // intentional security default migration
     for (section, names) in [

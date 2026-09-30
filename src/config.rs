@@ -247,6 +247,8 @@ pub struct NotifyConfig {
     pub camera: EventNotifyConfig,
     /// Confirmations: "keeping the print running", "resumed", ...
     pub info: EventNotifyConfig,
+    /// The watcher itself: printer unreachable during a print, restarted after a stall
+    pub health: EventNotifyConfig,
     /// per-request timeout for notification HTTP calls
     pub timeout_s: f64,
 }
@@ -268,6 +270,10 @@ impl Default for NotifyConfig {
             },
             info: EventNotifyConfig {
                 priority: 3,
+                ..Default::default()
+            },
+            health: EventNotifyConfig {
+                priority: 4,
                 ..Default::default()
             },
             timeout_s: 15.0,
@@ -336,6 +342,40 @@ impl Default for RecordingConfig {
     }
 }
 
+/// Keeping the watcher itself running, and knowing when it isn't.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HealthConfig {
+    /// Exit when the monitor loop hasn't completed an iteration for this long, so a
+    /// supervisor (Docker restart policy, systemd, launchd) starts a fresh process. Raised to
+    /// twice the loop budget if shorter. 0 = never.
+    pub stall_exit_s: f64,
+    /// Alert (notify.health) when the printer stays unreachable this long while a print was
+    /// active: prusa-watch can't pause it until the connection returns. 0 = never.
+    pub printer_down_alert_s: f64,
+    /// Dead-man's switch, e.g. `https://hc-ping.com/<uuid>`. Requested (GET) every
+    /// heartbeat_interval_s while prusa-watch is able to protect a print; if the host, the
+    /// container or the network dies, the pings stop and that service alerts you.
+    pub heartbeat_url: String,
+    /// Requested instead of heartbeat_url when prusa-watch is running but can't protect the
+    /// current print (e.g. `https://hc-ping.com/<uuid>/fail`). Empty = just skip the ping.
+    /// `{reason}` in either URL is replaced with the URL-encoded status.
+    pub heartbeat_fail_url: String,
+    pub heartbeat_interval_s: f64,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            stall_exit_s: 300.0,
+            printer_down_alert_s: 60.0,
+            heartbeat_url: String::new(),
+            heartbeat_fail_url: String::new(),
+            heartbeat_interval_s: 60.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -346,6 +386,7 @@ pub struct Config {
     pub notify: NotifyConfig,
     pub web: WebConfig,
     pub recording: RecordingConfig,
+    pub health: HealthConfig,
     /// What to do once a failure is detected: parsed and validated by `escalation`.
     pub escalation: Mapping,
     pub state_dir: String,
@@ -365,6 +406,7 @@ impl Default for Config {
             notify: Default::default(),
             web: Default::default(),
             recording: Default::default(),
+            health: Default::default(),
             escalation: Mapping::new(),
             state_dir: "data".into(),
             timezone: String::new(),
@@ -375,6 +417,16 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Longest a healthy monitor iteration may take: status poll (with retries), inference.
+    pub fn loop_budget_s(&self) -> f64 {
+        (self.printer.poll_interval_s * 3.0 + self.printer.timeout_s * 2.0 + self.detector.interval_s * 2.0).max(15.0)
+    }
+
+    /// Effective stall limit: never shorter than twice the loop budget. None = disabled.
+    pub fn stall_exit_after_s(&self) -> Option<f64> {
+        (self.health.stall_exit_s > 0.0).then(|| self.health.stall_exit_s.max(2.0 * self.loop_budget_s()))
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut errors: Vec<String> = Vec::new();
         if self.printer.host.is_empty() {
@@ -399,6 +451,7 @@ impl Config {
             ("warning", &self.notify.warning),
             ("camera", &self.notify.camera),
             ("info", &self.notify.info),
+            ("health", &self.notify.health),
         ] {
             let mut bad: Vec<&String> = ev
                 .channels
@@ -474,6 +527,8 @@ impl Config {
             ("notify.warning.cooldown_s", self.notify.warning.cooldown_s),
             ("notify.camera.cooldown_s", self.notify.camera.cooldown_s),
             ("notify.info.cooldown_s", self.notify.info.cooldown_s),
+            ("notify.health.cooldown_s", self.notify.health.cooldown_s),
+            ("health.printer_down_alert_s", self.health.printer_down_alert_s),
         ] {
             range(name, value, 0.0, 604_800.0);
         }
@@ -514,6 +569,24 @@ impl Config {
             1.0,
             10.0,
         );
+        range("health.stall_exit_s", self.health.stall_exit_s, 0.0, 86_400.0);
+        range(
+            "health.heartbeat_interval_s",
+            self.health.heartbeat_interval_s,
+            10.0,
+            3600.0,
+        );
+        for (name, url) in [
+            ("health.heartbeat_url", &self.health.heartbeat_url),
+            ("health.heartbeat_fail_url", &self.health.heartbeat_fail_url),
+        ] {
+            if !(url.is_empty() || url.starts_with("http://") || url.starts_with("https://")) {
+                errors.push(format!("{name} must be an http:// or https:// URL"));
+            }
+        }
+        if self.health.heartbeat_url.is_empty() && !self.health.heartbeat_fail_url.is_empty() {
+            errors.push("health.heartbeat_fail_url needs health.heartbeat_url".into());
+        }
         if self.decision.threshold_low >= self.decision.threshold_high {
             errors.push("decision.threshold_low must be less than threshold_high".into());
         }
@@ -905,7 +978,15 @@ pub fn load_config(path: Option<&Path>, environ: &BTreeMap<String, String>) -> R
     build_config(data)
 }
 
-const SECRET_KEYS: &[&str] = &["password", "token", "webhook_url", "topic", "reply_topic"];
+const SECRET_KEYS: &[&str] = &[
+    "password",
+    "token",
+    "webhook_url",
+    "topic",
+    "reply_topic",
+    "heartbeat_url",
+    "heartbeat_fail_url",
+];
 
 /// Fully-resolved settings (defaults + file + env) as plain data, for `prusa-watch config`.
 pub fn effective_config(cfg: &Config, redact: bool) -> Value {

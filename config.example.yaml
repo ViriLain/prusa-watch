@@ -22,6 +22,10 @@ notify:
   webhook:
     url: ${WEBHOOK_URL:-}
 
+health:                                 # dead-man's switch, see "Running it always-on" in the README
+  heartbeat_url: ${HEARTBEAT_URL:-}
+  heartbeat_fail_url: ${HEARTBEAT_FAIL_URL:-}
+
 web:
   public_url: ${PUBLIC_URL:-}
   token: ${WEB_TOKEN:-}

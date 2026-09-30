@@ -7,6 +7,7 @@ pub mod decision;
 pub mod detector;
 pub mod dotenv;
 pub mod escalation;
+pub mod heartbeat;
 pub mod http;
 pub mod imaging;
 pub mod model;
@@ -18,6 +19,7 @@ pub mod recording;
 pub mod replies;
 pub mod session;
 pub mod storage;
+pub mod watchdog;
 pub mod web;
 pub mod worker;
 

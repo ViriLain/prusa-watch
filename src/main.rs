@@ -290,6 +290,7 @@ fn cmd_run(cfg: Config) -> ExitCode {
         }
     };
     monitor.start();
+    start_recovery(&monitor);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -303,13 +304,40 @@ fn cmd_run(cfg: Config) -> ExitCode {
             Ok(())
         }
     });
+    let state_dir = monitor.state_dir.clone();
     let _ = std::thread::spawn(move || monitor.stop()).join();
+    prusa_watch::watchdog::end_run(&state_dir);
     match res {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Restart notice, stall watchdog and dead-man's switch (see `health:` in the config).
+fn start_recovery(monitor: &std::sync::Arc<Monitor>) {
+    use prusa_watch::{heartbeat::Heartbeat, watchdog};
+    if let Some(reason) = watchdog::begin_run(&monitor.state_dir) {
+        tracing::warn!("Restarted: {reason}");
+        monitor.notify_restarted(&reason);
+    }
+    if let Some(limit) = monitor.cfg.stall_exit_after_s() {
+        let state_dir = monitor.state_dir.clone();
+        watchdog::spawn(monitor.clone(), limit, move |reason| {
+            tracing::error!("Watchdog: {reason}; exiting so the supervisor restarts prusa-watch");
+            if let Err(e) = watchdog::record_restart(&state_dir, &reason) {
+                tracing::error!("Watchdog: could not record the restart reason: {e}");
+            }
+            std::process::exit(watchdog::STALL_EXIT_CODE);
+        });
+    }
+    let health = &monitor.cfg.health;
+    let transport = std::sync::Arc::new(prusa_watch::http::ReqwestTransport::new());
+    if let Some(heartbeat) = Heartbeat::new(health, monitor.cfg.notify.timeout_s, transport) {
+        tracing::info!("Heartbeat: every {:.0}s", health.heartbeat_interval_s);
+        heartbeat.spawn(monitor.clone(), health.heartbeat_interval_s);
     }
 }
 

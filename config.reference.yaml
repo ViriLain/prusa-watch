@@ -168,6 +168,11 @@ notify:
     channels: null
     priority: 3
     cooldown_s: 0
+  health:                          # the watcher itself: printer unreachable mid-print, restarted after a stall/crash
+    enabled: true
+    channels: null
+    priority: 4
+    cooldown_s: 0
 
   ntfy:
     url: https://ntfy.sh
@@ -203,6 +208,17 @@ recording:
   max_storage_mb: 1024             # combined recording budget; 0 = unlimited
 
 # ───────────────────────────── misc ─────────────────────────────
+# ───────────────────────────── health ─────────────────────────────
+# Keeping the watcher running, and finding out when it isn't. See "Running it always-on" in the README.
+health:
+  stall_exit_s: 5m                 # exit if the monitor loop stops making progress, so Docker/systemd/launchd restarts it (0 = never)
+  printer_down_alert_s: 60         # alert (notify.health) when the printer is unreachable this long during a print (0 = never)
+  # Dead-man's switch: requested every interval while prusa-watch can protect a print. If the host,
+  # container or network dies, the pings stop and that service alerts you. {reason} = URL-encoded status.
+  heartbeat_url: ""                # e.g. https://hc-ping.com/<uuid>  or  https://kuma.lan/api/push/<token>?status=up&msg=OK
+  heartbeat_fail_url: ""           # e.g. https://hc-ping.com/<uuid>/fail  or  .../api/push/<token>?status=down&msg={reason}
+  heartbeat_interval_s: 60
+
 state_dir: data
 timezone: ""                       # IANA zone for schedules, e.g. America/New_York (empty = system time)
 save_failure_frames: true          # annotated frame saved to state_dir/failures on every incident
