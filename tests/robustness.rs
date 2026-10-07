@@ -68,7 +68,7 @@ fn dashboard_state_does_not_wait_for_a_busy_monitor() {
         .unwrap();
     let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = prusa_watch::web::router(r.mon.clone());
+    let app = prusa_watch::web::app(r.mon.clone());
     rt.spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     // hold the control lock the way a tick does during a slow PrusaLink call
@@ -79,7 +79,11 @@ fn dashboard_state_does_not_wait_for_a_busy_monitor() {
         .build()
         .unwrap();
     let t = Instant::now();
-    let resp = client.get(format!("http://{addr}/api/state")).send().unwrap();
+    let resp = client
+        .get(format!("http://{addr}/api/state"))
+        .header("X-Token", "tok")
+        .send()
+        .unwrap();
     let health = client.get(format!("http://{addr}/healthz")).send().unwrap();
     let took = t.elapsed();
     drop(guard);
@@ -133,11 +137,21 @@ fn reply_handler_panic_does_not_kill_the_listener() {
         }
         "ok".to_string()
     });
-    let l = NtfyReplyListener::with_opener(prusa_watch::config::NtfyConfig::default(), handler, Arc::new(NoStream));
-    let line = |m: &str| format!(r#"{{"id":"x","event":"message","message":"{m}"}}"#);
-    assert_eq!(l.handle_line(&line("veto abc")), None);
+    let signer = prusa_watch::capability::Signer::default();
+    let l = NtfyReplyListener::with_opener(
+        prusa_watch::config::NtfyConfig::default(),
+        signer.clone(),
+        handler,
+        Arc::new(NoStream),
+    );
+    let expires = prusa_watch::now_ts() as i64 + 600;
+    let line = |command: &str| {
+        let signature = signer.sign(command, "abc", expires);
+        format!(r#"{{"id":"x","event":"message","message":"{command} abc {expires} {signature}"}}"#)
+    };
+    assert_eq!(l.handle_line(&line("veto")), None);
     assert_eq!(
-        l.handle_line(&line("act abc")).as_deref(),
+        l.handle_line(&line("act")).as_deref(),
         Some("ok"),
         "still handling after a panic"
     );

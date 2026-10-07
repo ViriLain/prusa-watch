@@ -37,14 +37,28 @@ impl Action {
         }
     }
 
-    pub fn confirmed(self, state: &str) -> bool {
+    /// Whether a printer report is positive evidence that this action took effect on `job_id`.
+    ///
+    /// `observed_job` is the job the report names, if any, and `state` the printer state
+    /// from the same report. An unknown, transitional or unrecognized state confirms
+    /// nothing, and neither does a report about a different job: the only way to learn
+    /// that a print stopped is for the printer to say so.
+    pub fn confirmed(self, job_id: i64, observed_job: Option<i64>, state: &str) -> bool {
         match self {
-            Self::Pause => state == "PAUSED",
-            Self::Resume => state == "PRINTING",
-            Self::Stop => !["PRINTING", "PAUSED", "ATTENTION"].contains(&state),
+            Self::Pause => observed_job == Some(job_id) && state == "PAUSED",
+            Self::Resume => observed_job == Some(job_id) && state == "PRINTING",
+            // STOPPED is the printer's own statement that the print was aborted. Buddy firmware
+            // names no job in that state, so "no job" is accepted; another job's id is not.
+            // FINISHED, IDLE and READY mean the print is over, not that it was stopped.
+            Self::Stop => state == "STOPPED" && observed_job.is_none_or(|observed| observed == job_id),
         }
     }
 }
+
+/// States in which the printer reports that no print is running or held: the job is over,
+/// however it ended. Only STOPPED says it was cancelled. BUSY and ERROR say nothing about
+/// the job, and ATTENTION still holds one.
+pub const ENDED_STATES: [&str; 4] = ["STOPPED", "FINISHED", "IDLE", "READY"];
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -62,6 +76,15 @@ pub struct JobContext {
     pub printer_handled: bool,
 }
 
+/// Where to report the outcome of a request an escalation step made: that step's own
+/// channels and priority. A request a person made has none and is reported everywhere.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Route {
+    /// the step's `notify`: None = every channel, empty = silent
+    pub notify: Option<Vec<String>>,
+    pub priority: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingAction {
     pub action: Action,
@@ -69,12 +92,17 @@ pub struct PendingAction {
     pub requested_at: f64,
     pub deadline: f64,
     pub attempts: u32,
+    #[serde(default)]
+    pub route: Option<Route>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActionOutcome {
     Confirmed(Action),
     Requested(Action),
+    /// The print was over before the request was confirmed. Nothing was claimed, the
+    /// request is no longer pending, and there is nothing left to retry.
+    Ended(String),
     Failed(String),
 }
 
@@ -183,20 +211,28 @@ impl Session {
     }
 
     pub fn request(&mut self, action: Action, job_id: i64, now: f64, timeout: f64, attempts: u32) {
+        // A retry of the same request keeps reporting where the original would have.
+        let route = self
+            .pending_action
+            .take()
+            .filter(|pending| pending.action == action && pending.job_id == job_id)
+            .and_then(|pending| pending.route);
         self.pending_action = Some(PendingAction {
             action,
             job_id,
             requested_at: now,
             deadline: now + timeout,
             attempts,
+            route,
         });
         self.action_error = None;
     }
 
     /// Returns the observed action; never promotes an accepted-but-unobserved request.
-    pub fn reconcile(&mut self, job_id: Option<i64>, state: &str) -> Option<Action> {
+    /// `observed_job` and `state` must come from the same printer report.
+    pub fn reconcile(&mut self, observed_job: Option<i64>, state: &str) -> Option<Action> {
         let pending = self.pending_action.as_ref()?;
-        if Some(pending.job_id) != job_id || !pending.action.confirmed(state) {
+        if !pending.action.confirmed(pending.job_id, observed_job, state) {
             return None;
         }
         let action = pending.action;

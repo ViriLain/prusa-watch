@@ -152,7 +152,13 @@ impl Transport for ReqwestTransport {
 }
 
 /// reqwest's Display hides the cause ("error sending request"); include it.
+/// It also prints the full request URL, which for ntfy and webhooks is the credential,
+/// so the description is redacted here, where every transport error is created.
 pub fn describe(e: &reqwest::Error) -> String {
+    crate::redact::text(&describe_raw(e))
+}
+
+fn describe_raw(e: &reqwest::Error) -> String {
     use std::error::Error;
     let mut s = if e.is_timeout() {
         "timed out".to_string()

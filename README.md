@@ -160,36 +160,43 @@ What the buttons do:
 
 **Schedules:** time windows pick the policy, and the first match wins. Windows can cross midnight, and `days` refers to the day the window starts. With no match, `default_policy` applies. The top-level `timezone` setting (an IANA name) sets the schedule clock.
 
-**How the buttons reach prusa-watch from anywhere:** each button POSTs `<command> <incident-id>` to `notify.ntfy.reply_topic`. prusa-watch keeps an **outbound** streaming subscription to that topic, so the buttons work on LTE with no port forwarding and no VPN. Replies that don't match the open incident, or don't make sense in its current state, are ignored. If `reply_topic` isn't set, the buttons call the dashboard directly, which only works on your LAN or VPN.
+**How the buttons reach prusa-watch from anywhere:** each button POSTs `<command> <incident-id> <expires> <signature>` to `notify.ntfy.reply_topic`. prusa-watch keeps an **outbound** streaming subscription to that topic, so the buttons work on LTE with no port forwarding and no VPN. The signature is a permission for that one command on that one incident, valid for `notify.command_ttl_s` (1 hour by default). A reply without a valid one is dropped, as is one that doesn't match the open incident or doesn't make sense in its current state. A button tapped after it expired changes nothing; while that incident is still open you get a note saying so. If `reply_topic` isn't set, the buttons call the dashboard directly, which only works on your LAN or VPN.
 
-The dashboard shows a live countdown to the next action, with buttons for whatever commands currently apply. The webhook payload includes `incident_id`, `policy`, `next_action`, `next_action_ts` and `command_urls`, so Home Assistant can build its own actionable notifications.
+Buttons never contain your ntfy `token`. On a protected ntfy server, let the reply topic accept anonymous publishes (`ntfy access everyone <reply-topic> write-only`); reading it still needs the token.
+
+The dashboard shows a live countdown to the next action, with buttons for whatever commands currently apply. The webhook payload includes `incident_id`, `policy`, `next_action`, `next_action_ts` and `command_urls`, so Home Assistant can build its own actionable notifications. Its `image_url` and `command_urls` are signed links that work without the dashboard token until they expire.
 
 ## Notifications
 
 - **Channels:** ntfy (the frame is attached, and the notification has action buttons), Discord (embedded image), or a generic JSON webhook.
 - **Incident notifications** are routed per step, as described above.
 - **Everything else** is routed under `notify:`. `notify.warning` covers the "possible failure" heads-up, `notify.camera` covers the camera going offline or coming back, and `notify.info` covers confirmations. Each has `enabled`, `channels`, `priority` and `cooldown_s`.
-- **ntfy.sh topics are public-by-name.** Use long random names for `topic` and `reply_topic`, or self-host ntfy with ACLs and set `token`.
+- **ntfy.sh topics are public-by-name.** Anyone who knows `topic` can read your alerts, camera frames and buttons included. Use long random names for `topic` and `reply_topic`, or self-host ntfy with ACLs and set `token`.
 
 ## Endpoints
 
 | Path | Notes |
 |---|---|
-| `GET /` | dashboard |
-| `GET /api/state` | full JSON state + 2 h score history |
-| `GET /frame.jpg`, `/raw.jpg` | last analyzed (annotated) frame / live frame with ROI box |
-| `POST /api/pause`, `/api/resume`, `/api/stop`, `/api/mute`, `/api/unmute` | `X-Token` plus the rendered `job_id` and `session_id`; resume accepts `mute=1` |
-| `POST /api/test` | `X-Token`; inference failures return 502 |
-| `POST /api/incident/{veto,act,stop,resume,mute}?id=...` | explicit incident ID plus `X-Token` or a scoped, expiring notification capability |
-| `GET /livez`, `/healthz` | process liveness / monitor readiness; readiness returns 503 for stale polling, frames, inference or action faults |
-| `GET /metrics` | Prometheus: score, p, ewm, baseline, inference ms, frame age, camera and printer up, state, incident open, seconds to the next action, counters (pauses, stops, vetoes, auto actions, ...) |
+| `GET /` | dashboard page (public; it holds no data and asks for the token) |
+| `GET /livez`, `/healthz` | public. Process liveness / monitor readiness; readiness returns 503 for stale polling, frames, inference or action faults, and gives the reason only to an authorized caller |
+| `GET /api/state` | private. Full JSON state + 2 h score history |
+| `GET /frame.jpg`, `/raw.jpg`, `/test.jpg` | private. Last analyzed (annotated) frame / live frame with ROI box / last detection test. `/frame.jpg` also accepts the signed link from a webhook's `image_url` |
+| `POST /api/pause`, `/api/resume`, `/api/stop`, `/api/mute`, `/api/unmute` | private. Also needs the rendered `job_id` and `session_id`; resume accepts `mute=1` |
+| `POST /api/test` | private. Inference failures return 502 |
+| `POST /api/incident/{veto,act,stop,resume,mute}?id=...` | private. Explicit incident ID, plus the token or a scoped, expiring notification capability |
+| `GET /metrics` | private. Prometheus: score, p, ewm, baseline, inference ms, frame age, camera and printer up, state, incident open, seconds to the next action, counters (pauses, stops, vetoes, auto actions, ...) |
+
+Private means: with `web.token` set, send it as `X-Token: <token>` or `Authorization: Bearer <token>` (Prometheus: `authorization: {credentials: <token>}`); a `token=` query parameter also works but ends up in logs and history. Without `web.token`, private routes answer only requests made on the same computer. Any route added later is private unless it is deliberately listed as public.
 
 ## Security
 
 - Native runs bind to `127.0.0.1` by default. Set `web.host: 0.0.0.0` and a strong `WEB_TOKEN` to reach them over a trusted LAN/VPN. Docker Compose publishes only on host loopback by default; change its port binding for LAN use. Network binding without a token requires explicit `web.allow_unauthenticated: true`.
-- Browser controls send the token in a header and retain it only for the browser session. Notification links contain command-specific HMAC permissions that expire after one hour and become unusable when the incident closes. Keep `data/control-key` private; a replacement key invalidates outstanding links. Read-only state and camera endpoints have no token requirement.
+- **Camera images, state, metrics and controls all need the token.** The dashboard asks for it before it loads anything, sends it in a header, and keeps it only for the browser session. Without a token, prusa-watch serves only the computer it runs on: the caller must be a loopback address, name the service by a loopback name, and come without proxy headers. That also keeps a web page you happen to visit from reaching it through your own browser. **Set `web.token` before putting a reverse proxy in front of it.** A proxy on the same machine that rewrites `Host` and adds no forwarding header looks exactly like a local program, so the token is the only reliable protection there.
+- Notification buttons and links carry an HMAC-signed permission for one command on one incident. It expires after `notify.command_ttl_s` (1 hour by default) and becomes useless when the incident closes. They never carry `web.token` or the ntfy `token`. Keep `data/control-key` private; a replacement key invalidates outstanding buttons and links.
 - Control endpoints can pause or cancel your print. Do not port-forward 8484; use a VPN for remote access.
-- The ntfy **reply topic** can pause, stop, resume or keep a print, but only for the open incident's one-time id. On ntfy.sh, topics are public-by-name, so give it a long random name. Better: self-host ntfy with an ACL and set `token`.
+- The ntfy **reply topic** accepts posts from anyone who knows its name, and that is safe: a post only counts if it carries a valid signature. Whoever can read your **alert topic** sees the buttons and can press them, so on ntfy.sh give both topics long random names. Better: self-host ntfy with an ACL and set `token`.
+- **A print is reported as stopped only when the printer says `STOPPED`**, for that job or naming no job (Buddy firmware names none once a print is stopped). `FINISHED`, `IDLE` and `READY` mean the print is over, not that it was cancelled: an unconfirmed stop is then dropped with a note ("print ended before the stop was confirmed") and not counted. An unreadable, malformed or unrecognized status (the firmware can report `UNKNOWN`) is treated as "printer unreachable", never as "not printing". Until `STOPPED` arrives, a stop shows as awaiting confirmation. It is re-sent a bounded number of times while the print keeps running and then fails with an alert; in a state where nothing can be sent (`BUSY`, `ERROR`) you get one "NOT CONFIRMED" alert and it keeps watching. A stop confirmed later is announced as "print STOPPED". These outcome messages go where the request came from: an escalation step's own channels and priority (a silent step stays silent), or every channel for a stop you asked for.
+- **Diagnostics are redacted.** Logs, `prusa-watch check`, `prusa-watch config` and `/api/state` errors pass through one redactor: URLs keep only scheme and host, and configured passwords, tokens, topics, hook URLs and camera credentials are masked. Notification text has the configured secrets masked and quoted errors reduced the same way; links in your own message templates are left alone. A camera URL whose password contains `/`, `?` or `#`, or whose path or query contains `@`, is shown as just `rtsp://***`. `prusa-watch config --show-secrets` is the only way to print secrets.
 - PrusaLink is plain HTTP with digest auth. Keep it on the LAN.
 - The Buddy3D RTSP stream is unauthenticated and unencrypted. Anyone on your LAN or Wi-Fi can watch it. Put IoT devices on their own VLAN if that matters to you.
 
