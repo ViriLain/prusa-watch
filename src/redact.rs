@@ -276,6 +276,8 @@ impl Redactor {
             cfg.notify.ntfy.reply_topic.clone(),
             cfg.notify.discord.webhook_url.clone(),
             cfg.notify.webhook.url.clone(),
+            cfg.health.heartbeat_url.clone(),
+            cfg.health.heartbeat_fail_url.clone(),
         ];
         // Hook URLs carry their secret in the path; the others in credentials, the query
         // and `key=value` path parts.
@@ -286,6 +288,8 @@ impl Redactor {
             (&cfg.web.public_url, false),
             (&cfg.notify.discord.webhook_url, true),
             (&cfg.notify.webhook.url, true),
+            (&cfg.health.heartbeat_url, true),
+            (&cfg.health.heartbeat_fail_url, true),
         ] {
             let bare = std::ptr::eq(url, &cfg.printer.host) && url.contains('@');
             let Some(parts) = split_url(url).or_else(|| bare.then(|| split_address("", url))) else {

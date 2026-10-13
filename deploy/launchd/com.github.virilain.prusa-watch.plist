@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for macOS. Replace YOUR_USER, then:
+    cp deploy/launchd/com.github.virilain.prusa-watch.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.github.virilain.prusa-watch.plist
+    tail -f ~/prusa-watch/data/prusa-watch.log
+  Stop:  launchctl bootout gui/$(id -u)/com.github.virilain.prusa-watch
+
+  A LaunchAgent runs only while YOUR_USER is logged in. For a headless Mac, enable automatic
+  login, and keep it awake (System Settings > Energy: prevent automatic sleeping).
+  macOS 15+ asks for the Local Network permission for prusa-watch itself the first time it
+  runs from launchd; if the log shows "No route to host (os error 65)", allow it in
+  System Settings > Privacy & Security > Local Network.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.github.virilain.prusa-watch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOUR_USER/.cargo/bin/prusa-watch</string>
+    <string>run</string>
+    <string>--config</string>
+    <string>/Users/YOUR_USER/prusa-watch/config.yaml</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/YOUR_USER/prusa-watch</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd's PATH doesn't include Homebrew -->
+    <key>PRUSA_WATCH_FFMPEG</key>
+    <string>/opt/homebrew/bin/ffmpeg</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- Restart after crashes and the stall watchdog's exit (status 70). -->
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USER/prusa-watch/data/prusa-watch.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USER/prusa-watch/data/prusa-watch.log</string>
+</dict>
+</plist>

@@ -3,7 +3,9 @@ services:
     build: .
     image: prusa-watch:latest
     container_name: prusa-watch
+    # restarts after crashes and the stall watchdog's exit (health.stall_exit_s)
     restart: unless-stopped
+    stop_grace_period: 30s             # time to flush the session checkpoint
     env_file: .env
     environment:
       TZ: America/New_York

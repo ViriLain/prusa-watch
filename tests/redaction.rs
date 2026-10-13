@@ -13,7 +13,7 @@ use prusa_watch::config::{Config, effective_config, load_config};
 use prusa_watch::redact::Redactor;
 
 /// Fragments of the synthetic secrets. None may appear in anything exported.
-const SECRETS: [&str; 14] = [
+const SECRETS: [&str; 16] = [
     "SYNTH-PRUSALINK-PASS",
     "SYNTH-PRINTER-URL-PASS",
     "printeruser-synth",
@@ -28,6 +28,8 @@ const SECRETS: [&str; 14] = [
     "SYNTH-HOOK-ID",
     "SYNTH-HOOK-QUERY",
     "SYNTH-WEB-TOKEN",
+    "SYNTH-HEARTBEAT-ID",
+    "SYNTH-HEARTBEAT-FAIL-ID",
 ];
 
 fn assert_clean(what: &str, text: &str) {
@@ -87,6 +89,9 @@ notify:
   webhook:
     url: "https://ha.invalid/api/webhook/SYNTH-HOOK-ID?secret=SYNTH-HOOK-QUERY"
   timeout_s: 1
+health:
+  heartbeat_url: "https://hc.invalid/SYNTH-HEARTBEAT-ID"
+  heartbeat_fail_url: "https://hc.invalid/SYNTH-HEARTBEAT-FAIL-ID/fail"
 web:
   port: {web_port}
   token: SYNTH-WEB-TOKEN
@@ -159,6 +164,8 @@ fn free_text_from_transports_and_ffmpeg_is_scrubbed() {
         "GET http://192.168.1.10:8484/api/state?token=SYNTH-WEB-TOKEN",
         "hook https://ha.invalid/api/webhook/SYNTH-HOOK-ID?secret=SYNTH-HOOK-QUERY failed",
         "password SYNTH-PRUSALINK-PASS in the middle of a sentence",
+        "heartbeat SYNTH-HEARTBEAT-ID failed",
+        "heartbeat SYNTH-HEARTBEAT-FAIL-ID failed",
         "topicsynth-alert-topic-1a2b3cglued",
     ] {
         let clean = redactor.text(line);
