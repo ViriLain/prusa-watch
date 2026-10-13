@@ -17,7 +17,10 @@ struct Capture {
 
 impl Capture {
     fn new(handler: impl Fn(&HttpRequest) -> HttpResponse + Send + Sync + 'static) -> Arc<Self> {
-        Arc::new(Self { reqs: Mutex::new(vec![]), handler: Box::new(handler) })
+        Arc::new(Self {
+            reqs: Mutex::new(vec![]),
+            handler: Box::new(handler),
+        })
     }
     fn reqs(&self) -> Vec<HttpRequest> {
         self.reqs.lock().unwrap().clone()
@@ -70,14 +73,18 @@ fn discord_multipart_with_image() {
     assert_eq!(reqs.len(), 1);
     // The Content-Type multipart/form-data header is added by the real transport
     // (reqwest) from Body::Multipart; here we check the body shape instead.
-    let Body::Multipart(parts) = &reqs[0].body else { panic!("expected multipart body, got {:?}", reqs[0].body) };
+    let Body::Multipart(parts) = &reqs[0].body else {
+        panic!("expected multipart body, got {:?}", reqs[0].body)
+    };
     let mut all = Vec::new();
     for p in parts {
         all.extend_from_slice(p.name.as_bytes());
         all.extend_from_slice(&p.data);
     }
     assert!(parts.iter().any(|p| p.name == "payload_json"));
-    assert!(contains(&all, b"payload_json") && contains(&all, b"attachment://frame.jpg") && contains(&all, b"\xff\xd8jpeg"));
+    assert!(
+        contains(&all, b"payload_json") && contains(&all, b"attachment://frame.jpg") && contains(&all, b"\xff\xd8jpeg")
+    );
     let img = parts.iter().find(|p| p.data == b"\xff\xd8jpeg").unwrap();
     assert_eq!(img.filename.as_deref(), Some("frame.jpg"));
     assert_eq!(img.content_type.as_deref(), Some("image/jpeg"));
@@ -103,13 +110,29 @@ fn webhook_json_and_ntfy_token_and_buttons() {
     assert_eq!(ntfy.get_header("Priority"), Some("4"));
     let acts = ntfy.get_header("Actions").unwrap();
     // no reply topic -> dashboard fallback URLs; label with a comma is quoted
-    assert!(acts.contains("http, Resume, http://watch.lan:8484/api/incident/resume?id=abc"), "{acts}");
+    assert!(
+        acts.contains("http, Resume, http://watch.lan:8484/api/incident/resume?id=abc"),
+        "{acts}"
+    );
     assert!(!acts.contains("\"False alarm: resume + mute\""), "{acts}"); // no comma in that label, no quoting needed
-    let Body::Json(body) = &hook.body else { panic!("expected JSON body") };
+    let Body::Json(body) = &hook.body else {
+        panic!("expected JSON body")
+    };
     assert_eq!(body["kind"], "failure");
     assert_eq!(body["has_image"], true);
-    assert!(body["image_url"].as_str().unwrap().ends_with("/frame.jpg"));
-    assert_eq!(body["command_urls"]["veto"], "http://watch.lan:8484/api/incident/veto?id=abc");
+    // the frame link works without the dashboard token, and only for the frame
+    assert!(
+        body["image_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://watch.lan:8484/frame.jpg?expires=")
+    );
+    assert!(
+        body["command_urls"]["veto"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://watch.lan:8484/api/incident/veto?id=abc&expires=")
+    );
 }
 
 #[test]
@@ -130,19 +153,36 @@ fn reply_topic_buttons() {
     let mut cfg = NotifyConfig::default();
     cfg.ntfy.topic = "t".into();
     cfg.ntfy.reply_topic = "r".into();
+    cfg.ntfy.token = "tk_synthetic_service_token".into();
     let n = Notifier::new(cfg, "", "");
     let mut e = ev();
     e.buttons = vec!["keep".into(), "act".into(), "stop".into()];
     e.incident_id = Some("i1".into());
     e.next_action = Some("stop".into());
-    assert_eq!(
-        n.ntfy_actions(&e),
-        vec![
-            "http, Keep printing, https://ntfy.sh/r, method=POST, body=veto i1, clear=true",
-            "http, Stop now, https://ntfy.sh/r, method=POST, body=act i1, clear=true",
-            "http, Cancel print, https://ntfy.sh/r, method=POST, body=stop i1, clear=true",
-        ]
-    );
+    let actions = n.ntfy_actions(&e);
+    assert_eq!(actions.len(), 3);
+    let now = prusa_watch::now_ts();
+    for (action, (label, command)) in
+        actions
+            .iter()
+            .zip([("Keep printing", "veto"), ("Stop now", "act"), ("Cancel print", "stop")])
+    {
+        // http, <label>, <reply topic url>, method=POST, body=<cmd> <incident> <expires> <signature>, clear=true
+        let prefix = format!("http, {label}, https://ntfy.sh/r, method=POST, body={command} i1 ");
+        let rest = action.strip_prefix(&prefix).unwrap_or_else(|| panic!("{action}"));
+        let (grant, tail) = rest.split_once(", ").unwrap();
+        assert_eq!(tail, "clear=true", "{action}");
+        let (expires, signature) = grant.split_once(' ').unwrap();
+        assert!(
+            n.signer.verify(command, "i1", expires.parse().unwrap(), signature, now),
+            "{action}"
+        );
+        // the server credential is never handed to the devices that receive the alert
+        assert!(
+            !action.contains("tk_synthetic_service_token") && !action.to_lowercase().contains("authorization"),
+            "{action}"
+        );
+    }
     let mut e2 = ev();
     e2.buttons = vec!["keep".into()];
     assert!(n.ntfy_actions(&e2).is_empty()); // no incident id -> no reply buttons
@@ -166,8 +206,13 @@ fn channel_failure_is_isolated() {
     let mut cfg = NotifyConfig::default();
     cfg.ntfy.topic = "t".into();
     cfg.webhook.url = "http://hook".into();
-    let t =
-        Capture::new(|r| if r.url.contains("hook") { HttpResponse::new(500, vec![]) } else { HttpResponse::new(200, vec![]) });
+    let t = Capture::new(|r| {
+        if r.url.contains("hook") {
+            HttpResponse::new(500, vec![])
+        } else {
+            HttpResponse::new(200, vec![])
+        }
+    });
     let n = notifier(cfg, "", t);
     n.send(ev(), None);
     assert_eq!(n.sent.load(Ordering::SeqCst), 1);

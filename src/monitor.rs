@@ -18,8 +18,10 @@ use crate::escalation::{Incident, PolicyResolver, Step, fmt_duration, format_tem
 use crate::imaging::{crop_roi, draw_rect, encode_jpeg};
 use crate::notify::{Event, Notifier};
 use crate::prusalink::{Printer, PrinterStatus, PrusaLink, PrusaLinkError};
-use crate::recording::{FrameRecord, Recorder};
+use crate::recording::Recorder;
 use crate::replies::NtfyReplyListener;
+pub use crate::session::JobContext;
+use crate::session::{Action, ActionOutcome, ENDED_STATES, PendingAction, Route, Session};
 
 pub const ACTIVE: [&str; 3] = ["PRINTING", "PAUSED", "ATTENTION"];
 
@@ -29,20 +31,10 @@ fn is_active(state: &str) -> bool {
 
 pub type Clock = Arc<dyn Fn() -> f64 + Send + Sync>;
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
-pub struct JobContext {
-    pub job_id: Option<i64>,
-    pub job_name: Option<String>,
-    /// user said "not a failure" -> no more incidents this job
-    pub muted: bool,
-    /// "paused" / "stopped" by us
-    pub action_taken: Option<String>,
-    pub last_warning_ts: f64,
-    pub warnings: i64,
-    /// no new incidents until this time (after resume / keep printing)
-    pub rearm_at: f64,
-    /// you paused at the printer during an incident -> grace on resume
-    pub printer_handled: bool,
+/// A one-off preview leaves the decision state unchanged.
+pub struct DetectionPreview {
+    pub detections: Vec<Detection>,
+    pub jpeg: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -89,6 +81,13 @@ pub struct Snapshot {
     pub progress: Option<f64>,
     pub incident: Option<Value>,
     pub policy: Value,
+    pub background_io: Value,
+    pub pending_action: Option<PendingAction>,
+    pub action_error: Option<String>,
+    pub detector_error: Option<String>,
+    pub loop_age_s: Option<f64>,
+    pub analysis_age_s: Option<f64>,
+    pub protection_status: String,
 }
 
 impl Default for Snapshot {
@@ -113,23 +112,44 @@ impl Default for Snapshot {
             progress: None,
             incident: None,
             policy: json!({}),
+            background_io: json!({}),
+            pending_action: None,
+            action_error: None,
+            detector_error: None,
+            loop_age_s: None,
+            analysis_age_s: None,
+            protection_status: "starting".into(),
         }
     }
 }
 
 /// Everything the control loop and replies mutate (serialized by one lock).
 pub struct Core {
-    pub job: JobContext,
-    pub incident: Option<Incident>,
+    pub session: Session,
     pub decider: FailureDecider,
     pub recorder: Recorder,
     pub policies: PolicyResolver,
     pub counters: Counters,
     pub last_status: Option<PrinterStatus>,
+    recovery: Option<crate::session::Checkpoint>,
     pub last_detect_ts: f64,
+    last_frame_sequence: Option<u64>,
     camera_down_notified: bool,
     printer_error_logged: bool,
     last_routed: HashMap<String, f64>,
+}
+
+impl std::ops::Deref for Core {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        &self.session
+    }
+}
+
+impl std::ops::DerefMut for Core {
+    fn deref_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
 }
 
 /// Read model for the dashboard/API (separate lock, never held during I/O).
@@ -140,6 +160,10 @@ struct View {
     latest_annotated: Option<Arc<Vec<u8>>>,
     counters: Counters,
     incident: Option<Incident>,
+    last_tick: Option<f64>,
+    last_poll: Option<f64>,
+    last_analysis: Option<f64>,
+    last_frame: Option<f64>,
 }
 
 pub struct Monitor {
@@ -149,8 +173,13 @@ pub struct Monitor {
     pub detector: Arc<dyn Detect>,
     pub notifier: Arc<Notifier>,
     pub clock: Clock,
+    wall_clock: Clock,
+    /// Masks this installation's secrets in everything the monitor exports.
+    pub redactor: Arc<crate::redact::Redactor>,
     pub state_dir: PathBuf,
+    storage: crate::storage::Storage,
     core: Mutex<Core>,
+    tick_lock: Mutex<()>,
     view: Mutex<View>,
     stop: (Mutex<bool>, Condvar),
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -170,41 +199,80 @@ pub struct Parts {
     pub detector: Option<Arc<dyn Detect>>,
     pub notifier: Option<Arc<Notifier>>,
     pub clock: Option<Clock>,
+    pub wall_clock: Option<Clock>,
 }
 
 impl Monitor {
     /// Build with real components for anything not supplied in `parts`.
     pub fn new(cfg: Config, parts: Parts) -> anyhow::Result<Arc<Self>> {
+        cfg.validate()?;
         let state_dir = PathBuf::from(&cfg.state_dir);
         std::fs::create_dir_all(&state_dir)?;
         let p = &cfg.printer;
         let printer = match parts.printer {
             Some(pr) => pr,
-            None => Arc::new(PrusaLink::new(&p.host, &p.password, &p.username, &p.auth, &p.scheme, p.timeout_s)),
+            None => Arc::new(PrusaLink::new(
+                &p.host,
+                &p.password,
+                &p.username,
+                &p.auth,
+                &p.scheme,
+                p.timeout_s,
+            )),
         };
         let c = &cfg.camera;
         let grabber: Arc<dyn FrameSource> = match parts.grabber {
             Some(g) => g,
-            None => Arc::new(Grabber::new(&c.url, &c.transport, c.reconnect_backoff_s, c.open_timeout_s, c.read_timeout_s)),
+            None => Arc::new(Grabber::new(
+                &c.url,
+                &c.transport,
+                c.reconnect_backoff_s,
+                c.open_timeout_s,
+                c.read_timeout_s,
+            )),
         };
         let detector: Arc<dyn Detect> = match parts.detector {
             Some(d) => d,
-            None => Arc::new(SpaghettiDetector::load(&cfg.detector.model_path, cfg.detector.use_gpu)?),
+            None => {
+                crate::model::verify_digest(
+                    std::path::Path::new(&cfg.detector.model_path),
+                    &cfg.detector.expected_sha256,
+                )?;
+                Arc::new(SpaghettiDetector::load(&cfg.detector.model_path, cfg.detector.use_gpu)?)
+            }
         };
-        let notifier =
-            parts.notifier.unwrap_or_else(|| Arc::new(Notifier::new(cfg.notify.clone(), &cfg.web.public_url, &cfg.web.token)));
-        let clock = parts.clock.unwrap_or_else(|| Arc::new(crate::now_ts));
+        let notifier = match parts.notifier {
+            Some(notifier) => notifier,
+            None => {
+                let mut notifier = Notifier::new(cfg.notify.clone(), &cfg.web.public_url, &cfg.web.token);
+                notifier.signer = crate::capability::Signer::load(&state_dir.join("control-key"))?;
+                Arc::new(notifier)
+            }
+        };
+        let wall_clock = parts
+            .wall_clock
+            .unwrap_or_else(|| parts.clock.clone().unwrap_or_else(|| Arc::new(crate::now_ts)));
+        let clock = parts.clock.unwrap_or_else(|| Arc::new(crate::monotonic_ts));
         let esc = parse_escalation(Some(&cfg.escalation), true)?;
         let policies = PolicyResolver::new(esc, &cfg.timezone)?;
+        let digest = crate::session::Checkpoint::digest(&cfg);
+        let recovery = std::fs::read(state_dir.join("session.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<crate::session::Checkpoint>(&bytes).ok())
+            .filter(|saved| saved.valid(&digest, wall_clock()));
+        let mut decider = FailureDecider::new(cfg.decision.clone(), Some(&state_dir.join("prediction_state.json")));
+        // The storage worker persists combined snapshots; update() performs no disk I/O here.
+        decider.state_path = None;
         let core = Core {
-            job: JobContext::default(),
-            incident: None,
-            decider: FailureDecider::new(cfg.decision.clone(), Some(&state_dir.join("prediction_state.json"))),
+            session: Session::default(),
+            decider,
+            recovery,
             recorder: Recorder::new(cfg.recording.clone(), &state_dir),
             policies,
             counters: Counters::default(),
             last_status: None,
-            last_detect_ts: 0.0,
+            last_detect_ts: f64::NEG_INFINITY,
+            last_frame_sequence: None,
             camera_down_notified: false,
             printer_error_logged: false,
             last_routed: HashMap::new(),
@@ -217,16 +285,26 @@ impl Monitor {
             latest_annotated: None,
             counters: Counters::default(),
             incident: None,
+            last_tick: None,
+            last_poll: None,
+            last_analysis: None,
+            last_frame: None,
         };
+        let storage = crate::storage::Storage::new(cfg.recording.clone(), &state_dir);
+        let redactor = Arc::new(crate::redact::Redactor::from_config(&cfg));
         Ok(Arc::new_cyclic(|me| Self {
+            redactor,
             cfg,
             printer,
             grabber,
             detector,
             notifier,
             clock,
+            wall_clock,
             state_dir,
+            storage,
             core: Mutex::new(core),
+            tick_lock: Mutex::new(()),
             view: Mutex::new(view),
             stop: (Mutex::new(false), Condvar::new()),
             thread: Mutex::new(None),
@@ -253,23 +331,54 @@ impl Monitor {
 
     // ------------------------------------------------------------------ lifecycle
     pub fn start(self: &Arc<Self>) {
+        let mut thread = lock(&self.thread);
+        if thread.is_some() || *lock(&self.stop.0) {
+            return;
+        }
         self.grabber.start();
         let ntfy = &self.cfg.notify.ntfy;
         let mut replies = lock(&self.replies);
         if !ntfy.reply_topic.is_empty() && replies.is_none() {
-            let weak = Arc::downgrade(self);
-            let handler = Arc::new(move |cmd: &str, iid: &str| match weak.upgrade() {
-                Some(m) => m.handle_reply(cmd, iid),
-                None => "ignored: shutting down".to_string(),
-            });
-            let l = NtfyReplyListener::new(ntfy.clone(), handler);
+            if !ntfy.token.is_empty() {
+                tracing::info!(
+                    "Replies: alert buttons never carry notify.ntfy.token, so the reply topic must accept \
+                     anonymous publishes (self-hosted: `ntfy access everyone <reply-topic> write-only`). \
+                     Each reply is authorized by its own signature."
+                );
+            }
+            let l = self.reply_listener(Arc::new(crate::replies::HttpStreamOpener::default()));
             l.start();
             *replies = Some(l);
         }
         drop(replies);
         let me = self.clone();
-        *lock(&self.thread) =
-            Some(std::thread::Builder::new().name("monitor".into()).spawn(move || me.run()).expect("spawn monitor"));
+        *thread = Some(
+            std::thread::Builder::new()
+                .name("monitor".into())
+                .spawn(move || me.run())
+                .expect("spawn monitor"),
+        );
+    }
+
+    /// The reply listener wired to this monitor: it verifies each reply against the key the
+    /// notifier signs buttons with, runs authorized commands, and reports expired ones.
+    pub fn reply_listener(self: &Arc<Self>, opener: Arc<dyn crate::replies::StreamOpener>) -> Arc<NtfyReplyListener> {
+        let weak = Arc::downgrade(self);
+        let handler = Arc::new(move |cmd: &str, iid: &str| match weak.upgrade() {
+            Some(m) => m.handle_reply(cmd, iid),
+            None => "ignored: shutting down".to_string(),
+        });
+        let listener = NtfyReplyListener::with_opener(
+            self.cfg.notify.ntfy.clone(),
+            self.notifier.signer.clone(),
+            handler,
+            opener,
+        );
+        let weak = Arc::downgrade(self);
+        listener.on_expired(Arc::new(move |_: &str, iid: &str| {
+            weak.upgrade().map(|m| m.reply_expired(iid)).unwrap_or_default()
+        }));
+        listener
     }
 
     pub fn stop(&self) {
@@ -282,15 +391,30 @@ impl Monitor {
         if let Some(h) = lock(&self.thread).take() {
             let _ = h.join();
         }
-        lock(&self.core).decider.save();
+        self.checkpoint(&lock(&self.core));
+        if let Err(error) = self.storage.flush() {
+            tracing::error!("Checkpoint flush failed: {error}");
+        }
+        self.storage.stop();
+        self.notifier.shutdown();
+    }
+
+    pub fn flush_storage(&self) -> Result<(), String> {
+        self.storage.flush()
     }
 
     pub fn replies_connected(&self) -> bool {
-        lock(&self.replies).as_ref().is_some_and(|r| r.connected.load(std::sync::atomic::Ordering::Relaxed))
+        lock(&self.replies)
+            .as_ref()
+            .is_some_and(|r| r.connected.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     fn run(self: Arc<Self>) {
-        tracing::info!("Monitor: watching {} ({})", self.cfg.printer.name, self.cfg.printer.host);
+        tracing::info!(
+            "Monitor: watching {} ({})",
+            self.cfg.printer.name,
+            crate::redact::host_credentials(&self.cfg.printer.host)
+        );
         loop {
             if *lock(&self.stop.0) {
                 break;
@@ -299,60 +423,171 @@ impl Monitor {
                 tracing::error!("Monitor: unexpected error in tick");
             }
             let g = lock(&self.stop.0);
-            let _ =
-                self.stop.1.wait_timeout_while(g, Duration::from_secs_f64(self.cfg.printer.poll_interval_s.max(0.05)), |s| !*s);
+            let _ = self.stop.1.wait_timeout_while(
+                g,
+                Duration::from_secs_f64(self.cfg.printer.poll_interval_s.max(0.05)),
+                |s| !*s,
+            );
         }
     }
 
     // ------------------------------------------------------------------ core loop
     /// One iteration. Public so tests can drive it deterministically.
     pub fn tick(&self) {
-        let mut core = lock(&self.core);
-        self.tick_inner(&mut core);
-        self.sync_counters(&core);
+        let _tick = lock(&self.tick_lock);
+        // Slow reads and inference do not prevent a user from retiring an incident.
+        let result = self
+            .printer
+            .status()
+            .and_then(PrinterStatus::validated)
+            .map(|mut status| {
+                if is_active(&status.state) && status.job_id.is_none() {
+                    status.job_id = self
+                        .printer
+                        .job()
+                        .ok()
+                        .flatten()
+                        .and_then(|job| job.get("id").and_then(Value::as_i64));
+                }
+                status
+            });
+        let name = result
+            .as_ref()
+            .ok()
+            .filter(|status| is_active(&status.state) && status.job_id != lock(&self.core).job.job_id)
+            .and_then(|_| self.printer.job_name());
+        let input = {
+            let mut core = lock(&self.core);
+            let input = self.tick_inner(&mut core, result, name);
+            self.sync_counters(&core);
+            input
+        };
+        if let Some((image, status, session_id)) = input {
+            self.analyze(&image, &status, &session_id);
+        }
+        self.sync_counters(&lock(&self.core));
+        lock(&self.view).last_tick = Some(self.now());
+    }
+
+    fn checkpoint(&self, core: &Core) {
+        let wall = (self.wall_clock)();
+        let mut session = core.session.clone();
+        session.shift_time(wall - self.now());
+        let checkpoint = crate::session::Checkpoint {
+            version: 1,
+            config_digest: crate::session::Checkpoint::digest(&self.cfg),
+            saved_at: wall,
+            time_printing: core.last_status.as_ref().and_then(|s| s.time_printing),
+            session,
+            prediction: core.decider.state.clone(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&checkpoint) {
+            self.storage.checkpoint(vec![
+                (self.state_dir.join("session.json"), bytes),
+                (
+                    self.state_dir.join("prediction_state.json"),
+                    core.decider.checkpoint_bytes(),
+                ),
+            ]);
+        }
     }
 
     fn sync_counters(&self, core: &Core) {
-        lock(&self.view).counters = core.counters.clone();
+        self.checkpoint(core);
+        let mut view = lock(&self.view);
+        view.counters = core.counters.clone();
+        view.snap.job = core.job.clone();
+        view.snap.pending_action = core.pending_action.clone();
+        view.snap.action_error = core.action_error.clone();
     }
 
-    fn tick_inner(&self, core: &mut Core) {
-        let Some(mut status) = self.poll_printer(core) else { return };
-        self.handle_job_transitions(core, &mut status);
-        // Keep what the printer actually reported. run_step marks `status` PAUSED/STOPPED
-        // for the rest of this tick; if that leaked into last_status, a pause still in
+    fn tick_inner(
+        &self,
+        core: &mut Core,
+        result: Result<PrinterStatus, PrusaLinkError>,
+        name: Option<String>,
+    ) -> Option<(Arc<RgbImage>, PrinterStatus, String)> {
+        let mut status = self.poll_printer(core, result)?;
+        let route = |core: &Core| core.pending_action.as_ref().and_then(|p| p.route.clone());
+        let asked_by = route(core);
+        if let Some(action) = core.session.reconcile(status.job_id, &status.state) {
+            self.confirmed_later(core, action, asked_by);
+        }
+        self.handle_job_transitions(core, &mut status, name);
+        // A newly restored request may already have completed while the host was down.
+        let asked_by = route(core);
+        if let Some(action) = core.session.reconcile(status.job_id, &status.state) {
+            self.confirmed_later(core, action, asked_by);
+        }
+        // The print is over without the printer ever confirming the request: stop waiting.
+        if let Some(pending) = core.pending_action.clone()
+            && self.now() >= pending.deadline
+            && ENDED_STATES.contains(&status.state.as_str())
+            && status.job_id.is_none_or(|observed| observed == pending.job_id)
+        {
+            self.retire_ended(core, pending.action, &status.state);
+        }
+        // Keep what the printer actually reported. The retry below and run_step mark `status`
+        // PAUSED/STOPPED for the rest of this tick; if that leaked into last_status, a pause still in
         // flight (next poll reads PRINTING) would look like a resume at the printer.
         core.last_status = Some(status.clone());
+        // An unobserved request is re-driven at its deadline. While an incident is open its
+        // due steps retry their own action below; anything else (a person's Stop or Resume
+        // that the printer accepted but did not act on) must not wait behind the incident,
+        // where it would also block the incident's pause for as long as it stayed pending.
+        if let Some(pending) = core.pending_action.clone()
+            && self.now() >= pending.deadline
+            && !core.incident.as_ref().is_some_and(|incident| {
+                incident
+                    .due(self.now())
+                    .iter()
+                    .any(|(_, step)| step.action.as_deref() == Some(pending.action.verb()))
+            })
+        {
+            let outcome = self.do_action(core, pending.action, Some(pending.job_id));
+            if outcome == ActionOutcome::Confirmed(Action::Stop) {
+                // Confirmed by the status read that followed the retry: this poll's report is
+                // older than that, so the rest of the tick must not treat the print as running.
+                self.announce_stop(core, pending.route);
+                status.state = "STOPPED".into();
+            }
+        }
 
         let now = self.now();
         self.process_incident(core, &mut status, now);
         self.refresh_policy_snapshot(core, now);
 
         let frame = self.grabber.latest();
-        let frame_age = frame.as_ref().map(|f| now - f.ts);
+        let frame_age = frame.as_ref().map(|f| (now - f.monotonic_ts).max(0.0));
         {
             let mut v = lock(&self.view);
             v.snap.camera_connected = self.grabber.connected();
             v.snap.frame_age_s = frame_age;
+            v.last_frame = frame.as_ref().map(|f| f.monotonic_ts);
         }
 
         if status.state != "PRINTING" {
-            return;
+            return None;
         }
         let camera_ok = frame.is_some() && frame_age.is_some_and(|a| a <= self.cfg.camera.stale_after_s);
         self.handle_camera_health(core, camera_ok);
         if !camera_ok {
-            return;
+            return None;
         }
         if now - core.last_detect_ts < self.cfg.detector.interval_s {
-            return;
+            return None;
         }
+        let frame = frame.unwrap();
+        if core.last_frame_sequence == Some(frame.sequence) {
+            return None;
+        }
+        core.last_frame_sequence = Some(frame.sequence);
         core.last_detect_ts = now;
-        self.analyze(core, &frame.unwrap().image, &status);
+        Some((frame.image, status, core.job.session_id.clone()))
     }
 
-    fn poll_printer(&self, core: &mut Core) -> Option<PrinterStatus> {
-        match self.printer.status() {
+    fn poll_printer(&self, core: &mut Core, result: Result<PrinterStatus, PrusaLinkError>) -> Option<PrinterStatus> {
+        match result {
             Err(e) => {
                 core.counters.printer_errors += 1;
                 if !core.printer_error_logged {
@@ -374,38 +609,75 @@ impl Monitor {
                 v.snap.printer_error = None;
                 v.snap.printer_state = status.state.clone();
                 v.snap.progress = status.progress;
+                v.last_poll = Some(self.now());
                 Some(status)
             }
         }
     }
 
-    fn handle_job_transitions(&self, core: &mut Core, status: &mut PrinterStatus) {
+    fn handle_job_transitions(&self, core: &mut Core, status: &mut PrinterStatus, name: Option<String>) {
         let prev = core.last_status.clone();
         let active = is_active(&status.state);
 
-        if active && status.job_id.is_none() {
-            // Some firmware builds omit job.id from /status; fall back to /job.
-            if let Ok(j) = self.printer.job() {
-                status.job_id = j.and_then(|j| j.get("id").and_then(Value::as_i64));
-            }
-        }
-
         // New job started (id changed while printing)
         if let Some(new_id) = status.job_id.filter(|id| active && Some(*id) != core.job.job_id) {
-            let name = self.printer.job_name();
-            tracing::info!("Monitor: new job {new_id} ({}) - resetting per-print state", name.as_deref().unwrap_or("None"));
+            tracing::info!(
+                "Monitor: new job {new_id} ({}) - resetting per-print state",
+                name.as_deref().unwrap_or("None")
+            );
             if core.incident.is_some() {
                 self.close_incident(core, "a new job started", false);
             }
-            core.job = JobContext { job_id: status.job_id, job_name: name.clone(), ..Default::default() };
-            core.decider.reset_for_new_print();
-            core.recorder.start_job(status.job_id, name.as_deref(), self.now());
+            let recovered = core.recovery.take().filter(|saved| {
+                saved.session.job.job_id == status.job_id
+                    && saved.session.job.job_name == name
+                    && saved
+                        .time_printing
+                        .zip(status.time_printing)
+                        .is_some_and(|(before, current)| {
+                            let downtime = (self.wall_clock)() - saved.saved_at;
+                            let expected = before as f64 + downtime;
+                            if status.state == "PAUSED" {
+                                // Print time may stop partway through downtime when a pause completes.
+                                current >= before.saturating_sub(5) && current as f64 <= expected + 60.0
+                            } else {
+                                (current as f64 - expected).abs() <= 60.0
+                            }
+                        })
+            });
+            if let Some(saved) = recovered {
+                core.session = saved.session;
+                core.session.shift_time(self.now() - (self.wall_clock)());
+                core.decider.state = saved.prediction;
+                // Preserve an existing pause/mute, but never replay an overdue intervention.
+                if let Some(pending) = &mut core.session.pending_action {
+                    pending.attempts = self.cfg.printer.action_max_attempts;
+                }
+                if core.incident.as_ref().is_some_and(|incident| {
+                    incident
+                        .next_action()
+                        .is_some_and(|(_, step)| self.now() >= incident.started_ts + step.at)
+                }) {
+                    core.session.incident = None;
+                    core.session.action_error =
+                        Some("Intervention expired during restart; check the printer before rearming".into());
+                }
+                self.refresh_incident_snapshot(core, self.now());
+            } else {
+                core.session.replace_job(status.job_id, name.clone());
+                core.decider.reset_for_new_print();
+            }
+            self.storage
+                .start_job(core.recorder.cfg.clone(), status.job_id, name, (self.wall_clock)());
             lock(&self.view).history.clear();
         }
 
         let prev_state = prev.as_ref().map(|p| p.state.as_str());
         // Resumed (anywhere: printer knob, Prusa app, dashboard) after we paused it
-        if prev_state == Some("PAUSED") && status.state == "PRINTING" && core.job.action_taken.as_deref() == Some("paused") {
+        if prev_state == Some("PAUSED")
+            && status.state == "PRINTING"
+            && core.job.action_taken.as_deref() == Some("paused")
+        {
             self.after_resume(core);
         }
         // Back to printing after you paused at the printer during an incident: same grace as our
@@ -425,7 +697,11 @@ impl Monitor {
 
         // Print ended
         if !active && core.job.job_id.is_some() && prev_state.is_some_and(is_active) {
-            tracing::info!("Monitor: job {} ended with state {}", core.job.job_id.unwrap(), status.state);
+            tracing::info!(
+                "Monitor: job {} ended with state {}",
+                core.job.job_id.unwrap(),
+                status.state
+            );
             if core.incident.is_some() {
                 self.close_incident(core, &format!("job ended ({})", status.state), false);
             }
@@ -480,14 +756,18 @@ impl Monitor {
         }
     }
 
-    fn analyze(&self, core: &mut Core, image: &RgbImage, status: &PrinterStatus) {
+    fn analyze(&self, image: &RgbImage, status: &PrinterStatus, session_id: &str) {
         let cfg = &self.cfg;
         let roi_img = crop_roi(image, cfg.camera.roi.as_deref());
-        let detections = match self.detector.try_detect(&roi_img, cfg.detector.threshold, cfg.detector.nms) {
+        let detections = match self
+            .detector
+            .try_detect(&roi_img, cfg.detector.threshold, cfg.detector.nms)
+        {
             Ok(d) => d,
             Err(e) => {
                 // Don't feed "nothing seen" into the averages/baseline for a frame we couldn't analyze.
                 tracing::error!("Monitor: inference failed, skipping frame: {e}");
+                lock(&self.view).snap.detector_error = Some(e);
                 return;
             }
         };
@@ -497,19 +777,40 @@ impl Monitor {
             tracing::debug!("Analyze: ignored {} box(es) in camera.ignore zones", ignored.len());
         }
         let confs: Vec<f64> = detections.iter().map(|d| d.confidence).collect();
+        let mut core = lock(&self.core);
+        if core.job.session_id != session_id || core.job.job_id != status.job_id {
+            return;
+        }
         let verdict = core.decider.update(&confs);
         let s = core.decider.state.clone();
         core.counters.frames_analyzed += 1;
+        drop(core);
 
-        let label = format!("{}  score {:.2}  p {:.2}", verdict.as_str().to_uppercase(), s.normalized_p, s.current_p);
-        let mut annotated = annotate(&roi_img, &detections, cfg.detector.visualization_threshold, Some(&label));
+        let label = format!(
+            "{}  score {:.2}  p {:.2}",
+            verdict.as_str().to_uppercase(),
+            s.normalized_p,
+            s.current_p
+        );
+        let mut annotated = annotate(
+            &roi_img,
+            &detections,
+            cfg.detector.visualization_threshold,
+            Some(&label),
+        );
         draw_zones(&mut annotated, &zones);
         let jpeg = Arc::new(encode_jpeg(&annotated, 85));
         let now = self.now();
         let inference_ms = self.detector.last_inference_ms();
+        let mut guard = lock(&self.core);
+        if guard.job.session_id != session_id || guard.job.job_id != status.job_id {
+            return;
+        }
+        let core = &mut *guard;
 
         {
             let mut v = lock(&self.view);
+            v.last_analysis = Some(now);
             v.latest_annotated = Some(jpeg.clone());
             v.history.push_back(HistoryPoint {
                 ts: now,
@@ -535,21 +836,25 @@ impl Monitor {
                 .map(Detection::as_list)
                 .collect();
             snap.last_analysis_ts = Some(now);
+            snap.detector_error = None;
         }
 
-        core.recorder.record(&FrameRecord {
-            now,
-            frame_num: s.current_frame_num,
-            progress: status.progress,
-            confidences: &confs,
-            ewm: s.ewm_mean,
-            baseline: s.rolling_mean_long,
-            short_mean: s.rolling_mean_short,
-            score: s.normalized_p,
-            verdict: verdict.as_str(),
-            inference_ms,
-            annotated_jpeg: Some(&jpeg),
-        });
+        self.storage.record(
+            core.recorder.cfg.clone(),
+            crate::storage::Record {
+                now: (self.wall_clock)(),
+                frame_num: s.current_frame_num,
+                progress: status.progress,
+                confidences: confs,
+                ewm: s.ewm_mean,
+                baseline: s.rolling_mean_long,
+                short_mean: s.rolling_mean_short,
+                score: s.normalized_p,
+                verdict: verdict.as_str().into(),
+                inference_ms,
+                jpeg: jpeg.clone(),
+            },
+        );
 
         tracing::debug!(
             "Analyze: {} dets p={:.3} ewm={:.3} base={:.3} -> {}",
@@ -560,7 +865,13 @@ impl Monitor {
             verdict.as_str()
         );
 
-        if core.job.muted || core.job.action_taken.is_some() || core.incident.is_some() || now < core.job.rearm_at {
+        if core.job.muted
+            || core.job.action_taken.is_some()
+            || core.pending_action.is_some()
+            || core.action_error.is_some()
+            || core.incident.is_some()
+            || now < core.job.rearm_at
+        {
             return;
         }
         match verdict {
@@ -615,7 +926,11 @@ impl Monitor {
         core.job.warnings += 1;
         core.counters.warnings += 1;
         let score = core.decider.state.normalized_p;
-        let job = core.job.job_name.clone().unwrap_or_else(|| core.job.job_id.map(|j| j.to_string()).unwrap_or("None".into()));
+        let job = core
+            .job
+            .job_name
+            .clone()
+            .unwrap_or_else(|| core.job.job_id.map(|j| j.to_string()).unwrap_or("None".into()));
         tracing::warn!(
             "Monitor: possible failure on job {} (score {score:.2})",
             core.job.job_id.map(|j| j.to_string()).unwrap_or("None".into())
@@ -631,26 +946,44 @@ impl Monitor {
     }
 
     // ------------------------------------------------------------------ escalation
-    fn open_incident(&self, core: &mut Core, status: &PrinterStatus, jpeg: Arc<Vec<u8>>, annotated: &RgbImage, now: f64) {
+    fn open_incident(
+        &self,
+        core: &mut Core,
+        status: &PrinterStatus,
+        jpeg: Arc<Vec<u8>>,
+        _annotated: &RgbImage,
+        now: f64,
+    ) {
         core.counters.failures += 1;
         let job_id = status.job_id.or(core.job.job_id);
         if self.cfg.save_failure_frames {
             let dir = self.state_dir.join("failures");
-            let name = format!("{}_job{}.jpg", now as i64, job_id.map(|j| j.to_string()).unwrap_or("None".into()));
-            let bytes = encode_jpeg(annotated, 95);
-            if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(dir.join(name), bytes)) {
-                tracing::warn!("Monitor: could not save failure frame: {e}");
-            }
+            let name = format!(
+                "{}_job{}.jpg",
+                now as i64,
+                job_id.map(|j| j.to_string()).unwrap_or("None".into())
+            );
+            self.storage.failure(dir.join(name), jpeg.clone());
         }
-        let (policy, schedule) = core.policies.resolve(now);
-        let inc = Incident::new(policy.clone(), schedule.clone(), job_id, now, core.decider.state.normalized_p, jpeg.to_vec());
+        let (policy, schedule) = core.policies.resolve((self.wall_clock)());
+        let inc = Incident::new(
+            policy.clone(),
+            schedule.clone(),
+            job_id,
+            now,
+            core.decider.state.normalized_p,
+            jpeg.to_vec(),
+        );
         tracing::warn!(
             "Monitor: failure on job {} (score {:.2}) - incident {}, policy '{}'{}",
             job_id.map(|j| j.to_string()).unwrap_or("None".into()),
             inc.score,
             inc.id,
             policy.name,
-            schedule.as_ref().map(|s| format!(" (schedule '{s}')")).unwrap_or_default()
+            schedule
+                .as_ref()
+                .map(|s| format!(" (schedule '{s}')"))
+                .unwrap_or_default()
         );
         core.incident = Some(inc);
         let mut st = status.clone();
@@ -666,7 +999,11 @@ impl Monitor {
             self.close_incident(core, &format!("printer is {}", status.state), false);
         } else if status.state != "PRINTING" && inc.acted.is_none() {
             core.job.printer_handled = true;
-            self.close_incident(core, &format!("printer is {} (handled at the printer)", status.state), false);
+            self.close_incident(
+                core,
+                &format!("printer is {} (handled at the printer)", status.state),
+                false,
+            );
         } else {
             self.run_due_steps(core, status, now, true);
         }
@@ -698,7 +1035,10 @@ impl Monitor {
 
     fn maybe_finish(&self, core: &mut Core) {
         let Some(inc) = &core.incident else { return };
-        if inc.steps_done() && inc.acted.as_deref() != Some("paused") {
+        if inc.steps_done()
+            && inc.acted.as_deref() != Some("paused")
+            && (inc.policy.has_action() || self.now() - inc.started_ts >= core.policies.esc.snooze_s.max(60.0))
+        {
             // Paused incidents stay open so Resume / False alarm buttons keep working.
             let cooldown = inc.acted.is_none();
             self.close_incident(core, "all steps done", cooldown);
@@ -715,37 +1055,69 @@ impl Monitor {
         now: f64,
         auto: bool,
     ) -> bool {
-        let (mut taken, mut err) = (None, None);
-        match step.action.as_deref() {
+        let asked_before = core.pending_action.as_ref().map(|pending| pending.requested_at);
+        let outcome = match step.action.as_deref() {
             Some("pause") if inc.acted.is_none() && status.state == "PRINTING" => {
-                (taken, err) = self.do_action(core, "pause", inc.job_id)
+                self.do_action(core, Action::Pause, inc.job_id)
             }
             Some("stop") if inc.acted.as_deref() != Some("stopped") && is_active(&status.state) => {
-                (taken, err) = self.do_action(core, "stop", inc.job_id)
+                self.do_action(core, Action::Stop, inc.job_id)
             }
-            _ => {}
+            Some("pause") if inc.acted.as_deref() == Some("paused") => ActionOutcome::Confirmed(Action::Pause),
+            _ => {
+                self.notify_step(core, inc, step, now, None);
+                return true;
+            }
+        };
+        // If this step's request is now waiting for the printer, its outcome is reported
+        // the way the step itself would have reported it.
+        if let Some(pending) = core.session.pending_action.as_mut()
+            && pending.route.is_none()
+            && asked_before != Some(pending.requested_at) // sent, or sent again, by this step
+            && step.action.as_deref() == Some(pending.action.verb())
+        {
+            pending.route = Some(Route {
+                notify: step.notify.clone(),
+                priority: step.priority,
+            });
         }
+        let (taken, err) = match outcome {
+            ActionOutcome::Confirmed(action) => (Some(action.result().to_string()), None),
+            ActionOutcome::Requested(_) => return false,
+            // The print is over; the incident closes on the next poll. Nothing to announce
+            // beyond the note the retirement already sent.
+            ActionOutcome::Ended(_) => return true,
+            ActionOutcome::Failed(error) => (None, Some(error)),
+        };
         if let Some(t) = &taken {
             inc.acted = Some(t.clone());
-            status.state = if t == "paused" { "PAUSED".into() } else { "STOPPED".into() };
+            status.state = if t == "paused" {
+                "PAUSED".into()
+            } else {
+                "STOPPED".into()
+            };
             if auto {
                 core.counters.auto_actions += 1;
             }
         }
         if let Some(err) = err {
-            let action = step.action.clone().unwrap_or_default();
-            inc.action_errors += 1;
+            let action = step.action.as_deref().unwrap_or_default();
+            inc.action_errors = inc.action_errors.saturating_add(1);
             if inc.action_errors == 1 {
                 // Never let a failed pause/stop go quietly: every channel, max priority. Once per
                 // incident; retries follow every poll and the normal alert goes out if one succeeds.
-                let name =
-                    core.job.job_name.clone().unwrap_or_else(|| inc.job_id.map(|j| j.to_string()).unwrap_or("None".into()));
+                let name = core
+                    .job
+                    .job_name
+                    .clone()
+                    .unwrap_or_else(|| inc.job_id.map(|j| j.to_string()).unwrap_or("None".into()));
                 let mut ev = self.event(
                     core,
                     "failure",
                     &format!("{}: {action} FAILED", self.cfg.printer.name),
                     &format!(
-                        "Spaghetti detected on '{name}' but the {action} command failed: {err}. Retrying every few seconds. Check the printer NOW."
+                        "Spaghetti detected on '{name}' but the {action} command failed: {}. Retries are bounded by the configured attempt limit. Check the printer NOW.",
+                        self.redactor.text(&err)
                     ),
                     Some(inc.jpeg.clone()),
                     None,
@@ -755,7 +1127,11 @@ impl Monitor {
                 ev.policy = Some(inc.policy.name.clone());
                 self.notifier.send(ev, None);
             } else {
-                tracing::warn!("Monitor: {action} retry {} for incident {} failed: {err}", inc.action_errors, inc.id);
+                tracing::warn!(
+                    "Monitor: {action} retry {} for incident {} failed: {err}",
+                    inc.action_errors,
+                    inc.id
+                );
             }
             return false;
         }
@@ -763,24 +1139,224 @@ impl Monitor {
         true
     }
 
-    fn do_action(&self, core: &mut Core, action: &str, job_id: Option<i64>) -> (Option<String>, Option<String>) {
-        let Some(job_id) = job_id else { return (None, Some("no job id".into())) };
-        let res = if action == "pause" { self.printer.pause(job_id) } else { self.printer.stop(job_id) };
+    /// A just-read printer report that is about `job_id`, or an error. The job named in the
+    /// result is exactly what the printer said: a report without a job is never attributed
+    /// to the one we asked about, and an unreadable or unrecognized report is an error.
+    fn fresh_status(&self, job_id: i64) -> Result<PrinterStatus, PrusaLinkError> {
+        let mut status = self.printer.status().and_then(PrinterStatus::validated)?;
+        if status.job_id.is_none() && is_active(&status.state) {
+            status.job_id = self
+                .printer
+                .job()?
+                .and_then(|job| job.get("id").and_then(Value::as_i64));
+            if status.job_id.is_none() {
+                return Err(PrusaLinkError(format!(
+                    "printer is {} but did not say which job; not acting on a job it cannot name",
+                    status.state
+                )));
+            }
+        }
+        if status.job_id.is_some_and(|observed| observed != job_id) {
+            return Err(PrusaLinkError(
+                "job changed; refresh the dashboard before acting".into(),
+            ));
+        }
+        Ok(status)
+    }
+
+    fn action_confirmed(&self, core: &mut Core, action: Action) {
+        match action {
+            Action::Pause => core.counters.pauses += 1,
+            Action::Stop => core.counters.stops += 1,
+            Action::Resume => self.after_resume(core),
+        }
+    }
+
+    /// The watch loop, not the request itself, saw the printer confirm `action`. Whoever
+    /// asked was told "awaiting confirmation", so a stop is announced here: by now the
+    /// incident that would have reported it is closing because the print is over.
+    /// (A pause keeps its incident open, and that incident's step reports it.)
+    fn confirmed_later(&self, core: &mut Core, action: Action, asked_by: Option<Route>) {
+        self.action_confirmed(core, action);
+        if action == Action::Stop {
+            self.announce_stop(core, asked_by);
+        }
+    }
+
+    /// Report an outcome where the request came from: the escalation step's own channels
+    /// and priority, or everywhere for a request a person made.
+    fn send_outcome(&self, mut event: Event, asked_by: Option<Route>, default_priority: i64) {
+        event.priority = asked_by.as_ref().map_or(default_priority, |route| route.priority);
+        match asked_by.and_then(|route| route.notify) {
+            Some(channels) if channels.is_empty() => {} // that step is configured silent
+            channels => self.notifier.send(event, channels.as_deref()),
+        }
+    }
+
+    fn announce_stop(&self, core: &mut Core, asked_by: Option<Route>) {
+        let job = core
+            .job
+            .job_name
+            .clone()
+            .unwrap_or_else(|| core.job.job_id.map(|j| j.to_string()).unwrap_or("print".into()));
+        let mut event = self.event(
+            core,
+            "failure",
+            &format!("{}: print STOPPED", self.cfg.printer.name),
+            &format!("The printer confirmed that '{job}' was stopped."),
+            None,
+            Some("stopped".into()),
+        );
+        event.incident_id = core.incident.as_ref().map(|incident| incident.id.clone());
+        self.send_outcome(event, asked_by, 4);
+    }
+
+    /// A request was still unconfirmed when the print ended some other way (finished,
+    /// dismissed at the printer). Stop waiting for it, claim nothing, and say so. This is
+    /// the only word on what became of the request, so it does not depend on
+    /// `notify.info.enabled`.
+    fn retire_ended(&self, core: &mut Core, action: Action, state: &str) {
+        let asked_by = core.session.pending_action.take().and_then(|pending| pending.route);
+        core.session.action_error = None;
+        tracing::warn!(
+            "Monitor: print ended ({state}) before the {} was confirmed; not counting it as {}",
+            action.verb(),
+            action.result()
+        );
+        let event = self.event(
+            core,
+            "info",
+            &format!(
+                "{}: print ended before the {} was confirmed",
+                self.cfg.printer.name,
+                action.verb()
+            ),
+            &format!(
+                "The printer now reports {state}. It never reported the print as {}, so prusa-watch is not counting it as {}.",
+                action.result(),
+                action.result()
+            ),
+            None,
+            None,
+        );
+        self.send_outcome(event, asked_by, self.cfg.notify.info.priority);
+    }
+
+    fn do_action(&self, core: &mut Core, action: Action, job_id: Option<i64>) -> ActionOutcome {
+        let Some(job_id) = job_id else {
+            return ActionOutcome::Failed("no job id".into());
+        };
+        let now = self.now();
+        let attempts = match &core.pending_action {
+            Some(pending) if pending.action != action || pending.job_id != job_id => {
+                return ActionOutcome::Failed("another printer action is awaiting confirmation".into());
+            }
+            Some(pending) if now < pending.deadline => return ActionOutcome::Requested(action),
+            Some(pending) if pending.attempts >= self.cfg.printer.action_max_attempts => {
+                let error = format!(
+                    "{action:?} was not confirmed after {} attempts; check the printer",
+                    pending.attempts
+                );
+                if core.action_error.as_deref() != Some(&error) {
+                    let mut event = self.event(
+                        core,
+                        "failure",
+                        &format!("{}: {action:?} FAILED", self.cfg.printer.name),
+                        &error,
+                        None,
+                        None,
+                    );
+                    event.priority = 5;
+                    self.notifier.send(event, None);
+                }
+                core.session.action_error = Some(error.clone());
+                return ActionOutcome::Failed(error);
+            }
+            Some(pending) => pending.attempts + 1,
+            None => 1,
+        };
+        let status = match self.fresh_status(job_id) {
+            Ok(status) => status,
+            Err(error) => {
+                core.session
+                    .request(action, job_id, now, self.cfg.printer.action_retry_s, attempts);
+                core.session.action_error = Some(error.to_string());
+                return ActionOutcome::Failed(error.to_string());
+            }
+        };
+        if action.confirmed(job_id, status.job_id, &status.state) {
+            if core.session.reconcile(status.job_id, &status.state).is_some() {
+                self.action_confirmed(core, action);
+            }
+            return ActionOutcome::Confirmed(action);
+        }
+        if (action == Action::Pause && status.state != "PRINTING")
+            || (action == Action::Resume && status.state != "PAUSED")
+            || (action == Action::Stop && !is_active(&status.state))
+        {
+            let error = format!("cannot {} while printer is {}", action.verb(), status.state);
+            if core.pending_action.is_none() {
+                return ActionOutcome::Failed(error);
+            }
+            if ENDED_STATES.contains(&status.state.as_str()) {
+                // The print is over and the request was never confirmed: nothing to retry.
+                self.retire_ended(core, action, &status.state);
+                return ActionOutcome::Ended(format!(
+                    "print already ended ({}); the {} was not confirmed",
+                    status.state,
+                    action.verb()
+                ));
+            }
+            // Nothing can be sent in this state (BUSY, ERROR, ATTENTION), and it may pass:
+            // BUSY covers crash recovery in the middle of a print. So no attempt is used up
+            // and the request stays alive, but the wait is not silent: one top-priority
+            // alert, a failed readiness check, and another look every retry interval.
+            let waiting = format!(
+                "{action:?} was not confirmed and the printer reports {}; check the printer",
+                status.state
+            );
+            if core.action_error.as_deref() != Some(&waiting) {
+                let mut event = self.event(
+                    core,
+                    "failure",
+                    &format!("{}: {action:?} NOT CONFIRMED", self.cfg.printer.name),
+                    &waiting,
+                    None,
+                    None,
+                );
+                event.priority = 5;
+                self.notifier.send(event, None);
+            }
+            if let Some(pending) = core.session.pending_action.as_mut() {
+                pending.deadline = now + self.cfg.printer.action_retry_s;
+            }
+            core.session.action_error = Some(waiting.clone());
+            return ActionOutcome::Failed(waiting);
+        }
+        let res = match action {
+            Action::Pause => self.printer.pause(job_id),
+            Action::Resume => self.printer.resume(job_id),
+            Action::Stop => self.printer.stop(job_id),
+        };
         match res {
             Ok(()) => {
-                let taken = if action == "pause" {
-                    core.counters.pauses += 1;
-                    "paused"
+                core.session
+                    .request(action, job_id, now, self.cfg.printer.action_confirmation_s, attempts);
+                if let Ok(status) = self.fresh_status(job_id)
+                    && core.session.reconcile(status.job_id, &status.state).is_some()
+                {
+                    self.action_confirmed(core, action);
+                    ActionOutcome::Confirmed(action)
                 } else {
-                    core.counters.stops += 1;
-                    "stopped"
-                };
-                core.job.action_taken = Some(taken.into());
-                (Some(taken.into()), None)
+                    ActionOutcome::Requested(action)
+                }
             }
             Err(e) => {
-                tracing::error!("Monitor: FAILED to {action} job {job_id}: {e}");
-                (None, Some(e.to_string()))
+                core.session
+                    .request(action, job_id, now, self.cfg.printer.action_retry_s, attempts);
+                tracing::error!("Monitor: FAILED to {:?} job {job_id}: {e}", action);
+                core.session.action_error = Some(e.to_string());
+                ActionOutcome::Failed(e.to_string())
             }
         }
     }
@@ -789,7 +1365,12 @@ impl Monitor {
         if step.notify.as_ref().is_some_and(|n| n.is_empty()) {
             return;
         }
-        let f = inc.template_fields(now, &self.cfg.printer.name, core.job.job_name.as_deref(), core.decider.state.normalized_p);
+        let f = inc.template_fields(
+            now,
+            &self.cfg.printer.name,
+            core.job.job_name.as_deref(),
+            core.decider.state.normalized_p,
+        );
         let na = inc.next_action();
         let fill = |t: &str| format_template(t, &f).unwrap_or_else(|_| t.to_string());
         // Python treated empty strings as unset (`if step.title:`)
@@ -798,7 +1379,11 @@ impl Monitor {
         } else if let Some(t) = taken {
             format!("{}: print {}", f["printer"], t.to_uppercase())
         } else if na.is_some() {
-            let verb = if f["next_action"] == "pause" { "pausing" } else { "stopping" };
+            let verb = if f["next_action"] == "pause" {
+                "pausing"
+            } else {
+                "stopping"
+            };
             format!("{}: {verb} in {} unless you respond", f["printer"], f["next_action_in"])
         } else {
             format!("{}: print failure detected", f["printer"])
@@ -810,15 +1395,28 @@ impl Monitor {
             let mut m = if let Some(t) = taken {
                 let mut m = format!("{head} Print was {}.", t.to_uppercase());
                 if na.is_some() {
-                    m += &format!(" Next: {} in {} unless you respond.", f["next_action"], f["next_action_in"]);
+                    m += &format!(
+                        " Next: {} in {} unless you respond.",
+                        f["next_action"], f["next_action_in"]
+                    );
                 }
                 m
             } else if na.is_some() {
-                format!("{head} Tap Keep printing if it's a false alarm. No response = {}.", f["next_action"])
+                format!(
+                    "{head} Tap Keep printing if it's a false alarm. No response = {}.",
+                    f["next_action"]
+                )
             } else {
-                format!("{head} Printer still running (policy '{}' does not act).", inc.policy.name)
+                format!(
+                    "{head} Printer still running (policy '{}' does not act).",
+                    inc.policy.name
+                )
             };
-            m += &format!(" [{}{}]", inc.policy.name, inc.schedule.as_ref().map(|s| format!(" / {s}")).unwrap_or_default());
+            m += &format!(
+                " [{}{}]",
+                inc.policy.name,
+                inc.schedule.as_ref().map(|s| format!(" / {s}")).unwrap_or_default()
+            );
             m
         };
         let kind = if taken.is_some() { "failure" } else { "incident" };
@@ -862,19 +1460,55 @@ impl Monitor {
             return "ignored: no matching open incident".into();
         }
         if !inc.commands().contains(&cmd) {
-            return format!("ignored: '{cmd}' not applicable (incident is {})", inc.acted.clone().unwrap_or("waiting".into()));
+            return format!(
+                "ignored: '{cmd}' not applicable (incident is {})",
+                inc.acted.clone().unwrap_or("waiting".into())
+            );
         }
         let result = match self.apply_reply(&mut core, cmd, now) {
             Ok(r) => r,
             Err(e) => {
                 self.sync_counters(&core);
-                return format!("failed: {e}");
+                return format!("failed: {}", self.redactor.text(&e.0));
             }
         };
         self.refresh_incident_snapshot(&core, now);
         lock(&self.view).snap.job = core.job.clone();
         self.sync_counters(&core);
         result
+    }
+
+    /// A genuine button was tapped after its permission ran out. Nothing is done to the
+    /// printer; say so, because the ntfy app reports the tap itself as a success.
+    pub fn reply_expired(&self, incident_id: &str) -> String {
+        let mut core = lock(&self.core);
+        let now = self.now();
+        // Only for the incident that is open now: an old button for a closed incident is
+        // ignored like any other reply to it, so a stale alert cannot be used to send notices.
+        let open = core
+            .incident
+            .as_ref()
+            .is_some_and(|incident| constant_time_eq(incident_id.as_bytes(), incident.id.as_bytes()));
+        if open && now - core.last_routed.get("expired").copied().unwrap_or(f64::NEG_INFINITY) >= 60.0 {
+            core.last_routed.insert("expired".into(), now);
+            let mut event = self.event(
+                &core,
+                "info",
+                &format!("{}: that button has expired", self.cfg.printer.name),
+                &format!(
+                    "Nothing was changed. Alert buttons work for {} after the alert is sent. \
+                     Use the newest alert or open the dashboard.",
+                    fmt_duration(self.cfg.notify.command_ttl_s)
+                ),
+                None,
+                None,
+            );
+            event.priority = self.cfg.notify.info.priority;
+            if self.cfg.notify.info.enabled {
+                self.notifier.send(event, self.cfg.notify.info.channels.as_deref());
+            }
+        }
+        "ignored: expired".into()
     }
 
     fn apply_reply(&self, core: &mut Core, cmd: &str, now: f64) -> Result<String, PrusaLinkError> {
@@ -888,11 +1522,15 @@ impl Monitor {
         let need_job = || inc_job.ok_or_else(|| PrusaLinkError("no job id".into()));
         match cmd {
             "veto" => {
-                if core.incident.as_ref().is_some_and(|i| i.acted.as_deref() == Some("paused")) {
-                    self.printer.resume(need_job()?)?;
-                    core.job.action_taken = None;
+                if core
+                    .incident
+                    .as_ref()
+                    .is_some_and(|i| i.acted.as_deref() == Some("paused"))
+                {
+                    self.manual_action(core, Action::Resume, need_job()?)?;
                 }
                 core.counters.vetoes += 1;
+                core.session.pending_action = core.pending_action.take().filter(|p| p.action == Action::Resume);
                 self.close_incident(core, "kept printing by user", true);
                 let name = self.cfg.printer.name.clone();
                 self.notify_routed(
@@ -912,17 +1550,24 @@ impl Monitor {
                     (i, s.clone())
                 };
                 inc.next_idx = idx + 1; // skip any reminders before it
-                let last_state = core.last_status.as_ref().map(|s| s.state.clone()).unwrap_or("PRINTING".into());
+                let last_state = core
+                    .last_status
+                    .as_ref()
+                    .map(|s| s.state.clone())
+                    .unwrap_or("PRINTING".into());
                 let mut status = PrinterStatus::new(&last_state, inc.job_id);
                 let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     self.run_step(core, &mut inc, &step, &mut status, now, false)
                 }))
                 .unwrap_or(false); // incident kept either way
-                let action = step.action.clone().unwrap_or_default();
+                let action = step.action.as_deref().unwrap_or_default();
                 if !ok {
                     inc.next_idx = idx;
                     inc.retry_idx = Some(idx); // the loop retries it on the next poll, not at its scheduled time
                     core.incident = Some(inc);
+                    if core.pending_action.is_some() && core.action_error.is_none() {
+                        return Ok(format!("{action} requested; awaiting confirmation"));
+                    }
                     return Ok(format!("failed: {action} command failed; retrying"));
                 }
                 let acted = inc.acted.clone();
@@ -931,10 +1576,12 @@ impl Monitor {
                 Ok(acted.unwrap_or_else(|| format!("{action} skipped (printer is {})", status.state)))
             }
             "stop" => {
-                let (taken, err) = self.do_action(core, "stop", inc_job);
-                if let Some(e) = err {
-                    return Err(PrusaLinkError(e));
-                }
+                let outcome = self.do_action(core, Action::Stop, inc_job);
+                let taken = match outcome {
+                    ActionOutcome::Confirmed(action) => Some(action.result().into()),
+                    ActionOutcome::Requested(_) => return Ok("stop requested; awaiting confirmation".into()),
+                    ActionOutcome::Ended(error) | ActionOutcome::Failed(error) => return Err(PrusaLinkError(error)),
+                };
                 if let Some(i) = core.incident.as_mut() {
                     i.acted = taken;
                 }
@@ -942,13 +1589,12 @@ impl Monitor {
                 Ok("stopped".into())
             }
             "resume" | "mute" => {
-                self.printer.resume(need_job()?)?;
-                self.after_resume(core);
+                let result = self.manual_action(core, Action::Resume, need_job()?)?;
                 if cmd == "mute" {
                     self.set_muted_locked(core, true);
-                    return Ok("resumed (alerts muted for this print)".into());
+                    return Ok(format!("{result} (alerts muted for this print)"));
                 }
-                Ok("resumed".into())
+                Ok(result)
             }
             other => Ok(format!("ignored: unknown command '{other}'")),
         }
@@ -960,8 +1606,8 @@ impl Monitor {
         v.incident = core.incident.clone();
     }
 
-    fn refresh_policy_snapshot(&self, core: &Core, now: f64) {
-        let (pol, sched) = core.policies.resolve(now);
+    fn refresh_policy_snapshot(&self, core: &Core, _now: f64) {
+        let (pol, sched) = core.policies.resolve((self.wall_clock)());
         let steps: Vec<Value> = pol
             .steps
             .iter()
@@ -982,7 +1628,15 @@ impl Monitor {
         jpeg: Option<Arc<Vec<u8>>>,
         action_taken: Option<String>,
     ) -> Event {
-        let mut e = Event::new(kind, title, message, &self.cfg.printer.name);
+        // No configured secret may reach a third-party notification service. Only literal
+        // values are masked here, so links in a user's own templates survive; error text is
+        // redacted structurally where it is quoted into a message.
+        let mut e = Event::new(
+            kind,
+            self.redactor.literals(title),
+            self.redactor.literals(message),
+            &self.cfg.printer.name,
+        );
         e.job_id = core.job.job_id;
         e.job_name = core.job.job_name.clone();
         e.score = Some(core.decider.state.normalized_p);
@@ -992,33 +1646,64 @@ impl Monitor {
     }
 
     // ------------------------------------------------------------------ controls (web UI)
+    /// Atomically bind browser controls to the session rendered when the button was created.
+    pub fn control(&self, job_id: i64, session_id: &str, command: &str, mute: bool) -> Result<String, PrusaLinkError> {
+        let mut core = lock(&self.core);
+        if !core.session.accepts(job_id, session_id) {
+            return Err(PrusaLinkError("job/session changed; refresh the dashboard".into()));
+        }
+        if matches!(command, "mute" | "unmute") {
+            self.set_muted_locked(&mut core, command == "mute");
+            return Ok(format!("{}d", command));
+        }
+        let action = Action::parse(command).ok_or_else(|| PrusaLinkError("unknown action".into()))?;
+        let result = self.manual_action(&mut core, action, job_id)?;
+        if mute {
+            self.set_muted_locked(&mut core, true);
+        }
+        Ok(result)
+    }
+
     pub fn resume(&self, mute: bool) -> Result<String, PrusaLinkError> {
         let mut core = lock(&self.core);
         let job_id = core.job.job_id.ok_or_else(|| PrusaLinkError("no active job".into()))?;
-        self.printer.resume(job_id)?;
-        if core.job.action_taken.as_deref() == Some("paused") {
-            self.after_resume(&mut core);
-        }
+        let out = self.manual_action(&mut core, Action::Resume, job_id)?;
         let out = if mute {
             self.set_muted_locked(&mut core, true);
-            "resumed (alerts muted for this print)"
+            format!("{out} (alerts muted for this print)")
         } else {
-            "resumed"
+            out
         };
         self.sync_counters(&core);
-        Ok(out.into())
+        Ok(out)
     }
 
     pub fn stop_print(&self) -> Result<String, PrusaLinkError> {
-        let job_id = lock(&self.core).job.job_id.ok_or_else(|| PrusaLinkError("no active job".into()))?;
-        self.printer.stop(job_id)?;
-        Ok("stopped".into())
+        let mut core = lock(&self.core);
+        let job_id = core.job.job_id.ok_or_else(|| PrusaLinkError("no active job".into()))?;
+        self.manual_action(&mut core, Action::Stop, job_id)
     }
 
     pub fn pause(&self) -> Result<String, PrusaLinkError> {
-        let job_id = lock(&self.core).job.job_id.ok_or_else(|| PrusaLinkError("no active job".into()))?;
-        self.printer.pause(job_id)?;
-        Ok("paused".into())
+        let mut core = lock(&self.core);
+        let job_id = core.job.job_id.ok_or_else(|| PrusaLinkError("no active job".into()))?;
+        self.manual_action(&mut core, Action::Pause, job_id)
+    }
+
+    fn manual_action(&self, core: &mut Core, action: Action, job_id: i64) -> Result<String, PrusaLinkError> {
+        // A human command supersedes an older request; old scheduled steps must not resume later.
+        core.session.pending_action = None;
+        let outcome = self.do_action(core, action, Some(job_id));
+        if matches!(outcome, ActionOutcome::Confirmed(Action::Stop | Action::Resume)) {
+            self.close_incident(core, "handled by user", false);
+        }
+        self.refresh_incident_snapshot(core, self.now());
+        self.sync_counters(core);
+        match outcome {
+            ActionOutcome::Confirmed(action) => Ok(action.result().into()),
+            ActionOutcome::Requested(action) => Ok(format!("{} requested; awaiting confirmation", action.verb())),
+            ActionOutcome::Ended(error) | ActionOutcome::Failed(error) => Err(PrusaLinkError(error)),
+        }
     }
 
     pub fn set_muted(&self, muted: bool) {
@@ -1027,38 +1712,149 @@ impl Monitor {
     }
 
     fn set_muted_locked(&self, core: &mut Core, muted: bool) {
-        core.job.muted = muted;
+        let resume = core.pending_action.take().filter(|p| p.action == Action::Resume);
+        core.session.mute(muted);
+        if !muted {
+            core.session.action_error = None;
+            core.session.pending_action = None;
+        }
+        if resume.is_some() {
+            core.session.pending_action = resume;
+        }
+        self.refresh_incident_snapshot(core, self.now());
         tracing::info!(
             "Monitor: alerts {} for job {}",
             if muted { "muted" } else { "unmuted" },
             core.job.job_id.map(|j| j.to_string()).unwrap_or("None".into())
         );
-        lock(&self.view).snap.job = core.job.clone();
+        self.sync_counters(core);
     }
 
     /// Run the model on the current frame without touching decision state (ROI tuning).
-    pub fn test_detection(&self) -> Option<(Vec<Detection>, Vec<u8>)> {
-        let frame = self.grabber.latest()?;
+    pub fn test_detection(&self) -> Result<Option<DetectionPreview>, String> {
+        let Some(frame) = self.grabber.latest() else {
+            return Ok(None);
+        };
         let img = crop_roi(&frame.image, self.cfg.camera.roi.as_deref());
-        let dets = self.detector.detect(&img, self.cfg.detector.threshold, self.cfg.detector.nms);
+        let dets = self
+            .detector
+            .try_detect(&img, self.cfg.detector.threshold, self.cfg.detector.nms)?;
         let zones = ignore_zones_in_crop(&self.cfg, img.width(), img.height());
         let (dets, _) = drop_ignored(dets, &zones);
         let total: f64 = dets.iter().map(|d| d.confidence).fold(0.0, |a, b| a + b);
-        let mut annotated =
-            annotate(&img, &dets, self.cfg.detector.visualization_threshold, Some(&format!("TEST  sum p {total:.2}")));
+        let mut annotated = annotate(
+            &img,
+            &dets,
+            self.cfg.detector.visualization_threshold,
+            Some(&format!("TEST  sum p {total:.2}")),
+        );
         draw_zones(&mut annotated, &zones);
-        Some((dets, encode_jpeg(&annotated, 85)))
+        Ok(Some(DetectionPreview {
+            detections: dets,
+            jpeg: encode_jpeg(&annotated, 85),
+        }))
     }
 
     // ------------------------------------------------------------------ read models
     pub fn snapshot(&self) -> Snapshot {
         let v = lock(&self.view);
         let mut snap = v.snap.clone();
+        let now = self.now();
+        use std::sync::atomic::Ordering;
+        snap.background_io = json!({
+            "storage_errors": self.storage.stats().errors.load(Ordering::Relaxed),
+            "storage_dropped": self.storage.stats().dropped.load(Ordering::Relaxed),
+            "notification_errors": self.notifier.errors.load(Ordering::Relaxed),
+            "notification_dropped": self.notifier.dropped(),
+            "channels": self.notifier.delivery_health(),
+        });
+        snap.loop_age_s = v.last_tick.map(|time| (now - time).max(0.0));
+        snap.analysis_age_s = v.last_analysis.map(|time| (now - time).max(0.0));
+        snap.frame_age_s = v.last_frame.map(|time| (now - time).max(0.0));
+        snap.protection_status = if *lock(&self.stop.0) {
+            "stopped"
+        } else if snap.loop_age_s.is_none() {
+            "starting"
+        } else if snap.loop_age_s.is_some_and(|age| age > self.loop_budget()) {
+            "monitor loop stalled"
+        } else if !snap.printer_reachable {
+            "printer offline"
+        } else if snap.action_error.is_some() {
+            "printer action failed"
+        } else if snap.pending_action.is_some() {
+            "awaiting printer confirmation"
+        } else if snap.job.muted {
+            "muted for this print"
+        } else if snap.printer_state != "PRINTING" {
+            "waiting for a print"
+        } else if snap.detector_error.is_some() {
+            "detector failed"
+        } else if !snap.camera_connected || !snap.frame_age_s.is_some_and(|age| age <= self.cfg.camera.stale_after_s) {
+            "camera unavailable"
+        } else if snap.grace_frames_left > 0 {
+            "startup grace"
+        } else if now < snap.job.rearm_at {
+            "resume grace"
+        } else {
+            "monitoring"
+        }
+        .into();
         if let Some(inc) = &v.incident {
             // keep the countdown live between ticks
             snap.incident = Some(inc.public(self.now()));
         }
+        // Error text originates in transports and child processes that quote URLs.
+        for text in [
+            &mut snap.printer_error,
+            &mut snap.action_error,
+            &mut snap.detector_error,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *text = self.redactor.text(text);
+        }
+        self.redactor.json(&mut snap.background_io);
         snap
+    }
+
+    /// Process liveness and protection readiness have separate contracts.
+    fn loop_budget(&self) -> f64 {
+        (self.cfg.printer.poll_interval_s * 3.0 + self.cfg.printer.timeout_s * 2.0 + self.cfg.detector.interval_s * 2.0)
+            .max(15.0)
+    }
+
+    pub fn readiness(&self) -> Result<(), String> {
+        let snap = self.snapshot();
+        if *lock(&self.stop.0) {
+            return Err("monitor stopped".into());
+        }
+        let budget = self.loop_budget();
+        if !snap.loop_age_s.is_some_and(|age| age <= budget) {
+            return Err("monitor loop is starting, stalled, or stopped".into());
+        }
+        if !snap.printer_reachable
+            || !lock(&self.view)
+                .last_poll
+                .is_some_and(|time| self.now() - time <= budget)
+        {
+            return Err("printer status is unavailable or stale".into());
+        }
+        if let Some(error) = snap.action_error {
+            return Err(error);
+        }
+        if snap.printer_state == "PRINTING" {
+            if let Some(error) = snap.detector_error {
+                return Err(error);
+            }
+            if !snap.camera_connected || !snap.frame_age_s.is_some_and(|age| age <= self.cfg.camera.stale_after_s) {
+                return Err("camera frames are unavailable or stale".into());
+            }
+            if !snap.analysis_age_s.is_some_and(|age| age <= budget) {
+                return Err("successful inference is unavailable or stale".into());
+            }
+        }
+        Ok(())
     }
 
     pub fn counters(&self) -> Counters {
@@ -1091,8 +1887,14 @@ impl Monitor {
             );
         }
         let (w, h) = (img.width() as f64, img.height() as f64);
-        let full: Vec<[f64; 4]> =
-            self.cfg.camera.ignore.iter().filter(|z| z.len() == 4).map(|z| [z[0] * w, z[1] * h, z[2] * w, z[3] * h]).collect();
+        let full: Vec<[f64; 4]> = self
+            .cfg
+            .camera
+            .ignore
+            .iter()
+            .filter(|z| z.len() == 4)
+            .map(|z| [z[0] * w, z[1] * h, z[2] * w, z[3] * h])
+            .collect();
         draw_zones(&mut img, &full);
         Some(encode_jpeg(&img, 80))
     }
@@ -1105,7 +1907,12 @@ impl Monitor {
 /// `camera.ignore` zones (full-frame normalized) mapped into pixel coordinates of the
 /// ROI-cropped image the model sees: [x1, y1, x2, y2].
 pub fn ignore_zones_in_crop(cfg: &Config, crop_w: u32, crop_h: u32) -> Vec<[f64; 4]> {
-    let roi: &[f64] = cfg.camera.roi.as_deref().filter(|r| r.len() == 4).unwrap_or(&[0.0, 0.0, 1.0, 1.0]);
+    let roi: &[f64] = cfg
+        .camera
+        .roi
+        .as_deref()
+        .filter(|r| r.len() == 4)
+        .unwrap_or(&[0.0, 0.0, 1.0, 1.0]);
     let (rw, rh) = (roi[2] - roi[0], roi[3] - roi[1]);
     if rw <= 0.0 || rh <= 0.0 {
         return vec![];
@@ -1128,13 +1935,21 @@ pub fn ignore_zones_in_crop(cfg: &Config, crop_w: u32, crop_h: u32) -> Vec<[f64;
 pub fn drop_ignored(dets: Vec<Detection>, zones: &[[f64; 4]]) -> (Vec<Detection>, Vec<Detection>) {
     dets.into_iter().partition(|d| {
         let (cx, cy) = (d.bbox[0], d.bbox[1]);
-        !zones.iter().any(|z| cx >= z[0] && cx <= z[2] && cy >= z[1] && cy <= z[3])
+        !zones
+            .iter()
+            .any(|z| cx >= z[0] && cx <= z[2] && cy >= z[1] && cy <= z[3])
     })
 }
 
 fn draw_zones(img: &mut RgbImage, zones: &[[f64; 4]]) {
     for z in zones {
-        draw_rect(img, (z[0] as i64, z[1] as i64), (z[2] as i64, z[3] as i64), Rgb([150, 150, 150]), 1);
+        draw_rect(
+            img,
+            (z[0] as i64, z[1] as i64),
+            (z[2] as i64, z[3] as i64),
+            Rgb([150, 150, 150]),
+            1,
+        );
     }
 }
 

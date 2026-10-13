@@ -5,7 +5,7 @@
 //! processing is ported from obico-server `ml_api/lib/onnx.py` (AGPL-3.0) so the
 //! per-frame confidences match what Obico's tuned decision thresholds expect.
 //!
-//! Model weights: https://tsd-pub-static.s3.amazonaws.com/ml-models/model-weights-5a6b1be1fa.onnx
+//! Model weights: <https://tsd-pub-static.s3.amazonaws.com/ml-models/model-weights-5a6b1be1fa.onnx>
 //! (fetched by `prusa-watch fetch-model`, or automatically on first run).
 
 use std::path::Path;
@@ -37,14 +37,6 @@ pub trait Detect: Send + Sync {
     /// Detections, or an error if inference itself failed (not the same as "nothing seen").
     fn try_detect(&self, image: &RgbImage, thresh: f64, nms: f64) -> Result<Vec<Detection>, String>;
     fn last_inference_ms(&self) -> f64;
-
-    /// Convenience for tools/tests: an inference error is logged and yields no detections.
-    fn detect(&self, image: &RgbImage, thresh: f64, nms: f64) -> Vec<Detection> {
-        self.try_detect(image, thresh, nms).unwrap_or_else(|e| {
-            tracing::error!("Detector: inference failed: {e}");
-            vec![]
-        })
-    }
 }
 
 type Plan = std::sync::Arc<TypedSimplePlan>;
@@ -64,22 +56,72 @@ impl SpaghettiDetector {
             tracing::warn!("use_gpu requested but prusa-watch runs inference on the CPU (tract); ignoring");
         }
         let mut model = tract_onnx::onnx().model_for_path(path)?;
+        anyhow::ensure!(
+            model.input_outlets()?.len() == 1,
+            "detector model must have exactly one image input"
+        );
         // NCHW; Obico's export is static 1x3x416x416. Pin symbolic dims to that.
         let (mut h, mut w) = (416u32, 416u32);
         if let Ok(fact) = model.input_fact(0)
             && let Ok(Some(dims)) = fact.shape.as_concrete_finite()
-            && dims.len() == 4
         {
+            anyhow::ensure!(
+                dims.len() == 4
+                    && dims[0] == 1
+                    && dims[1] == 3
+                    && (1..=8192).contains(&dims[2])
+                    && (1..=8192).contains(&dims[3]),
+                "model input must be 1x3xHxW with dimensions in 1..=8192"
+            );
             h = dims[2] as u32;
             w = dims[3] as u32;
         }
         model.set_input_fact(0, f32::fact([1, 3, h as usize, w as usize]).into())?;
         let plan = model.into_optimized()?.into_runnable()?;
+        anyhow::ensure!(
+            plan.model().output_outlets()?.len() == 2,
+            "detector model must have boxes and confidences outputs"
+        );
+        anyhow::ensure!(
+            plan.model().output_fact(0)?.datum_type == DatumType::F32
+                && plan.model().output_fact(1)?.datum_type == DatumType::F32,
+            "detector outputs must be float32"
+        );
+        let boxes = plan
+            .model()
+            .output_fact(0)?
+            .shape
+            .as_concrete()
+            .ok_or_else(|| anyhow::anyhow!("boxes output shape must be static"))?;
+        let confs = plan
+            .model()
+            .output_fact(1)?
+            .shape
+            .as_concrete()
+            .ok_or_else(|| anyhow::anyhow!("confidences output shape must be static"))?;
+        anyhow::ensure!(
+            boxes.len() == 4
+                && boxes[0] == 1
+                && (1..=100_000).contains(&boxes[1])
+                && boxes[2] == 1
+                && boxes[3] == 4
+                && confs.len() == 3
+                && confs[0] == 1
+                && confs[1] == boxes[1]
+                && confs[2] == 1,
+            "detector outputs must be boxes [1,N,1,4] and confidences [1,N,1]"
+        );
         tracing::info!("Detector: loaded {} ({w}x{h}) tract CPU", path.display());
-        Ok(Self { plan, input_w: w, input_h: h, names: vec!["failure".into()], last_ms: Mutex::new(0.0) })
+        Ok(Self {
+            plan,
+            input_w: w,
+            input_h: h,
+            names: vec!["failure".into()],
+            last_ms: Mutex::new(0.0),
+        })
     }
 
-    /// Raw model outputs (boxes [1,N,1,4], confs [1,N,C]) for an already-resized RGB image.
+    /// Raw model outputs (boxes `[1,N,1,4]`, confs `[1,N,C]`) for an already-resized RGB image.
     pub fn run_raw(&self, resized: &RgbImage) -> anyhow::Result<(Vec<f32>, Vec<f32>, usize)> {
         let (w, h) = resized.dimensions();
         let raw = resized.as_raw();
@@ -88,10 +130,27 @@ impl SpaghettiDetector {
         })
         .into();
         let out = self.plan.run(tvec!(input.into()))?;
+        anyhow::ensure!(out.len() == 2, "detector model must produce two outputs");
         let boxes = out[0].to_plain_array_view::<f32>()?;
         let confs = out[1].to_plain_array_view::<f32>()?;
+        anyhow::ensure!(
+            boxes.ndim() == 4 && boxes.shape()[0] == 1 && boxes.shape()[2..] == [1, 4],
+            "boxes output must be [1,N,1,4]"
+        );
+        anyhow::ensure!(
+            confs.ndim() == 3 && confs.shape()[0] == 1 && confs.shape()[1] == boxes.shape()[1] && confs.shape()[2] == 1,
+            "confidence output must be [1,N,1] matching boxes"
+        );
+        anyhow::ensure!(
+            boxes.iter().all(|v| v.is_finite()) && confs.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+            "detector output contains invalid boxes or confidences"
+        );
         let num_classes = *confs.shape().last().unwrap_or(&1);
-        Ok((boxes.iter().copied().collect(), confs.iter().copied().collect(), num_classes))
+        Ok((
+            boxes.iter().copied().collect(),
+            confs.iter().copied().collect(),
+            num_classes,
+        ))
     }
 }
 
@@ -103,7 +162,16 @@ impl Detect for SpaghettiDetector {
         let result = self.run_raw(&resized);
         *self.last_ms.lock().unwrap() = t0.elapsed().as_secs_f64() * 1000.0;
         let (boxes, confs, nc) = result.map_err(|e| e.to_string())?;
-        Ok(post_process(&boxes, &confs, nc, width, height, thresh, nms, &self.names))
+        Ok(post_process(
+            &boxes,
+            &confs,
+            nc,
+            width,
+            height,
+            thresh,
+            nms,
+            &self.names,
+        ))
     }
 
     fn last_inference_ms(&self) -> f64 {
@@ -204,9 +272,19 @@ pub fn annotate(image: &RgbImage, detections: &[Detection], min_conf: f64, label
         let [xc, yc, w, h] = d.bbox;
         let p1 = ((xc - w / 2.0) as i64, (yc - h / 2.0) as i64);
         let p2 = ((xc + w / 2.0) as i64, (yc + h / 2.0) as i64);
-        let color = if d.confidence >= 0.5 { Rgb([255, 0, 0]) } else { Rgb([255, 165, 0]) };
+        let color = if d.confidence >= 0.5 {
+            Rgb([255, 0, 0])
+        } else {
+            Rgb([255, 165, 0])
+        };
         draw_rect(&mut out, p1, p2, color, 2);
-        draw_text(&mut out, p1.0, (p1.1 - 4).max(12), &format!("{:.2}", d.confidence), color);
+        draw_text(
+            &mut out,
+            p1.0,
+            (p1.1 - 4).max(12),
+            &format!("{:.2}", d.confidence),
+            color,
+        );
     }
     if let Some(label) = label.filter(|l| !l.is_empty()) {
         let w = out.width() as i64;

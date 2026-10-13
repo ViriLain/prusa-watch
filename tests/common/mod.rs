@@ -25,7 +25,8 @@ pub fn fake_model_path() -> String {
 
 pub fn fake_detector() -> Arc<SpaghettiDetector> {
     static DET: OnceLock<Arc<SpaghettiDetector>> = OnceLock::new();
-    DET.get_or_init(|| Arc::new(SpaghettiDetector::load(fake_model_path(), false).unwrap())).clone()
+    DET.get_or_init(|| Arc::new(SpaghettiDetector::load(fake_model_path(), false).unwrap()))
+        .clone()
 }
 
 pub fn solid(v: u8) -> RgbImage {
@@ -63,6 +64,12 @@ pub struct PrinterState {
     /// emulate a pause still in flight: after pause(), report PRINTING for this many polls
     pub pause_lag_polls: usize,
     lag: usize,
+    /// accept stop() but keep printing (a request the printer has not acted on)
+    pub ignore_stop: bool,
+    /// what status() reports instead of the real state, e.g. a state no firmware defines
+    pub report: Option<(String, Option<i64>)>,
+    /// make status() fail with exactly this text (what a transport error would say)
+    pub status_error: Option<String>,
 }
 
 pub struct FakePrinter(pub Mutex<PrinterState>);
@@ -77,6 +84,9 @@ impl FakePrinter {
             fail_pause: false,
             pause_lag_polls: 0,
             lag: 0,
+            ignore_stop: false,
+            report: None,
+            status_error: None,
         })))
     }
     pub fn s(&self) -> std::sync::MutexGuard<'_, PrinterState> {
@@ -96,6 +106,10 @@ impl FakePrinter {
     pub fn calls(&self) -> Vec<(String, i64)> {
         self.s().calls.clone()
     }
+    /// Report `state`/`job_id` from status() regardless of the simulated printer's real state.
+    pub fn report(&self, state: &str, job_id: Option<i64>) {
+        self.s().report = Some((state.into(), job_id));
+    }
     pub fn count(&self, what: &str, job: i64) -> usize {
         self.calls().iter().filter(|(w, j)| w == what && *j == job).count()
     }
@@ -110,12 +124,16 @@ impl Printer for FakePrinter {
                 s.state = "PAUSED".into();
             }
         }
+        if let Some(error) = &s.status_error {
+            return Err(PrusaLinkError(error.clone()));
+        }
         if !s.reachable {
             return Err(PrusaLinkError("GET /api/v1/status: timed out".into()));
         }
+        let (state, job_id) = s.report.clone().unwrap_or_else(|| (s.state.clone(), s.job_id));
         Ok(PrinterStatus {
-            state: s.state.clone(),
-            job_id: s.job_id,
+            state,
+            job_id,
             progress: Some(10.0),
             time_printing: Some(100),
             temp_nozzle: Some(215.0),
@@ -124,13 +142,19 @@ impl Printer for FakePrinter {
         })
     }
     fn job(&self) -> Result<Option<Value>, PrusaLinkError> {
-        Ok(self.s().job_id.map(|id| json!({"id": id, "file": {"display_name": format!("part-{id}.bgcode")}})))
+        Ok(self
+            .s()
+            .job_id
+            .map(|id| json!({"id": id, "file": {"display_name": format!("part-{id}.bgcode")}})))
     }
     fn job_name(&self) -> Option<String> {
         self.s().job_id.map(|id| format!("part-{id}.bgcode"))
     }
     fn pause(&self, job_id: i64) -> Result<(), PrusaLinkError> {
         let mut s = self.s();
+        if s.job_id != Some(job_id) || s.state != "PRINTING" {
+            return Err(PrusaLinkError("pause: wrong job or state".into()));
+        }
         s.calls.push(("pause".into(), job_id));
         if s.fail_pause {
             return Err(PrusaLinkError("PUT pause: HTTP 409".into()));
@@ -144,14 +168,22 @@ impl Printer for FakePrinter {
     }
     fn resume(&self, job_id: i64) -> Result<(), PrusaLinkError> {
         let mut s = self.s();
+        if s.job_id != Some(job_id) || s.state != "PAUSED" {
+            return Err(PrusaLinkError("resume: wrong job or state".into()));
+        }
         s.calls.push(("resume".into(), job_id));
         s.state = "PRINTING".into();
         Ok(())
     }
     fn stop(&self, job_id: i64) -> Result<(), PrusaLinkError> {
         let mut s = self.s();
+        if s.job_id != Some(job_id) || !["PRINTING", "PAUSED", "ATTENTION"].contains(&s.state.as_str()) {
+            return Err(PrusaLinkError("stop: wrong job or state".into()));
+        }
         s.calls.push(("stop".into(), job_id));
-        s.state = "STOPPED".into();
+        if !s.ignore_stop {
+            s.state = "STOPPED".into();
+        }
         Ok(())
     }
 }
@@ -160,6 +192,8 @@ pub struct GrabberState {
     pub image: Option<RgbImage>,
     pub connected: bool,
     pub stale: bool,
+    pub sequence: u64,
+    pub decoded_at: f64,
 }
 
 pub struct FakeGrabber {
@@ -169,13 +203,29 @@ pub struct FakeGrabber {
 
 impl FakeGrabber {
     pub fn new(clock: Clock) -> Arc<Self> {
-        Arc::new(Self { clock, st: Mutex::new(GrabberState { image: Some(solid(0)), connected: true, stale: false }) })
+        let decoded_at = clock.t();
+        Arc::new(Self {
+            clock,
+            st: Mutex::new(GrabberState {
+                image: Some(solid(0)),
+                connected: true,
+                stale: false,
+                sequence: 1,
+                decoded_at,
+            }),
+        })
     }
     pub fn set_image(&self, img: Option<RgbImage>) {
         self.st.lock().unwrap().image = img;
+        self.publish();
     }
     pub fn set_stale(&self, stale: bool) {
         self.st.lock().unwrap().stale = stale;
+    }
+    pub fn publish(&self) {
+        let mut state = self.st.lock().unwrap();
+        state.sequence += 1;
+        state.decoded_at = self.clock.t();
     }
 }
 
@@ -185,7 +235,13 @@ impl FrameSource for FakeGrabber {
     fn latest(&self) -> Option<Frame> {
         let s = self.st.lock().unwrap();
         let img = s.image.clone()?;
-        Some(Frame { image: Arc::new(img), ts: self.clock.t() - if s.stale { 120.0 } else { 0.1 } })
+        let ts = s.decoded_at - if s.stale { 120.0 } else { 0.0 };
+        Some(Frame {
+            sequence: s.sequence,
+            image: Arc::new(img),
+            ts,
+            monotonic_ts: ts,
+        })
     }
     fn connected(&self) -> bool {
         self.st.lock().unwrap().connected
@@ -256,7 +312,12 @@ pub fn rig_with(tweak: impl FnOnce(&mut Config)) -> Rig {
     let printer = FakePrinter::new();
     let grabber = FakeGrabber::new(clock.clone());
     let transport = Arc::new(RecordingTransport::default());
-    let mut notifier = Notifier::with_transport(cfg.notify.clone(), &cfg.web.public_url, &cfg.web.token, transport.clone());
+    let mut notifier = Notifier::with_transport(
+        cfg.notify.clone(),
+        &cfg.web.public_url,
+        &cfg.web.token,
+        transport.clone(),
+    );
     notifier.blocking = true;
     let mon = Monitor::new(
         cfg,
@@ -266,10 +327,18 @@ pub fn rig_with(tweak: impl FnOnce(&mut Config)) -> Rig {
             detector: Some(fake_detector()),
             notifier: Some(Arc::new(notifier)),
             clock: Some(clock.as_fn()),
+            ..Default::default()
         },
     )
     .unwrap();
-    Rig { mon, printer, grabber, clock, transport, dir }
+    Rig {
+        mon,
+        printer,
+        grabber,
+        clock,
+        transport,
+        dir,
+    }
 }
 
 impl Rig {
@@ -279,14 +348,19 @@ impl Rig {
     pub fn advance_by(&self, n: usize, step: f64) {
         for _ in 0..n {
             self.clock.add(step);
+            self.grabber.publish();
             self.mon.tick();
+            let _ = self.mon.flush_storage(); // write faults are asserted through monitor telemetry
         }
     }
     pub fn sent(&self) -> Vec<HttpRequest> {
         self.transport.requests()
     }
     pub fn ntfy(&self) -> Vec<HttpRequest> {
-        self.sent().into_iter().filter(|r| r.url.contains("ntfy.example")).collect()
+        self.sent()
+            .into_iter()
+            .filter(|r| r.url.contains("ntfy.example"))
+            .collect()
     }
     pub fn hooks(&self) -> Vec<Value> {
         self.sent()
@@ -299,10 +373,16 @@ impl Rig {
             .collect()
     }
     pub fn with_priority(&self, p: &str) -> Vec<HttpRequest> {
-        self.sent().into_iter().filter(|r| r.get_header("Priority") == Some(p)).collect()
+        self.sent()
+            .into_iter()
+            .filter(|r| r.get_header("Priority") == Some(p))
+            .collect()
     }
     pub fn titles(&self) -> Vec<String> {
-        self.sent().iter().filter_map(|r| r.get_header("Title").map(str::to_string)).collect()
+        self.sent()
+            .iter()
+            .filter_map(|r| r.get_header("Title").map(str::to_string))
+            .collect()
     }
     pub fn state_dir(&self) -> std::path::PathBuf {
         std::path::PathBuf::from(&self.mon.cfg.state_dir)

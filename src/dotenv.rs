@@ -37,35 +37,8 @@ pub fn parse_dotenv(text: &str) -> BTreeMap<String, String> {
     out
 }
 
-/// Environment access, abstracted so tests don't touch the process environment.
-pub trait EnvStore {
-    fn contains(&self, key: &str) -> bool;
-    fn set(&mut self, key: &str, value: &str);
-}
-
-pub struct ProcessEnv;
-
-impl EnvStore for ProcessEnv {
-    fn contains(&self, key: &str) -> bool {
-        std::env::var_os(key).is_some()
-    }
-    fn set(&mut self, key: &str, value: &str) {
-        // SAFETY: called at startup before any other threads exist.
-        unsafe { std::env::set_var(key, value) }
-    }
-}
-
-impl EnvStore for BTreeMap<String, String> {
-    fn contains(&self, key: &str) -> bool {
-        self.contains_key(key)
-    }
-    fn set(&mut self, key: &str, value: &str) {
-        self.insert(key.to_string(), value.to_string());
-    }
-}
-
 /// Load each existing file in `paths` (first file wins per key). Returns the files loaded.
-pub fn load_dotenv(paths: &[PathBuf], env: &mut dyn EnvStore) -> Vec<PathBuf> {
+pub fn load_dotenv(paths: &[PathBuf], env: &mut BTreeMap<String, String>) -> Vec<PathBuf> {
     let mut loaded = Vec::new();
     let mut seen = HashSet::new();
     for p in paths {
@@ -73,10 +46,12 @@ pub fn load_dotenv(paths: &[PathBuf], env: &mut dyn EnvStore) -> Vec<PathBuf> {
         if !seen.insert(path.clone()) || !path.is_file() {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         for (k, v) in parse_dotenv(&text) {
-            if !v.is_empty() && !env.contains(&k) {
-                env.set(&k, &v);
+            if !v.is_empty() && !env.contains_key(&k) {
+                env.insert(k, v);
             }
         }
         loaded.push(path);
@@ -85,6 +60,12 @@ pub fn load_dotenv(paths: &[PathBuf], env: &mut dyn EnvStore) -> Vec<PathBuf> {
 }
 
 pub fn default_candidates(config_path: &Path) -> Vec<PathBuf> {
-    let dir = std::path::absolute(config_path).ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
-    vec![dir.join(".env"), std::env::current_dir().unwrap_or_default().join(".env")]
+    let dir = std::path::absolute(config_path)
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_default();
+    vec![
+        dir.join(".env"),
+        std::env::current_dir().unwrap_or_default().join(".env"),
+    ]
 }

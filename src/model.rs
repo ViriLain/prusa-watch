@@ -1,7 +1,7 @@
 //! Download Obico's open-source failure-detection model (ONNX).
 //!
 //! Source of truth for the URL: obico-server ml_api/model/model-weights.onnx.url
-//! (AGPL-3.0, https://github.com/TheSpaghettiDetective/obico-server).
+//! (AGPL-3.0, <https://github.com/TheSpaghettiDetective/obico-server>).
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -10,12 +10,39 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 
 pub const DEFAULT_URL: &str = "https://tsd-pub-static.s3.amazonaws.com/ml-models/model-weights-5a6b1be1fa.onnx";
+pub const DEFAULT_SHA256: &str = "0a6ebd8e30dbf6a450c50f9c0a5406f04ba7eb1c99fd5996e888c78bb383b9aa";
 /// the real model is ~200 MB; anything tiny is an error page
 pub const MIN_BYTES: u64 = 1_000_000;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct ModelDownloadError(pub String);
+
+pub fn verify_digest(path: &Path, expected: &str) -> Result<(), ModelDownloadError> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let mut file = std::fs::File::open(path).map_err(|error| ModelDownloadError(error.to_string()))?;
+    let mut digest = Sha256::new();
+    let mut buf = [0_u8; 65536];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|error| ModelDownloadError(error.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buf[..n]);
+    }
+    let actual = hex::encode(digest.finalize());
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(ModelDownloadError(format!(
+            "model SHA-256 mismatch: expected {expected}, got {actual}"
+        )))
+    }
+}
 
 /// Something that yields the model bytes (HTTP in production, canned data in tests).
 pub trait Fetch {
@@ -29,14 +56,18 @@ impl Fetch for HttpFetch {
     fn get(&self, url: &str) -> Result<(Box<dyn Read>, Option<u64>), String> {
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(60))
-            // blocking client: per read/write operation, not the whole download
+            // Total deadline for the download, including body reads.
             .timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| e.to_string())?;
         let resp = client.get(url).send().map_err(|e| crate::http::describe(&e))?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or("")));
+            return Err(format!(
+                "{} {}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("")
+            ));
         }
         let len = resp.content_length();
         Ok((Box::new(resp), len))
@@ -53,6 +84,13 @@ pub fn download_model(
     verify_onnx: bool,
 ) -> Result<PathBuf, ModelDownloadError> {
     if out.exists() && !force {
+        if verify_onnx {
+            if url == DEFAULT_URL {
+                verify_digest(out, DEFAULT_SHA256).map_err(|error| ModelDownloadError(error.to_string()))?;
+            }
+            crate::detector::SpaghettiDetector::load(out, false)
+                .map_err(|error| ModelDownloadError(error.to_string()))?;
+        }
         return Ok(out.to_path_buf());
     }
     if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -66,7 +104,9 @@ pub fn download_model(
         let _ = std::fs::remove_file(tmp);
         ModelDownloadError(msg)
     };
-    let (mut reader, total) = fetch.get(url).map_err(|e| fail(&tmp, format!("model download failed: {e}")))?;
+    let (mut reader, total) = fetch
+        .get(url)
+        .map_err(|e| fail(&tmp, format!("model download failed: {e}")))?;
     let mut file = std::fs::File::create(&tmp).map_err(|e| fail(&tmp, format!("model download failed: {e}")))?;
     let mut hasher = Sha256::new();
     let mut done: u64 = 0;
@@ -82,7 +122,8 @@ pub fn download_model(
                 return Err(fail(&tmp, format!("model download failed: {e}")));
             }
         };
-        file.write_all(&buf[..n]).map_err(|e| fail(&tmp, format!("model download failed: {e}")))?;
+        file.write_all(&buf[..n])
+            .map_err(|e| fail(&tmp, format!("model download failed: {e}")))?;
         hasher.update(&buf[..n]);
         done += n as u64;
         if progress && let Some(t) = total.filter(|t| *t > 0) {
@@ -94,12 +135,26 @@ pub fn download_model(
     }
     drop(file);
     if done < MIN_BYTES {
-        return Err(fail(&tmp, format!("model download looks wrong ({done} bytes); aborting")));
+        return Err(fail(
+            &tmp,
+            format!("model download looks wrong ({done} bytes); aborting"),
+        ));
     }
     if verify_onnx && let Err(e) = crate::detector::SpaghettiDetector::load(&tmp, false) {
         return Err(fail(&tmp, format!("downloaded file is not a loadable ONNX model: {e}")));
     }
+    if verify_onnx
+        && url == DEFAULT_URL
+        && let Err(error) = verify_digest(&tmp, DEFAULT_SHA256)
+    {
+        return Err(fail(&tmp, error.to_string()));
+    }
     std::fs::rename(&tmp, out).map_err(|e| fail(&tmp, format!("model download failed: {e}")))?;
-    eprintln!("Saved {} ({:.1} MB, sha256={})", out.display(), done as f64 / 1e6, hex::encode(hasher.finalize()));
+    eprintln!(
+        "Saved {} ({:.1} MB, sha256={})",
+        out.display(),
+        done as f64 / 1e6,
+        hex::encode(hasher.finalize())
+    );
     Ok(out.to_path_buf())
 }

@@ -18,7 +18,9 @@ fn distinct(v: &[Verdict]) -> BTreeSet<&'static str> {
 }
 
 fn index(v: &[Verdict], x: Verdict) -> usize {
-    v.iter().position(|y| *y == x).unwrap_or_else(|| panic!("{x:?} not in verdicts"))
+    v.iter()
+        .position(|y| *y == x)
+        .unwrap_or_else(|| panic!("{x:?} not in verdicts"))
 }
 
 fn cfg_with(f: impl FnOnce(&mut DecisionConfig)) -> DecisionConfig {
@@ -130,7 +132,13 @@ fn matches_obico_reference_math() {
 #[test]
 fn fresh_install_catches_spaghetti_from_first_layer() {
     let seq = rep(2.5, 40);
-    assert!(!run(&mut FailureDecider::new(cfg_with(|c| c.baseline_prior_frames = 0), None), &seq).contains(&Verdict::Failure));
+    assert!(
+        !run(
+            &mut FailureDecider::new(cfg_with(|c| c.baseline_prior_frames = 0), None),
+            &seq
+        )
+        .contains(&Verdict::Failure)
+    );
     assert!(run(&mut FailureDecider::new(DecisionConfig::default(), None), &seq).contains(&Verdict::Failure));
 }
 

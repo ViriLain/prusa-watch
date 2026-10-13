@@ -72,20 +72,17 @@ fn grabber_survives_bad_url() {
 #[test]
 fn crop_roi() {
     let img = RgbImage::new(200, 100);
-    assert_eq!(prusa_watch::imaging::crop_roi(&img, Some(&[0.25, 0.1, 0.75, 0.9])).dimensions(), (100, 80));
+    assert_eq!(
+        prusa_watch::imaging::crop_roi(&img, Some(&[0.25, 0.1, 0.75, 0.9])).dimensions(),
+        (100, 80)
+    );
     // Python asserts identity (`is img`); Rust returns an owned copy, so compare by value.
     assert_eq!(prusa_watch::imaging::crop_roi(&img, None), img);
 }
 
 #[test]
 fn config_env_expansion_and_validation() {
-    // SAFETY: std serializes its own env access; the only other env readers in
-    // this binary are std::process::Command spawns, which take the same lock.
-    unsafe {
-        std::env::set_var("PL_PASS", "hunter2");
-        std::env::set_var("SENS", "1.3");
-        std::env::remove_var("NTFY_TOPIC"); // so the ${NTFY_TOPIC:-default-topic} fallback applies
-    }
+    let env = [("PL_PASS".into(), "hunter2".into()), ("SENS".into(), "1.3".into())].into();
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path().join("c.yaml");
     std::fs::write(
@@ -98,7 +95,7 @@ notify: {ntfy: {topic: "${NTFY_TOPIC:-default-topic}"}}
 "#,
     )
     .unwrap();
-    let cfg = load_config(Some(&p), &BTreeMap::new()).unwrap();
+    let cfg = load_config(Some(&p), &env).unwrap();
     cfg.validate().unwrap();
     assert_eq!(cfg.printer.password, "hunter2");
     assert_eq!(cfg.decision.sensitivity, 1.3);
@@ -117,6 +114,10 @@ fn config_rejects_unknown_keys_and_bad_values() {
         "printer: {host: x, password: y}\ncamera: {url: rtsp://a/live}\nescalation: {policies: {p: {steps: [{action: explode}]}}}\n",
     )
     .unwrap();
-    let e = load_config(Some(&p), &BTreeMap::new()).unwrap().validate().unwrap_err().to_string();
+    let e = load_config(Some(&p), &BTreeMap::new())
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("action must be one of"), "{e}");
 }

@@ -42,7 +42,9 @@ impl ScheduleRule {
     }
 
     fn day_ok(&self, dt: NaiveDateTime) -> bool {
-        self.days.as_ref().is_none_or(|d| d.contains(&dt.weekday().num_days_from_monday()))
+        self.days
+            .as_ref()
+            .is_none_or(|d| d.contains(&dt.weekday().num_days_from_monday()))
     }
 }
 
@@ -93,8 +95,11 @@ pub fn parse_schedules(raw: Option<&Value>, policies: &BTreeSet<String>) -> Resu
         let Some(m) = item.as_mapping() else {
             return Err(ScheduleError(format!("{where_}: must be a mapping")));
         };
-        let mut unknown: Vec<String> =
-            m.keys().map(scalar_str).filter(|k| !["name", "start", "end", "days", "policy"].contains(&k.as_str())).collect();
+        let mut unknown: Vec<String> = m
+            .keys()
+            .map(scalar_str)
+            .filter(|k| !["name", "start", "end", "days", "policy"].contains(&k.as_str()))
+            .collect();
         if !unknown.is_empty() {
             unknown.sort();
             return Err(ScheduleError(format!(
@@ -162,7 +167,14 @@ fn is_truthy(v: &Value) -> bool {
 }
 
 pub(crate) fn py_list<S: AsRef<str>>(items: &[S]) -> String {
-    format!("[{}]", items.iter().map(|s| format!("'{}'", s.as_ref())).collect::<Vec<_>>().join(", "))
+    format!(
+        "[{}]",
+        items
+            .iter()
+            .map(|s| format!("'{}'", s.as_ref()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// Empty name = system local time.
@@ -170,7 +182,9 @@ pub fn resolve_tz(name: &str) -> Result<Option<Tz>, ScheduleError> {
     if name.is_empty() {
         return Ok(None);
     }
-    name.parse::<Tz>().map(Some).map_err(|_| ScheduleError(format!("timezone: unknown IANA zone '{name}'")))
+    name.parse::<Tz>()
+        .map(Some)
+        .map_err(|_| ScheduleError(format!("timezone: unknown IANA zone '{name}'")))
 }
 
 /// Wall-clock time at unix timestamp `ts` in `tz` (or system local time).
@@ -182,6 +196,10 @@ pub fn local_now(ts: f64, tz: Option<Tz>) -> NaiveDateTime {
             let utc = DateTime::from_timestamp(secs, nanos).unwrap_or_default();
             utc.with_timezone(&tz).naive_local()
         }
-        None => Local.timestamp_opt(secs, nanos).single().map(|d| d.naive_local()).unwrap_or_default(),
+        None => Local
+            .timestamp_opt(secs, nanos)
+            .single()
+            .map(|d| d.naive_local())
+            .unwrap_or_default(),
     }
 }

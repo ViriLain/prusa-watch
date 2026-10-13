@@ -55,7 +55,10 @@ fn load_dotenv_shell_wins_empty_skipped_first_file_wins() {
     std::fs::write(&a, "ONE=from-a\nTWO=from-a\nEMPTY=\n").unwrap();
     std::fs::write(&b, "TWO=from-b\nTHREE=from-b\n").unwrap();
     let mut env: BTreeMap<String, String> = [("ONE".to_string(), "from-shell".to_string())].into();
-    let loaded = load_dotenv(&[a.clone(), b.clone(), tmp.path().join("missing.env"), a.clone()], &mut env);
+    let loaded = load_dotenv(
+        &[a.clone(), b.clone(), tmp.path().join("missing.env"), a.clone()],
+        &mut env,
+    );
     assert_eq!(loaded, vec![a.canonicalize().unwrap(), b.canonicalize().unwrap()]);
     let expected: BTreeMap<String, String> = [("ONE", "from-shell"), ("TWO", "from-a"), ("THREE", "from-b")]
         .into_iter()
@@ -85,7 +88,12 @@ impl Fetch for Boom {
 
 fn part_files(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir)
-        .map(|rd| rd.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "part")).collect())
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "part"))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -103,7 +111,10 @@ fn serve_once(status: u16, reason: &'static str, body: &'static [u8]) -> String 
                     Ok(n) => req.extend_from_slice(&buf[..n]),
                 }
             }
-            let head = format!("HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let head = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
             let _ = s.write_all(head.as_bytes());
             let _ = s.write_all(body);
         }
@@ -121,17 +132,20 @@ fn download_model_writes_atomically() {
 }
 
 #[test]
-fn download_model_noop_when_present() {
+fn download_model_validates_existing_files_when_requested() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("m.onnx");
     std::fs::write(&out, b"existing").unwrap();
-    download_model(&out, DEFAULT_URL, false, &Boom, false, true).unwrap();
+    let error = download_model(&out, DEFAULT_URL, false, &Boom, false, true).unwrap_err();
+    assert!(error.to_string().contains("SHA-256 mismatch"));
+    download_model(&out, DEFAULT_URL, false, &Boom, false, false).unwrap();
     assert_eq!(std::fs::read(&out).unwrap(), b"existing");
 }
 
 #[test]
 fn download_model_rejects_bad_responses() {
-    let cases: [(&'static [u8], u16, &'static str); 2] = [(b"<html>nope</html>", 200, "OK"), (b"denied", 403, "Forbidden")];
+    let cases: [(&'static [u8], u16, &'static str); 2] =
+        [(b"<html>nope</html>", 200, "OK"), (b"denied", 403, "Forbidden")];
     for (body, status, reason) in cases {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("m.onnx");
@@ -139,7 +153,11 @@ fn download_model_rejects_bad_responses() {
         let res: Result<PathBuf, ModelDownloadError> = download_model(&out, &url, false, &HttpFetch, false, false);
         let e = res.expect_err("expected ModelDownloadError").to_string();
         // 200 + tiny body -> size check; 403 -> HTTP status error (not a proxy/connect error)
-        let why = if status == 200 { "looks wrong".to_string() } else { format!("model download failed: {status}") };
+        let why = if status == 200 {
+            "looks wrong".to_string()
+        } else {
+            format!("model download failed: {status}")
+        };
         assert!(e.contains(&why), "status {status}: {e}");
         assert!(!out.exists(), "status {status}");
         assert!(part_files(tmp.path()).is_empty(), "status {status}");
@@ -180,7 +198,14 @@ fn no_network(c: &mut Command) -> &mut Command {
     for k in ["NO_PROXY", "no_proxy"] {
         c.env_remove(k);
     }
-    for k in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+    for k in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
         c.env(k, &dead);
     }
     c
@@ -204,7 +229,11 @@ fn env_file_next_to_config_feeds_config() {
     )
     .unwrap();
     std::fs::write(tmp.path().join(".env"), "PW_TEST_PASSWORD=s3cret\n").unwrap();
-    let out = run(cli(work.path()).arg("config").arg("-c").arg(tmp.path().join("config.yaml")).arg("--show-secrets"));
+    let out = run(cli(work.path())
+        .arg("config")
+        .arg("-c")
+        .arg(tmp.path().join("config.yaml"))
+        .arg("--show-secrets"));
     let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
     assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
     assert!(stdout.contains("password: s3cret"), "{stdout}");
@@ -227,7 +256,11 @@ fn shell_env_overrides_env_file() {
         .arg("-c")
         .arg(tmp.path().join("config.yaml"))
         .arg("--show-secrets"));
-    assert!(text(&out.stdout).contains("password: from-shell"), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stdout).contains("password: from-shell"),
+        "{}",
+        text(&out.stdout)
+    );
 }
 
 #[test]
@@ -235,7 +268,11 @@ fn missing_config_gives_a_hint() {
     let tmp = tempfile::tempdir().unwrap();
     let out = run(cli(tmp.path()).arg("check").arg("-c").arg(tmp.path().join("nope.yaml")));
     assert_eq!(out.status.code(), Some(2));
-    assert!(text(&out.stderr).contains("cp config.example.yaml"), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("cp config.example.yaml"),
+        "{}",
+        text(&out.stderr)
+    );
 }
 
 #[test]
@@ -257,19 +294,27 @@ fn fetch_model_uses_configured_path() {
     let out = fetch(false);
     let err = text(&out.stderr);
     assert!(err.contains("Downloading model from"), "{err}");
-    assert!(target.parent().unwrap().is_dir(), "download should target {}", target.display());
+    assert!(
+        target.parent().unwrap().is_dir(),
+        "download should target {}",
+        target.display()
+    );
     assert!(!target.exists() && part_files(target.parent().unwrap()).is_empty());
 
     // present -> no download unless --force
     std::fs::write(&target, b"m").unwrap();
     let out = fetch(false);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", text(&out.stderr));
-    assert!(!text(&out.stderr).contains("Downloading model"), "{}", text(&out.stderr));
-    assert!(text(&out.stdout).contains(&target.display().to_string()), "{}", text(&out.stdout));
+    assert!(!out.status.success(), "a corrupt existing model must be rejected");
+    assert!(text(&out.stderr).contains("SHA-256 mismatch"), "{}", text(&out.stderr));
+    assert!(!text(&out.stderr).contains("Downloading model"));
 
     // --force -> re-download attempted even though the file exists (and a failed one keeps it)
     let out = fetch(true);
-    assert!(text(&out.stderr).contains("Downloading model from"), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("Downloading model from"),
+        "{}",
+        text(&out.stderr)
+    );
     assert_eq!(std::fs::read(&target).unwrap(), b"m");
 }
 
@@ -278,9 +323,17 @@ fn ensure_model_reports_failure() {
     // `_ensure_model` is private to the binary; `fetch-model` is its thinnest caller.
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.yaml");
-    std::fs::write(&config, format!("detector: {{model_path: '{}'}}\n", tmp.path().join("m.onnx").display())).unwrap();
+    std::fs::write(
+        &config,
+        format!("detector: {{model_path: '{}'}}\n", tmp.path().join("m.onnx").display()),
+    )
+    .unwrap();
     let mut c = cli(tmp.path());
     let out = run(no_network(&mut c).arg("fetch-model").arg("-c").arg(&config));
     assert_eq!(out.status.code(), Some(1));
-    assert!(text(&out.stderr).contains("prusa-watch fetch-model"), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("prusa-watch fetch-model"),
+        "{}",
+        text(&out.stderr)
+    );
 }

@@ -1,0 +1,9 @@
+{
+  "model_sha256": "0a6ebd8e30dbf6a450c50f9c0a5406f04ba7eb1c99fd5996e888c78bb383b9aa",
+  "opencv": "5.0.0",
+  "numpy": "2.5.3",
+  "onnxruntime": "1.30.0",
+  "resize": "INTER_LINEAR_EXACT",
+  "threshold": 0.08,
+  "nms": 0.45
+}

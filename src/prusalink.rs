@@ -36,7 +36,38 @@ pub struct PrinterStatus {
     pub raw: Value,
 }
 
+/// Every printer state PrusaLink v1 defines (spec/openapi.yaml, `StatusPrinter.state`).
+pub const STATES: [&str; 9] = [
+    "IDLE",
+    "BUSY",
+    "PRINTING",
+    "PAUSED",
+    "FINISHED",
+    "STOPPED",
+    "ERROR",
+    "ATTENTION",
+    "READY",
+];
+
 impl PrinterStatus {
+    /// Reject a report whose state is not one PrusaLink defines. Callers decide whether a
+    /// print is running, paused or over from this state, so a value nobody can interpret
+    /// is treated like an unreadable response rather than as "not printing".
+    pub fn validated(self) -> Result<Self, PrusaLinkError> {
+        if STATES.contains(&self.state.as_str()) {
+            return Ok(self);
+        }
+        let shown: String = self
+            .state
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .take(24)
+            .collect();
+        Err(PrusaLinkError(format!(
+            "GET /api/v1/status: unrecognized printer state '{shown}'"
+        )))
+    }
+
     pub fn new(state: &str, job_id: Option<i64>) -> Self {
         Self {
             state: state.into(),
@@ -91,7 +122,15 @@ pub struct PrusaLink {
 
 impl PrusaLink {
     pub fn new(host: &str, password: &str, username: &str, auth: &str, scheme: &str, timeout_s: f64) -> Self {
-        Self::with_transport(host, password, username, auth, scheme, timeout_s, Arc::new(ReqwestTransport::new()))
+        Self::with_transport(
+            host,
+            password,
+            username,
+            auth,
+            scheme,
+            timeout_s,
+            Arc::new(ReqwestTransport::new()),
+        )
     }
 
     pub fn with_transport(
@@ -134,8 +173,14 @@ impl PrusaLink {
         let md5 = |s: String| hex::encode(Md5::digest(s.as_bytes()));
         let ha1 = md5(format!("{}:{}:{}", self.username, ch.realm, self.password));
         let ha2 = md5(format!("{method}:{uri}"));
-        let mut h = format!(r#"Digest username="{}", realm="{}", nonce="{}", uri="{}""#, self.username, ch.realm, ch.nonce, uri);
-        let qop_auth = ch.qop.as_deref().is_some_and(|q| q.split(',').any(|x| x.trim() == "auth"));
+        let mut h = format!(
+            r#"Digest username="{}", realm="{}", nonce="{}", uri="{}""#,
+            self.username, ch.realm, ch.nonce, uri
+        );
+        let qop_auth = ch
+            .qop
+            .as_deref()
+            .is_some_and(|q| q.split(',').any(|x| x.trim() == "auth"));
         if qop_auth {
             ch.nc += 1;
             let nc = format!("{:08x}", ch.nc);
@@ -156,7 +201,8 @@ impl PrusaLink {
     }
 
     fn request(&self, method: &str, path: &str) -> Result<HttpResponse, PrusaLinkError> {
-        let wrap = |e: String| PrusaLinkError(format!("{method} {path}: {e}"));
+        // A transport error names the full URL, which may embed credentials (printer.host).
+        let wrap = |e: String| PrusaLinkError(format!("{method} {path}: {}", crate::redact::text(&e)));
         let mut resp;
         if self.apikey {
             resp = self.send(method, path, None).map_err(wrap)?;
@@ -183,11 +229,17 @@ impl PrusaLink {
             }
         }
         if resp.status == 401 {
-            return Err(PrusaLinkError(format!("{method} {path}: 401 Unauthorized (check printer.password / printer.auth)")));
+            return Err(PrusaLinkError(format!(
+                "{method} {path}: 401 Unauthorized (check printer.password / printer.auth)"
+            )));
         }
         if resp.status >= 400 {
             let text: String = resp.text().chars().take(200).collect();
-            return Err(PrusaLinkError(format!("{method} {path}: HTTP {} {text}", resp.status)));
+            return Err(PrusaLinkError(format!(
+                "{method} {path}: HTTP {} {}",
+                resp.status,
+                crate::redact::text(&text)
+            )));
         }
         Ok(resp)
     }
@@ -198,7 +250,10 @@ impl PrusaLink {
 }
 
 fn parse_challenge(h: &str) -> Option<Challenge> {
-    let rest = h.trim().strip_prefix("Digest").or_else(|| h.trim().strip_prefix("digest"))?;
+    let rest = h
+        .trim()
+        .strip_prefix("Digest")
+        .or_else(|| h.trim().strip_prefix("digest"))?;
     let mut params = std::collections::HashMap::new();
     let mut chars = rest.trim().chars().peekable();
     loop {
@@ -215,7 +270,10 @@ fn parse_challenge(h: &str) -> Option<Challenge> {
             chars.next();
             v
         } else {
-            std::iter::from_fn(|| chars.next_if(|c| *c != ',')).collect::<String>().trim().to_string()
+            std::iter::from_fn(|| chars.next_if(|c| *c != ','))
+                .collect::<String>()
+                .trim()
+                .to_string()
         };
         params.insert(key.trim().to_lowercase(), val);
     }
@@ -233,26 +291,48 @@ fn f64_of(v: &Value) -> Option<f64> {
     v.as_f64()
 }
 
+/// Strict reading of a `/api/v1/status` body. The spec requires `printer` and its
+/// `state`; `job` is optional. Anything else is an error, never a guessed state.
+pub fn parse_status(data: Value) -> Result<PrinterStatus, PrusaLinkError> {
+    let bad = |what: &str| PrusaLinkError(format!("GET /api/v1/status: malformed response ({what})"));
+    let printer = data
+        .get("printer")
+        .and_then(Value::as_object)
+        .ok_or_else(|| bad("no printer object"))?;
+    let state = match printer.get("state") {
+        Some(Value::String(s)) => s.trim().to_uppercase(),
+        _ => return Err(bad("printer.state is missing or not text")),
+    };
+    let job = match data.get("job") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(job)) => Some(job),
+        Some(_) => return Err(bad("job is not an object")),
+    };
+    let job_id = match job.and_then(|job| job.get("id")) {
+        None | Some(Value::Null) => None,
+        Some(id) => Some(
+            id.as_i64()
+                .filter(|id| *id >= 0)
+                .ok_or_else(|| bad("job.id is not a whole number"))?,
+        ),
+    };
+    let job_field = |name: &str| job.and_then(|job| job.get(name));
+    PrinterStatus {
+        state,
+        job_id,
+        progress: job_field("progress").and_then(f64_of),
+        time_printing: job_field("time_printing").and_then(Value::as_i64),
+        temp_nozzle: printer.get("temp_nozzle").and_then(f64_of),
+        temp_bed: printer.get("temp_bed").and_then(f64_of),
+        raw: data.clone(),
+    }
+    .validated()
+}
+
 impl Printer for PrusaLink {
     fn status(&self) -> Result<PrinterStatus, PrusaLinkError> {
         let r = self.request("GET", "/api/v1/status")?;
-        let data = self.json(&r, "GET /api/v1/status")?;
-        let printer = data.get("printer").filter(|v| v.is_object()).cloned().unwrap_or_default();
-        let job = data.get("job").filter(|v| v.is_object()).cloned().unwrap_or_default();
-        let state = match printer.get("state") {
-            Some(Value::String(s)) => s.to_uppercase(),
-            Some(Value::Null) | None => "UNKNOWN".into(),
-            Some(other) => other.to_string().to_uppercase(),
-        };
-        Ok(PrinterStatus {
-            state,
-            job_id: job.get("id").and_then(Value::as_i64),
-            progress: job.get("progress").and_then(f64_of),
-            time_printing: job.get("time_printing").and_then(Value::as_i64),
-            temp_nozzle: printer.get("temp_nozzle").and_then(f64_of),
-            temp_bed: printer.get("temp_bed").and_then(f64_of),
-            raw: data,
-        })
+        parse_status(self.json(&r, "GET /api/v1/status")?)
     }
 
     fn job(&self) -> Result<Option<Value>, PrusaLinkError> {
@@ -304,7 +384,9 @@ pub fn digest_expected(
 /// Parse an `Authorization: Digest ...` header into its parameters.
 pub fn parse_authorization(h: &str) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
-    let Some(rest) = h.trim().strip_prefix("Digest") else { return out };
+    let Some(rest) = h.trim().strip_prefix("Digest") else {
+        return out;
+    };
     for part in split_params(rest) {
         if let Some((k, v)) = part.split_once('=') {
             out.insert(k.trim().to_lowercase(), v.trim().trim_matches('"').to_string());
