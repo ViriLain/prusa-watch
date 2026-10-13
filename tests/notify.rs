@@ -120,7 +120,13 @@ fn webhook_json_and_ntfy_token_and_buttons() {
     };
     assert_eq!(body["kind"], "failure");
     assert_eq!(body["has_image"], true);
-    assert!(body["image_url"].as_str().unwrap().ends_with("/frame.jpg"));
+    // the frame link works without the dashboard token, and only for the frame
+    assert!(
+        body["image_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://watch.lan:8484/frame.jpg?expires=")
+    );
     assert!(
         body["command_urls"]["veto"]
             .as_str()
@@ -147,19 +153,36 @@ fn reply_topic_buttons() {
     let mut cfg = NotifyConfig::default();
     cfg.ntfy.topic = "t".into();
     cfg.ntfy.reply_topic = "r".into();
+    cfg.ntfy.token = "tk_synthetic_service_token".into();
     let n = Notifier::new(cfg, "", "");
     let mut e = ev();
     e.buttons = vec!["keep".into(), "act".into(), "stop".into()];
     e.incident_id = Some("i1".into());
     e.next_action = Some("stop".into());
-    assert_eq!(
-        n.ntfy_actions(&e),
-        vec![
-            "http, Keep printing, https://ntfy.sh/r, method=POST, body=veto i1, clear=true",
-            "http, Stop now, https://ntfy.sh/r, method=POST, body=act i1, clear=true",
-            "http, Cancel print, https://ntfy.sh/r, method=POST, body=stop i1, clear=true",
-        ]
-    );
+    let actions = n.ntfy_actions(&e);
+    assert_eq!(actions.len(), 3);
+    let now = prusa_watch::now_ts();
+    for (action, (label, command)) in
+        actions
+            .iter()
+            .zip([("Keep printing", "veto"), ("Stop now", "act"), ("Cancel print", "stop")])
+    {
+        // http, <label>, <reply topic url>, method=POST, body=<cmd> <incident> <expires> <signature>, clear=true
+        let prefix = format!("http, {label}, https://ntfy.sh/r, method=POST, body={command} i1 ");
+        let rest = action.strip_prefix(&prefix).unwrap_or_else(|| panic!("{action}"));
+        let (grant, tail) = rest.split_once(", ").unwrap();
+        assert_eq!(tail, "clear=true", "{action}");
+        let (expires, signature) = grant.split_once(' ').unwrap();
+        assert!(
+            n.signer.verify(command, "i1", expires.parse().unwrap(), signature, now),
+            "{action}"
+        );
+        // the server credential is never handed to the devices that receive the alert
+        assert!(
+            !action.contains("tk_synthetic_service_token") && !action.to_lowercase().contains("authorization"),
+            "{action}"
+        );
+    }
     let mut e2 = ev();
     e2.buttons = vec!["keep".into()];
     assert!(n.ntfy_actions(&e2).is_empty()); // no incident id -> no reply buttons

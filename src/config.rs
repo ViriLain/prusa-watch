@@ -176,9 +176,11 @@ impl Default for DecisionConfig {
 pub struct NtfyConfig {
     pub url: String,
     pub topic: String,
-    /// optional bearer token for protected/self-hosted topics
+    /// Optional bearer token prusa-watch itself uses to publish alerts and to read the reply
+    /// topic. It is never put into a notification, so buttons post to `reply_topic` without it.
     pub token: String,
-    /// Topic prusa-watch SUBSCRIBES to for button replies.
+    /// Topic prusa-watch SUBSCRIBES to for button replies. Must accept anonymous publishes;
+    /// a reply only counts if it carries a valid signed permission.
     pub reply_topic: String,
     /// backoff when the reply stream drops
     pub reply_reconnect_s: f64,
@@ -251,6 +253,9 @@ pub struct NotifyConfig {
     pub health: EventNotifyConfig,
     /// per-request timeout for notification HTTP calls
     pub timeout_s: f64,
+    /// How long the buttons and links of one notification stay usable. Each carries a
+    /// signed permission for one command on one incident; it also ends with the incident.
+    pub command_ttl_s: f64,
 }
 
 impl Default for NotifyConfig {
@@ -277,6 +282,7 @@ impl Default for NotifyConfig {
                 ..Default::default()
             },
             timeout_s: 15.0,
+            command_ttl_s: 3600.0,
         }
     }
 }
@@ -289,9 +295,10 @@ pub struct WebConfig {
     pub port: u16,
     /// used for links in notifications, e.g. http://192.168.1.10:8484
     pub public_url: String,
-    /// Optional shared secret for control endpoints (pause/resume/stop/mute).
+    /// Shared secret for everything private: camera images, state, metrics and controls.
+    /// Without it the dashboard answers only the machine it runs on.
     pub token: String,
-    /// Explicit opt-in for network-accessible controls without authentication.
+    /// Explicit opt-in to serve camera images, state and controls to anyone who can connect.
     pub allow_unauthenticated: bool,
     /// score history kept for the dashboard chart
     pub history_s: f64,
@@ -563,6 +570,12 @@ impl Config {
         range("decision.min_frame_p", self.decision.min_frame_p, 0.0, 10_000.0);
         range("recording.frame_min_p", self.recording.frame_min_p, 0.0, 10_000.0);
         range("web.history_s", self.web.history_s, 0.0, 604_800.0);
+        range(
+            "notify.command_ttl_s",
+            self.notify.command_ttl_s,
+            60.0,
+            crate::capability::MAX_LIFETIME_S,
+        );
         range(
             "printer.action_max_attempts",
             self.printer.action_max_attempts as f64,
@@ -988,6 +1001,14 @@ const SECRET_KEYS: &[&str] = &[
     "heartbeat_fail_url",
 ];
 
+/// Settings that hold an address which may embed credentials: (section, key).
+const CREDENTIAL_URLS: &[(&str, &str)] = &[
+    ("camera", "url"),
+    ("printer", "host"),
+    ("ntfy", "url"),
+    ("web", "public_url"),
+];
+
 /// Fully-resolved settings (defaults + file + env) as plain data, for `prusa-watch config`.
 pub fn effective_config(cfg: &Config, redact: bool) -> Value {
     let mut v = serde_yaml::to_value(cfg).unwrap();
@@ -996,25 +1017,31 @@ pub fn effective_config(cfg: &Config, redact: bool) -> Value {
         .unwrap()
         .insert("escalation".into(), Value::Mapping(merged));
     if redact {
-        scrub(&mut v, "");
+        scrub(&mut v, "", &crate::redact::Redactor::from_config(cfg));
     }
     v
 }
 
-fn scrub(node: &mut Value, parent: &str) {
+/// Mask by key first (the whole value is the secret), then by value, so a secret that was
+/// copied into another setting (a topic inside a message template) is masked there too.
+fn scrub(node: &mut Value, parent: &str, redactor: &crate::redact::Redactor) {
     match node {
         Value::Mapping(m) => {
             for (k, v) in m.iter_mut() {
                 let key = key_str(k);
                 let secret = SECRET_KEYS.contains(&key.as_str()) || (parent == "webhook" && key == "url");
-                if secret && matches!(v, Value::String(s) if !s.is_empty()) {
-                    *v = Value::String("***".into());
-                } else {
-                    scrub(v, &key);
+                match v {
+                    Value::String(s) if secret && !s.is_empty() => *s = crate::redact::MASK.into(),
+                    Value::String(s) if CREDENTIAL_URLS.contains(&(parent, key.as_str())) => {
+                        *s = redactor.literals(&crate::redact::host_credentials(s));
+                    }
+                    Value::String(s) => *s = redactor.literals(s),
+                    _ => scrub(v, &key, redactor),
                 }
             }
         }
-        Value::Sequence(s) => s.iter_mut().for_each(|v| scrub(v, parent)),
+        Value::Sequence(s) => s.iter_mut().for_each(|v| scrub(v, parent, redactor)),
+        Value::String(s) => *s = redactor.literals(s),
         _ => {}
     }
 }

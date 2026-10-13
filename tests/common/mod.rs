@@ -64,6 +64,12 @@ pub struct PrinterState {
     /// emulate a pause still in flight: after pause(), report PRINTING for this many polls
     pub pause_lag_polls: usize,
     lag: usize,
+    /// accept stop() but keep printing (a request the printer has not acted on)
+    pub ignore_stop: bool,
+    /// what status() reports instead of the real state, e.g. a state no firmware defines
+    pub report: Option<(String, Option<i64>)>,
+    /// make status() fail with exactly this text (what a transport error would say)
+    pub status_error: Option<String>,
 }
 
 pub struct FakePrinter(pub Mutex<PrinterState>);
@@ -78,6 +84,9 @@ impl FakePrinter {
             fail_pause: false,
             pause_lag_polls: 0,
             lag: 0,
+            ignore_stop: false,
+            report: None,
+            status_error: None,
         })))
     }
     pub fn s(&self) -> std::sync::MutexGuard<'_, PrinterState> {
@@ -97,6 +106,10 @@ impl FakePrinter {
     pub fn calls(&self) -> Vec<(String, i64)> {
         self.s().calls.clone()
     }
+    /// Report `state`/`job_id` from status() regardless of the simulated printer's real state.
+    pub fn report(&self, state: &str, job_id: Option<i64>) {
+        self.s().report = Some((state.into(), job_id));
+    }
     pub fn count(&self, what: &str, job: i64) -> usize {
         self.calls().iter().filter(|(w, j)| w == what && *j == job).count()
     }
@@ -111,12 +124,16 @@ impl Printer for FakePrinter {
                 s.state = "PAUSED".into();
             }
         }
+        if let Some(error) = &s.status_error {
+            return Err(PrusaLinkError(error.clone()));
+        }
         if !s.reachable {
             return Err(PrusaLinkError("GET /api/v1/status: timed out".into()));
         }
+        let (state, job_id) = s.report.clone().unwrap_or_else(|| (s.state.clone(), s.job_id));
         Ok(PrinterStatus {
-            state: s.state.clone(),
-            job_id: s.job_id,
+            state,
+            job_id,
             progress: Some(10.0),
             time_printing: Some(100),
             temp_nozzle: Some(215.0),
@@ -164,7 +181,9 @@ impl Printer for FakePrinter {
             return Err(PrusaLinkError("stop: wrong job or state".into()));
         }
         s.calls.push(("stop".into(), job_id));
-        s.state = "STOPPED".into();
+        if !s.ignore_stop {
+            s.state = "STOPPED".into();
+        }
         Ok(())
     }
 }

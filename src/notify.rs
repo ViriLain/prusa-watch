@@ -282,23 +282,43 @@ impl Notifier {
     }
 
     // -- buttons -----------------------------------------------------------
+    /// Sign permission for `scope` on `subject`, valid for `notify.command_ttl_s`.
+    /// Returns (expiry as unix seconds, signature).
+    pub fn grant(&self, scope: &str, subject: &str) -> (i64, String) {
+        let lifetime = self.cfg.command_ttl_s.clamp(1.0, crate::capability::MAX_LIFETIME_S);
+        let expires = crate::now_ts() as i64 + lifetime as i64;
+        (expires, self.signer.sign(scope, subject, expires))
+    }
+
     pub fn dashboard_url(&self, cmd: &str, incident_id: &str) -> String {
         let mut url = reqwest::Url::parse(&format!("{}/api/incident/{cmd}", self.public_url))
             .expect("configured dashboard URL must be valid");
         {
+            let (expires, cap) = self.grant(cmd, incident_id);
             let mut query = url.query_pairs_mut();
             query.append_pair("id", incident_id);
-            let expires = crate::now_ts() as i64 + 3600;
             query.append_pair("expires", &expires.to_string());
-            query.append_pair("cap", &self.signer.sign(cmd, incident_id, expires));
+            query.append_pair("cap", &cap);
         }
         url.into()
+    }
+
+    /// Link to the latest analyzed frame that works without the dashboard token, for the
+    /// receiver of a webhook. It grants that one read and nothing else.
+    pub fn frame_url(&self) -> String {
+        let (expires, cap) = self.grant(crate::capability::READ_FRAME, "");
+        format!("{}/frame.jpg?expires={expires}&cap={cap}", self.public_url)
     }
 
     /// Translate button names into ntfy action definitions.
     ///
     /// Replies go to ntfy.reply_topic when set (works from anywhere: prusa-watch
     /// subscribes outbound); otherwise straight to the dashboard (LAN/VPN only).
+    ///
+    /// An action definition is delivered to every subscribed device and stored by the ntfy
+    /// server, so it never contains `ntfy.token` or any other reusable credential. What
+    /// authorizes a reply is the signed, expiring permission in its body, checked by the
+    /// reply listener. The reply topic therefore has to accept anonymous publishes.
     pub fn ntfy_actions(&self, e: &Event) -> Vec<String> {
         let c = &self.cfg.ntfy;
         let mut out = Vec::new();
@@ -324,13 +344,9 @@ impl Notifier {
             };
             if !c.reply_topic.is_empty() {
                 let url = format!("{}/{}", c.url.trim_end_matches('/'), c.reply_topic);
-                let auth = if c.token.is_empty() {
-                    String::new()
-                } else {
-                    format!(", headers.Authorization=Bearer {}", c.token)
-                };
+                let (expires, cap) = self.grant(cmd, iid);
                 out.push(format!(
-                    "http, {}, {url}, method=POST{auth}, body={cmd} {iid}, clear=true",
+                    "http, {}, {url}, method=POST, body={cmd} {iid} {expires} {cap}, clear=true",
                     q(label)
                 ));
             } else if !self.public_url.is_empty() {
@@ -419,7 +435,7 @@ impl Notifier {
     pub fn webhook_request(&self, e: &Event) -> HttpRequest {
         let mut body = e.to_json();
         if !self.public_url.is_empty() && e.image().is_some() {
-            body["image_url"] = json!(format!("{}/frame.jpg", self.public_url));
+            body["image_url"] = json!(self.frame_url());
         }
         if let Some(iid) = e.incident_id.as_deref().filter(|s| !s.is_empty())
             && !self.public_url.is_empty()

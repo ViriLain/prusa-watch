@@ -152,7 +152,7 @@ impl FfmpegGrabber {
 
     fn run(self: Arc<Self>) {
         let sh = self.shared.clone();
-        let url = redact(&self.url);
+        let url = crate::redact::url_credentials(&self.url);
         while !sh.stop.load(Ordering::Relaxed) {
             let mut child = match self.command().spawn() {
                 Ok(c) => c,
@@ -247,12 +247,12 @@ impl FfmpegGrabber {
             if sh.stop.load(Ordering::Relaxed) {
                 break;
             }
+            // ffmpeg echoes the source URL, credentials included, in its error lines.
             let detail = errors
                 .lock()
                 .unwrap()
                 .last()
-                .cloned()
-                .map(|e| format!(" ({e})"))
+                .map(|e| format!(" ({})", crate::redact::text(e)))
                 .unwrap_or_default();
             if got_any {
                 tracing::warn!("Camera: stream read failed{detail}, reconnecting");
@@ -368,14 +368,4 @@ pub fn read_ppm<R: BufRead>(r: &mut R) -> std::io::Result<Option<RgbImage>> {
     let mut buf = vec![0u8; (w * h * 3) as usize];
     r.read_exact(&mut buf)?;
     Ok(RgbImage::from_raw(w, h, buf))
-}
-
-/// rtsp://user:pass@host/... -> rtsp://***@host/...
-pub fn redact(url: &str) -> String {
-    if let (Some((scheme, rest)), true) = (url.split_once("://"), url.contains('@'))
-        && let Some((_, host)) = rest.split_once('@')
-    {
-        return format!("{scheme}://***@{host}");
-    }
-    url.to_string()
 }

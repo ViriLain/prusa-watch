@@ -152,6 +152,10 @@ escalation:
 # ───────────────────────────── notify ─────────────────────────────
 notify:
   timeout_s: 15                    # per-request timeout for notification calls
+  # How long one notification's buttons and links work. Each carries a signed permission for
+  # one command on one incident (never a reusable token); it also ends when the incident does.
+  # 1m .. 24h. Raise it if you answer overnight pauses from an old alert.
+  command_ttl_s: 1h
   # Non-escalation notifications: enabled, channels (null = all configured), ntfy priority, cooldown
   warning:                         # "possible failure" heads-up, below the failure threshold
     enabled: true
@@ -177,9 +181,12 @@ notify:
   ntfy:
     url: https://ntfy.sh
     topic: ""                      # alerts; use something unguessable on ntfy.sh
-    token: ""                      # bearer token for protected / self-hosted topics
+    # Bearer token prusa-watch uses to publish alerts and read replies on a protected server.
+    # It is never sent to your phone: buttons carry a signed, expiring permission instead.
+    token: ""
     # Buttons post replies here, and prusa-watch subscribes outbound, so the buttons work
-    # away from home. Use a different long random name than `topic`.
+    # away from home. Use a different long random name than `topic`. With a protected server
+    # the topic must accept anonymous publishes: `ntfy access everyone <reply_topic> write-only`.
     reply_topic: ""
     reply_reconnect_s: 5
   discord:
@@ -193,8 +200,10 @@ web:
   host: 127.0.0.1
   port: 8484
   public_url: ""                   # e.g. http://192.168.1.10:8484 (links, and button fallback without reply_topic)
-  token: ""                        # set a strong random secret before exposing on the network
-  allow_unauthenticated: false     # explicit opt-in only; non-loopback binding requires a token by default
+  # Required for camera images, state, metrics and controls from any other device or through a
+  # proxy. Without it the dashboard answers only requests made on this computer.
+  token: ""
+  allow_unauthenticated: false     # explicit opt-out: serve images, state and controls to anyone who can connect
   history_s: 2h                    # score history kept for the dashboard chart
 
 # ───────────────────────────── recording ─────────────────────────────

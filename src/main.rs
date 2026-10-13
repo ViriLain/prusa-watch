@@ -75,11 +75,12 @@ fn setup_logging(level: &str) {
         .unwrap_or_else(|_| EnvFilter::new(format!("{lvl},hyper=warn,reqwest=warn,tract=warn")));
     let timer = tracing_subscriber::fmt::time::ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f".into());
     use std::io::IsTerminal;
+    // Every log line passes through the redactor installed in main().
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_timer(timer)
         .with_target(true)
-        .with_writer(std::io::stderr)
+        .with_writer(prusa_watch::redact::LogWriter)
         .with_ansi(std::io::stderr().is_terminal())
         .try_init();
 }
@@ -131,15 +132,26 @@ fn ensure_model(path: &str, force: bool, expected: &str) -> bool {
 /// Local Network permission, and reports it as EHOSTUNREACH. (curl is exempt, which hides it.)
 const MACOS_LOCAL_NETWORK_HINT: &str = "  hint: on macOS this usually means your terminal app lacks the Local Network permission:\n        System Settings > Privacy & Security > Local Network > enable your terminal, then quit (Cmd-Q) and reopen it.";
 
+/// `check` output is what people paste into bug reports: print it only through the redactor.
+macro_rules! say {
+    ($($arg:tt)*) => {
+        println!("{}", prusa_watch::redact::active(&format!($($arg)*)))
+    };
+}
+
 fn cmd_check(cfg: &Config) -> ExitCode {
     let mut ok = true;
     let p = &cfg.printer;
-    println!("[printer] {} (auth={})", p.host, p.auth);
+    say!(
+        "[printer] {} (auth={})",
+        prusa_watch::redact::host_credentials(&p.host),
+        p.auth
+    );
     let pl = PrusaLink::new(&p.host, &p.password, &p.username, &p.auth, &p.scheme, 5.0);
     match pl.status() {
         Ok(st) => {
             let o = |v: Option<f64>| v.map(|x| format!("{x:?}")).unwrap_or("None".into());
-            println!(
+            say!(
                 "  OK  state={} job_id={} nozzle={} bed={}",
                 st.state,
                 st.job_id.map(|j| j.to_string()).unwrap_or("None".into()),
@@ -147,19 +159,19 @@ fn cmd_check(cfg: &Config) -> ExitCode {
                 o(st.temp_bed)
             );
             if st.job_id.is_some() {
-                println!("  job: {}", pl.job_name().unwrap_or("None".into()));
+                say!("  job: {}", pl.job_name().unwrap_or("None".into()));
             }
         }
         Err(e) => {
             ok = false;
-            println!("  FAIL {e}");
+            say!("  FAIL {e}");
             if cfg!(target_os = "macos") && e.to_string().contains("No route to host") {
-                println!("{MACOS_LOCAL_NETWORK_HINT}");
+                say!("{MACOS_LOCAL_NETWORK_HINT}");
             }
         }
     }
 
-    println!("[camera] {}", cfg.camera.url);
+    say!("[camera] {}", prusa_watch::redact::url_credentials(&cfg.camera.url));
     let c = &cfg.camera;
     let g = Grabber::new(
         &c.url,
@@ -169,7 +181,9 @@ fn cmd_check(cfg: &Config) -> ExitCode {
         c.read_timeout_s,
     );
     g.start();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // Default timeouts add up to the 20 s this has always waited; shorter settings shorten it.
+    let wait = Duration::from_secs_f64((c.open_timeout_s + c.read_timeout_s).clamp(1.0, 20.0));
+    let deadline = Instant::now() + wait;
     while Instant::now() < deadline && g.latest().is_none() {
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -178,20 +192,23 @@ fn cmd_check(cfg: &Config) -> ExitCode {
     match &frame {
         None => {
             ok = false;
-            println!("  FAIL no frame within 20 s. Is RTSP enabled for the camera in the Prusa app? Is the IP right?");
+            say!(
+                "  FAIL no frame within {:.0} s. Is RTSP enabled for the camera in the Prusa app? Is the IP right?",
+                wait.as_secs_f64()
+            );
         }
         Some(f) => {
-            println!("  OK  {}x{}", f.image.width(), f.image.height());
+            say!("  OK  {}x{}", f.image.width(), f.image.height());
             let path = Path::new(&cfg.state_dir).join("check_frame.jpg");
             let _ = std::fs::create_dir_all(&cfg.state_dir);
             match std::fs::write(&path, encode_jpeg(&f.image, 95)) {
-                Ok(()) => println!("  saved {}", path.display()),
-                Err(e) => println!("  (could not save {}: {e})", path.display()),
+                Ok(()) => say!("  saved {}", path.display()),
+                Err(e) => say!("  (could not save {}: {e})", path.display()),
             }
         }
     }
 
-    println!("[escalation]");
+    say!("[escalation]");
     let esc = parse_escalation(Some(&cfg.escalation), true).expect("validated");
     let resolver = PolicyResolver::new(esc.clone(), &cfg.timezone).expect("validated");
     let (pol, sched) = resolver.resolve(prusa_watch::now_ts());
@@ -207,7 +224,7 @@ fn cmd_check(cfg: &Config) -> ExitCode {
                 marks += &format!(" via schedule '{s}'");
             }
         }
-        println!("  policy {name}{marks}");
+        say!("  policy {name}{marks}");
         for st in &p.steps {
             let notify = match &st.notify {
                 None => "all".to_string(),
@@ -216,7 +233,7 @@ fn cmd_check(cfg: &Config) -> ExitCode {
                     n.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", ")
                 ),
             };
-            println!(
+            say!(
                 "    at {:>6.0}s  action={:<5}  notify={notify}  prio={}",
                 st.at,
                 st.action.as_deref().unwrap_or("-"),
@@ -226,18 +243,26 @@ fn cmd_check(cfg: &Config) -> ExitCode {
     }
     let n = &cfg.notify;
     if !n.ntfy.topic.is_empty() && n.ntfy.reply_topic.is_empty() {
-        println!("  note: notify.ntfy.reply_topic not set - buttons only work on your LAN (via web.public_url)");
+        say!("  note: notify.ntfy.reply_topic not set - buttons only work on your LAN (via web.public_url)");
     }
-    if n.ntfy.topic.is_empty() && n.discord.webhook_url.is_empty() && n.webhook.url.is_empty() {
-        println!(
-            "  WARNING: no notification channel configured - policies that wait for your answer will just act late"
+    if !n.ntfy.reply_topic.is_empty() && !n.ntfy.token.is_empty() {
+        say!(
+            "  note: alert buttons do not carry notify.ntfy.token. The reply topic must accept anonymous \
+             publishes (self-hosted ntfy: `ntfy access everyone <reply-topic> write-only`); each reply is \
+             authorized by its own expiring signature."
         );
     }
+    if cfg.web.enabled && cfg.web.token.is_empty() {
+        say!("  note: web.token not set - the dashboard, camera images and state answer this computer only");
+    }
+    if n.ntfy.topic.is_empty() && n.discord.webhook_url.is_empty() && n.webhook.url.is_empty() {
+        say!("  WARNING: no notification channel configured - policies that wait for your answer will just act late");
+    }
 
-    println!("[model] {}", cfg.detector.model_path);
+    say!("[model] {}", cfg.detector.model_path);
     if !ensure_model(&cfg.detector.model_path, false, &cfg.detector.expected_sha256) {
         ok = false;
-        println!("  FAIL model missing and download failed");
+        say!("  FAIL model missing and download failed");
     } else {
         match SpaghettiDetector::load(&cfg.detector.model_path, cfg.detector.use_gpu) {
             Ok(det) => match &frame {
@@ -246,7 +271,7 @@ fn cmd_check(cfg: &Config) -> ExitCode {
                     match det.try_detect(&img, cfg.detector.threshold, cfg.detector.nms) {
                         Ok(dets) => {
                             let sum: f64 = dets.iter().map(|d| d.confidence).fold(0.0, |a, b| a + b);
-                            println!(
+                            say!(
                                 "  OK  {} boxes, sum p={sum:.3}, {:.0} ms",
                                 dets.len(),
                                 det.last_inference_ms()
@@ -254,19 +279,19 @@ fn cmd_check(cfg: &Config) -> ExitCode {
                         }
                         Err(error) => {
                             ok = false;
-                            println!("  FAIL inference: {error}");
+                            say!("  FAIL inference: {error}");
                         }
                     }
                 }
-                None => println!("  OK  loaded"),
+                None => say!("  OK  loaded"),
             },
             Err(e) => {
                 ok = false;
-                println!("  FAIL {e}");
+                say!("  FAIL {e}");
             }
         }
     }
-    println!(
+    say!(
         "{}",
         if ok {
             "\nAll checks passed."
@@ -285,7 +310,7 @@ fn cmd_run(cfg: Config) -> ExitCode {
     let monitor = match Monitor::new(cfg, Parts::default()) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("{e}");
+            eprintln!("{}", prusa_watch::redact::active(&e.to_string()));
             return ExitCode::from(1);
         }
     };
@@ -310,7 +335,7 @@ fn cmd_run(cfg: Config) -> ExitCode {
     match res {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{e}");
+            eprintln!("{}", prusa_watch::redact::active(&e.to_string()));
             ExitCode::from(1)
         }
     }
@@ -360,7 +385,12 @@ fn cmd_config(args: &Args, environ: &BTreeMap<String, String>) -> ExitCode {
     if !args.defaults
         && let Err(e) = cfg.validate()
     {
-        eprintln!("{}", format!("\n# {e}").replace('\n', "\n# "));
+        let message = if args.show_secrets {
+            e.to_string()
+        } else {
+            prusa_watch::redact::Redactor::from_config(&cfg).text(&e.to_string())
+        };
+        eprintln!("{}", format!("\n# {message}").replace('\n', "\n# "));
         return ExitCode::from(2);
     }
     ExitCode::SUCCESS
@@ -502,13 +532,17 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         Err(e) => {
-            eprintln!("{e}");
+            // no configuration yet to know its secrets from: structural rules only
+            eprintln!("{}", prusa_watch::redact::text(&e.to_string()));
             return ExitCode::from(2);
         }
     };
+    // Before the first log line: nothing after this point may print a configured secret.
+    prusa_watch::redact::install(std::sync::Arc::new(prusa_watch::redact::Redactor::from_config(&cfg)));
     setup_logging(&cfg.log_level);
     if let Err(e) = cfg.validate() {
-        eprintln!("{e}");
+        // a validation message quotes the offending value, which may be a misplaced secret
+        eprintln!("{}", prusa_watch::redact::active(&e.to_string()));
         return ExitCode::from(2);
     }
     match args.command {
