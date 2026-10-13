@@ -1,5 +1,25 @@
-//! Expiring, command-specific links never carry the dashboard's shared control token.
+//! Scoped, expiring authorization for one command on one incident.
+//!
+//! Notification buttons, links and reply messages carry one of these instead of a
+//! reusable credential: never the dashboard's control token, never the ntfy access token.
+//! A capability names its command and incident, expires, and dies with the incident.
 use sha2::{Digest, Sha256};
+
+/// Longest lifetime a capability may be issued with or accepted for.
+pub const MAX_LIFETIME_S: f64 = 86400.0;
+
+/// Scope for fetching the latest analyzed frame (webhook `image_url`); not a printer command.
+pub const READ_FRAME: &str = "read-frame";
+
+/// Why a presented capability was or was not accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grant {
+    Valid,
+    /// Genuine, but past its expiry. Safe to tell the holder so.
+    Expired,
+    /// Not signed by this installation for this command and subject.
+    Invalid,
+}
 
 #[derive(Clone)]
 pub struct Signer(pub [u8; 32]);
@@ -28,10 +48,21 @@ impl Signer {
         hex::encode(outer.finalize())
     }
 
+    pub fn check(&self, command: &str, incident: &str, expires: i64, signature: &str, now: f64) -> Grant {
+        let expected = self.sign(command, incident, expires);
+        if !crate::monitor::constant_time_eq(signature.as_bytes(), expected.as_bytes())
+            || expires as f64 > now + MAX_LIFETIME_S
+        {
+            Grant::Invalid
+        } else if (expires as f64) < now {
+            Grant::Expired
+        } else {
+            Grant::Valid
+        }
+    }
+
     pub fn verify(&self, command: &str, incident: &str, expires: i64, signature: &str, now: f64) -> bool {
-        expires as f64 >= now
-            && expires as f64 <= now + 86400.0
-            && crate::monitor::constant_time_eq(signature.as_bytes(), self.sign(command, incident, expires).as_bytes())
+        self.check(command, incident, expires, signature, now) == Grant::Valid
     }
 
     pub fn load(path: &std::path::Path) -> std::io::Result<Self> {

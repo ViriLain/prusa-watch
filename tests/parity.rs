@@ -157,6 +157,7 @@ fn effective_default_config_matches_python() {
         ),
         ("detector", vec!["expected_sha256"]),
         ("web", vec!["allow_unauthenticated"]),
+        ("notify", vec!["command_ttl_s"]),
         ("recording", vec!["max_storage_mb"]),
     ] {
         for name in names {
@@ -260,11 +261,19 @@ fn event(name: &str) -> Event {
     e
 }
 
-// Link credentials intentionally changed; preserve all other Python wire semantics.
+// Link and button credentials intentionally changed; preserve all other Python wire semantics.
+// Python buttons sent the ntfy token and an unsigned "<cmd> <incident>" body. Rust buttons
+// send no token and append "<expires> <signature>" to the body.
 fn normalized_links(value: &str) -> String {
+    let value = regex::Regex::new(r", headers\.Authorization=Bearer [^,;]+")
+        .unwrap()
+        .replace_all(value, "");
+    let value = regex::Regex::new(r"(body=[a-z]+ [^\s,;]+) \d+ [0-9a-f]{64}")
+        .unwrap()
+        .replace_all(&value, "$1");
     regex::Regex::new(r#"https?://[^\s,;"]+"#)
         .unwrap()
-        .replace_all(value, |capture: &regex::Captures<'_>| {
+        .replace_all(&value, |capture: &regex::Captures<'_>| {
             let Ok(mut url) = reqwest::Url::parse(&capture[0]) else {
                 return capture[0].to_string();
             };
@@ -339,6 +348,12 @@ fn notification_requests_match_python() {
                     normalized_links(g.get_header(k).unwrap()),
                     normalized_links(v.as_str().unwrap()),
                     "{ctx} header {k}"
+                );
+            }
+            if let Some(actions) = g.get_header("Actions") {
+                assert!(
+                    !actions.contains("tk_abc") && !actions.contains("Authorization"),
+                    "{ctx}: button carries the ntfy token: {actions}"
                 );
             }
             let extra: Vec<&str> = g

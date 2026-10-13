@@ -53,6 +53,13 @@
   .pending button.keep { background: var(--ink); color: var(--panel); border-color: var(--ink); font-weight: 600; }
   @media (max-width: 900px) { .pending { margin: 12px 16px 0; } }
   .banner { display: none; margin: 0 20px; padding: 10px 14px; border-radius: 8px; background: color-mix(in srgb, var(--fail) 14%, transparent); color: var(--fail); font-weight: 600; }
+  .lock { display: none; max-width: 420px; margin: 48px auto; }
+  .lock p { margin: 0 0 12px; color: var(--muted); }
+  .lock form { display: flex; gap: 8px; }
+  .lock input { flex: 1; min-width: 0; font: inherit; padding: 7px 10px; border-radius: 7px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+  .lock .msg { color: var(--fail); }
+  body.locked main, body.locked .pending, body.locked .banner { display: none !important; }
+  body.locked .lock { display: block; }
 </style>
 </head>
 <body>
@@ -62,6 +69,15 @@
   <span id="pstate" class="pill">…</span>
   <span id="job" class="job"></span>
 </header>
+<section id="lock" class="card lock" aria-live="polite">
+  <h2>Locked</h2>
+  <p id="lock-text">Enter the dashboard token (<code>web.token</code> in the config) to see the camera and printer state.</p>
+  <form id="lock-form">
+    <input id="lock-token" type="password" autocomplete="current-password" aria-label="Dashboard token" placeholder="Token">
+    <button type="submit">Unlock</button>
+  </form>
+  <div class="msg" id="lock-msg"></div>
+</section>
 <div id="banner" class="banner"></div>
 <div id="pending" class="pending" role="alert">
   <div class="count" id="p-count">2:00</div>
@@ -121,18 +137,64 @@ document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => {
   b.classList.add("active"); src = b.dataset.src; refreshImage();
 });
 
-function refreshImage() { $("view").src = `/${src}.jpg?t=${Date.now()}`; }
-$("view").onerror = () => { if (src === "frame") { $("view").src = `/raw.jpg?t=${Date.now()}`; } };
+// Every request carries the token in a header: it never goes into a URL, and nothing is
+// fetched (state, frames, controls) until the server accepts it.
+const auth = () => (token ? { "X-Token": token } : {});
+const api = (path, options = {}) => fetch(path, { ...options, headers: auth(), cache: "no-store" });
+
+function lock(status) {
+  const rejected = status === 401 && token !== "";
+  token = "";
+  try { sessionStorage.removeItem("pw-token"); } catch (e) {}
+  last = null;
+  const forbidden = status === 403;
+  $("lock-form").style.display = forbidden ? "none" : "flex";
+  $("lock-text").textContent = forbidden
+    ? "This dashboard only answers the computer it runs on. Set web.token in the config to open it from another device or through a proxy."
+    : "Enter the dashboard token (web.token in the config) to see the camera and printer state.";
+  $("lock-msg").textContent = rejected ? "That token was not accepted." : "";
+  if (imageUrl) { URL.revokeObjectURL(imageUrl); imageUrl = ""; }
+  $("view").removeAttribute("src");
+  $("pstate").textContent = "locked"; $("pstate").className = "pill";
+  $("pname").textContent = ""; $("job").textContent = "";
+  document.body.classList.add("locked");
+}
+$("lock-form").onsubmit = (event) => {
+  event.preventDefault();
+  token = $("lock-token").value.trim();
+  $("lock-token").value = "";
+  if (!token) return;
+  try { sessionStorage.setItem("pw-token", token); } catch (e) {}
+  $("lock-msg").textContent = "";
+  poll().then(refreshImage);
+};
+
+// <img src> cannot send a header, so frames are fetched like everything else.
+let imageUrl = "", imageBusy = false;
+async function refreshImage() {
+  if (imageBusy || document.body.classList.contains("locked")) return;
+  imageBusy = true;
+  const wanted = src;
+  try {
+    let r = await api(`/${wanted}.jpg`);
+    if (!r.ok && wanted === "frame" && r.status === 404) r = await api("/raw.jpg");
+    if (r.status === 401 || r.status === 403) { lock(r.status); return; }
+    if (wanted !== src) return;
+    const next = r.ok ? URL.createObjectURL(await r.blob()) : "";
+    if (next) $("view").src = next; else $("view").removeAttribute("src");
+    if (imageUrl) URL.revokeObjectURL(imageUrl);
+    imageUrl = next;
+  } catch (e) {} finally {
+    imageBusy = false;
+    if (wanted !== src) refreshImage();  // the tab changed while this one was loading
+  }
+}
 
 let busy = false;
 async function call(path, confirmText, incidentId) {
   if (busy || !last) return;
   const owner = { job_id: last.job.job_id, session_id: last.job.session_id };
   if (confirmText && !confirm(confirmText)) return;
-  if (last && last.auth_required && !token) {
-    token = prompt("Control token (web.token in config):") || "";
-    try { sessionStorage.setItem("pw-token", token); } catch (e) {}
-  }
   $("msg").textContent = "…";
   try {
     busy = true;
@@ -143,14 +205,15 @@ async function call(path, confirmText, incidentId) {
       url.searchParams.set("job_id", owner.job_id);
       url.searchParams.set("session_id", owner.session_id);
     }
-    const r = await fetch(url, { method: "POST", headers: token ? { "X-Token": token } : {} });
+    const r = await api(url, { method: "POST" });
     const j = await r.json().catch(() => ({}));
-    if (!r.ok) { $("msg").textContent = `Error: ${j.detail || r.status}`; if (r.status === 401) { token = ""; try { sessionStorage.removeItem("pw-token"); } catch (e) {} } return; }
+    if (r.status === 401 || r.status === 403) { lock(r.status); return; }
+    if (!r.ok) { $("msg").textContent = `Error: ${j.detail || r.status}`; return; }
     if (path === "/api/test") { $("msg").textContent = `Test: ${j.detections.length} boxes, sum p ${j.sum_p.toFixed(2)}`; document.querySelector('[data-src="test"]').click(); }
     else $("msg").textContent = `OK: ${j.result}`;
     poll();
   } catch (e) { $("msg").textContent = `Error: ${e}`; }
-  finally { busy = false; poll(); }
+  finally { busy = false; if (!document.body.classList.contains("locked")) poll(); }
 }
 $("b-pause").onclick = () => call("/api/pause");
 $("b-resume").onclick = () => call("/api/resume");
@@ -197,8 +260,11 @@ function chart(hist) {
 
 async function poll() {
   try {
-    const s = await (await fetch("/api/state")).json();
+    const r = await api("/api/state");
+    if (r.status === 401 || r.status === 403) { lock(r.status); return; }
+    const s = await r.json();
     last = s;
+    document.body.classList.remove("locked");
     document.querySelectorAll(".controls button, #p-btns button").forEach(b => b.disabled = busy || !s.printer_reachable);
     $("pname").textContent = s.printer_name;
     const st = s.printer_reachable ? s.printer_state : "offline";
@@ -258,8 +324,9 @@ async function poll() {
     document.querySelectorAll(".controls button, #p-btns button").forEach(b => b.disabled = true);
   }
 }
-poll(); refreshImage();
-setInterval(poll, 3000);
+poll().then(refreshImage);
+// While locked, a token entered in the form is the only thing that asks again.
+setInterval(() => { if (!document.body.classList.contains("locked")) poll(); }, 3000);
 setInterval(() => { if (src !== "test") refreshImage(); }, 3000);
 </script>
 </body>

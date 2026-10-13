@@ -15,6 +15,7 @@ pub mod notify;
 pub mod policy;
 pub mod prusalink;
 pub mod recording;
+pub mod redact;
 pub mod replies;
 pub mod session;
 pub mod storage;

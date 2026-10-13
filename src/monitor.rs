@@ -21,7 +21,7 @@ use crate::prusalink::{Printer, PrinterStatus, PrusaLink, PrusaLinkError};
 use crate::recording::Recorder;
 use crate::replies::NtfyReplyListener;
 pub use crate::session::JobContext;
-use crate::session::{Action, ActionOutcome, PendingAction, Session};
+use crate::session::{Action, ActionOutcome, ENDED_STATES, PendingAction, Route, Session};
 
 pub const ACTIVE: [&str; 3] = ["PRINTING", "PAUSED", "ATTENTION"];
 
@@ -174,6 +174,8 @@ pub struct Monitor {
     pub notifier: Arc<Notifier>,
     pub clock: Clock,
     wall_clock: Clock,
+    /// Masks this installation's secrets in everything the monitor exports.
+    pub redactor: Arc<crate::redact::Redactor>,
     pub state_dir: PathBuf,
     storage: crate::storage::Storage,
     core: Mutex<Core>,
@@ -289,7 +291,9 @@ impl Monitor {
             last_frame: None,
         };
         let storage = crate::storage::Storage::new(cfg.recording.clone(), &state_dir);
+        let redactor = Arc::new(crate::redact::Redactor::from_config(&cfg));
         Ok(Arc::new_cyclic(|me| Self {
+            redactor,
             cfg,
             printer,
             grabber,
@@ -335,12 +339,14 @@ impl Monitor {
         let ntfy = &self.cfg.notify.ntfy;
         let mut replies = lock(&self.replies);
         if !ntfy.reply_topic.is_empty() && replies.is_none() {
-            let weak = Arc::downgrade(self);
-            let handler = Arc::new(move |cmd: &str, iid: &str| match weak.upgrade() {
-                Some(m) => m.handle_reply(cmd, iid),
-                None => "ignored: shutting down".to_string(),
-            });
-            let l = NtfyReplyListener::new(ntfy.clone(), handler);
+            if !ntfy.token.is_empty() {
+                tracing::info!(
+                    "Replies: alert buttons never carry notify.ntfy.token, so the reply topic must accept \
+                     anonymous publishes (self-hosted: `ntfy access everyone <reply-topic> write-only`). \
+                     Each reply is authorized by its own signature."
+                );
+            }
+            let l = self.reply_listener(Arc::new(crate::replies::HttpStreamOpener::default()));
             l.start();
             *replies = Some(l);
         }
@@ -352,6 +358,27 @@ impl Monitor {
                 .spawn(move || me.run())
                 .expect("spawn monitor"),
         );
+    }
+
+    /// The reply listener wired to this monitor: it verifies each reply against the key the
+    /// notifier signs buttons with, runs authorized commands, and reports expired ones.
+    pub fn reply_listener(self: &Arc<Self>, opener: Arc<dyn crate::replies::StreamOpener>) -> Arc<NtfyReplyListener> {
+        let weak = Arc::downgrade(self);
+        let handler = Arc::new(move |cmd: &str, iid: &str| match weak.upgrade() {
+            Some(m) => m.handle_reply(cmd, iid),
+            None => "ignored: shutting down".to_string(),
+        });
+        let listener = NtfyReplyListener::with_opener(
+            self.cfg.notify.ntfy.clone(),
+            self.notifier.signer.clone(),
+            handler,
+            opener,
+        );
+        let weak = Arc::downgrade(self);
+        listener.on_expired(Arc::new(move |_: &str, iid: &str| {
+            weak.upgrade().map(|m| m.reply_expired(iid)).unwrap_or_default()
+        }));
+        listener
     }
 
     pub fn stop(&self) {
@@ -386,7 +413,7 @@ impl Monitor {
         tracing::info!(
             "Monitor: watching {} ({})",
             self.cfg.printer.name,
-            self.cfg.printer.host
+            crate::redact::host_credentials(&self.cfg.printer.host)
         );
         loop {
             if *lock(&self.stop.0) {
@@ -409,17 +436,21 @@ impl Monitor {
     pub fn tick(&self) {
         let _tick = lock(&self.tick_lock);
         // Slow reads and inference do not prevent a user from retiring an incident.
-        let result = self.printer.status().map(|mut status| {
-            if is_active(&status.state) && status.job_id.is_none() {
-                status.job_id = self
-                    .printer
-                    .job()
-                    .ok()
-                    .flatten()
-                    .and_then(|job| job.get("id").and_then(Value::as_i64));
-            }
-            status
-        });
+        let result = self
+            .printer
+            .status()
+            .and_then(PrinterStatus::validated)
+            .map(|mut status| {
+                if is_active(&status.state) && status.job_id.is_none() {
+                    status.job_id = self
+                        .printer
+                        .job()
+                        .ok()
+                        .flatten()
+                        .and_then(|job| job.get("id").and_then(Value::as_i64));
+                }
+                status
+            });
         let name = result
             .as_ref()
             .ok()
@@ -477,24 +508,50 @@ impl Monitor {
         name: Option<String>,
     ) -> Option<(Arc<RgbImage>, PrinterStatus, String)> {
         let mut status = self.poll_printer(core, result)?;
+        let route = |core: &Core| core.pending_action.as_ref().and_then(|p| p.route.clone());
+        let asked_by = route(core);
         if let Some(action) = core.session.reconcile(status.job_id, &status.state) {
-            self.action_confirmed(core, action);
+            self.confirmed_later(core, action, asked_by);
         }
         self.handle_job_transitions(core, &mut status, name);
         // A newly restored request may already have completed while the host was down.
+        let asked_by = route(core);
         if let Some(action) = core.session.reconcile(status.job_id, &status.state) {
-            self.action_confirmed(core, action);
+            self.confirmed_later(core, action, asked_by);
         }
-        if core.incident.is_none()
-            && let Some(pending) = core.pending_action.clone()
+        // The print is over without the printer ever confirming the request: stop waiting.
+        if let Some(pending) = core.pending_action.clone()
             && self.now() >= pending.deadline
+            && ENDED_STATES.contains(&status.state.as_str())
+            && status.job_id.is_none_or(|observed| observed == pending.job_id)
         {
-            let _ = self.do_action(core, pending.action, Some(pending.job_id));
+            self.retire_ended(core, pending.action, &status.state);
         }
-        // Keep what the printer actually reported. run_step marks `status` PAUSED/STOPPED
-        // for the rest of this tick; if that leaked into last_status, a pause still in
+        // Keep what the printer actually reported. The retry below and run_step mark `status`
+        // PAUSED/STOPPED for the rest of this tick; if that leaked into last_status, a pause still in
         // flight (next poll reads PRINTING) would look like a resume at the printer.
         core.last_status = Some(status.clone());
+        // An unobserved request is re-driven at its deadline. While an incident is open its
+        // due steps retry their own action below; anything else (a person's Stop or Resume
+        // that the printer accepted but did not act on) must not wait behind the incident,
+        // where it would also block the incident's pause for as long as it stayed pending.
+        if let Some(pending) = core.pending_action.clone()
+            && self.now() >= pending.deadline
+            && !core.incident.as_ref().is_some_and(|incident| {
+                incident
+                    .due(self.now())
+                    .iter()
+                    .any(|(_, step)| step.action.as_deref() == Some(pending.action.verb()))
+            })
+        {
+            let outcome = self.do_action(core, pending.action, Some(pending.job_id));
+            if outcome == ActionOutcome::Confirmed(Action::Stop) {
+                // Confirmed by the status read that followed the retry: this poll's report is
+                // older than that, so the rest of the tick must not treat the print as running.
+                self.announce_stop(core, pending.route);
+                status.state = "STOPPED".into();
+            }
+        }
 
         let now = self.now();
         self.process_incident(core, &mut status, now);
@@ -998,6 +1055,7 @@ impl Monitor {
         now: f64,
         auto: bool,
     ) -> bool {
+        let asked_before = core.pending_action.as_ref().map(|pending| pending.requested_at);
         let outcome = match step.action.as_deref() {
             Some("pause") if inc.acted.is_none() && status.state == "PRINTING" => {
                 self.do_action(core, Action::Pause, inc.job_id)
@@ -1011,9 +1069,24 @@ impl Monitor {
                 return true;
             }
         };
+        // If this step's request is now waiting for the printer, its outcome is reported
+        // the way the step itself would have reported it.
+        if let Some(pending) = core.session.pending_action.as_mut()
+            && pending.route.is_none()
+            && asked_before != Some(pending.requested_at) // sent, or sent again, by this step
+            && step.action.as_deref() == Some(pending.action.verb())
+        {
+            pending.route = Some(Route {
+                notify: step.notify.clone(),
+                priority: step.priority,
+            });
+        }
         let (taken, err) = match outcome {
             ActionOutcome::Confirmed(action) => (Some(action.result().to_string()), None),
             ActionOutcome::Requested(_) => return false,
+            // The print is over; the incident closes on the next poll. Nothing to announce
+            // beyond the note the retirement already sent.
+            ActionOutcome::Ended(_) => return true,
             ActionOutcome::Failed(error) => (None, Some(error)),
         };
         if let Some(t) = &taken {
@@ -1043,7 +1116,8 @@ impl Monitor {
                     "failure",
                     &format!("{}: {action} FAILED", self.cfg.printer.name),
                     &format!(
-                        "Spaghetti detected on '{name}' but the {action} command failed: {err}. Retries are bounded by the configured attempt limit. Check the printer NOW."
+                        "Spaghetti detected on '{name}' but the {action} command failed: {}. Retries are bounded by the configured attempt limit. Check the printer NOW.",
+                        self.redactor.text(&err)
                     ),
                     Some(inc.jpeg.clone()),
                     None,
@@ -1065,18 +1139,24 @@ impl Monitor {
         true
     }
 
+    /// A just-read printer report that is about `job_id`, or an error. The job named in the
+    /// result is exactly what the printer said: a report without a job is never attributed
+    /// to the one we asked about, and an unreadable or unrecognized report is an error.
     fn fresh_status(&self, job_id: i64) -> Result<PrinterStatus, PrusaLinkError> {
-        let mut status = self.printer.status()?;
+        let mut status = self.printer.status().and_then(PrinterStatus::validated)?;
         if status.job_id.is_none() && is_active(&status.state) {
             status.job_id = self
                 .printer
                 .job()?
                 .and_then(|job| job.get("id").and_then(Value::as_i64));
+            if status.job_id.is_none() {
+                return Err(PrusaLinkError(format!(
+                    "printer is {} but did not say which job; not acting on a job it cannot name",
+                    status.state
+                )));
+            }
         }
-        if status.job_id.is_none() && !is_active(&status.state) {
-            status.job_id = Some(job_id);
-        }
-        if status.job_id != Some(job_id) {
+        if status.job_id.is_some_and(|observed| observed != job_id) {
             return Err(PrusaLinkError(
                 "job changed; refresh the dashboard before acting".into(),
             ));
@@ -1090,6 +1170,76 @@ impl Monitor {
             Action::Stop => core.counters.stops += 1,
             Action::Resume => self.after_resume(core),
         }
+    }
+
+    /// The watch loop, not the request itself, saw the printer confirm `action`. Whoever
+    /// asked was told "awaiting confirmation", so a stop is announced here: by now the
+    /// incident that would have reported it is closing because the print is over.
+    /// (A pause keeps its incident open, and that incident's step reports it.)
+    fn confirmed_later(&self, core: &mut Core, action: Action, asked_by: Option<Route>) {
+        self.action_confirmed(core, action);
+        if action == Action::Stop {
+            self.announce_stop(core, asked_by);
+        }
+    }
+
+    /// Report an outcome where the request came from: the escalation step's own channels
+    /// and priority, or everywhere for a request a person made.
+    fn send_outcome(&self, mut event: Event, asked_by: Option<Route>, default_priority: i64) {
+        event.priority = asked_by.as_ref().map_or(default_priority, |route| route.priority);
+        match asked_by.and_then(|route| route.notify) {
+            Some(channels) if channels.is_empty() => {} // that step is configured silent
+            channels => self.notifier.send(event, channels.as_deref()),
+        }
+    }
+
+    fn announce_stop(&self, core: &mut Core, asked_by: Option<Route>) {
+        let job = core
+            .job
+            .job_name
+            .clone()
+            .unwrap_or_else(|| core.job.job_id.map(|j| j.to_string()).unwrap_or("print".into()));
+        let mut event = self.event(
+            core,
+            "failure",
+            &format!("{}: print STOPPED", self.cfg.printer.name),
+            &format!("The printer confirmed that '{job}' was stopped."),
+            None,
+            Some("stopped".into()),
+        );
+        event.incident_id = core.incident.as_ref().map(|incident| incident.id.clone());
+        self.send_outcome(event, asked_by, 4);
+    }
+
+    /// A request was still unconfirmed when the print ended some other way (finished,
+    /// dismissed at the printer). Stop waiting for it, claim nothing, and say so. This is
+    /// the only word on what became of the request, so it does not depend on
+    /// `notify.info.enabled`.
+    fn retire_ended(&self, core: &mut Core, action: Action, state: &str) {
+        let asked_by = core.session.pending_action.take().and_then(|pending| pending.route);
+        core.session.action_error = None;
+        tracing::warn!(
+            "Monitor: print ended ({state}) before the {} was confirmed; not counting it as {}",
+            action.verb(),
+            action.result()
+        );
+        let event = self.event(
+            core,
+            "info",
+            &format!(
+                "{}: print ended before the {} was confirmed",
+                self.cfg.printer.name,
+                action.verb()
+            ),
+            &format!(
+                "The printer now reports {state}. It never reported the print as {}, so prusa-watch is not counting it as {}.",
+                action.result(),
+                action.result()
+            ),
+            None,
+            None,
+        );
+        self.send_outcome(event, asked_by, self.cfg.notify.info.priority);
     }
 
     fn do_action(&self, core: &mut Core, action: Action, job_id: Option<i64>) -> ActionOutcome {
@@ -1134,8 +1284,8 @@ impl Monitor {
                 return ActionOutcome::Failed(error.to_string());
             }
         };
-        if action.confirmed(&status.state) {
-            if core.session.reconcile(Some(job_id), &status.state).is_some() {
+        if action.confirmed(job_id, status.job_id, &status.state) {
+            if core.session.reconcile(status.job_id, &status.state).is_some() {
                 self.action_confirmed(core, action);
             }
             return ActionOutcome::Confirmed(action);
@@ -1144,7 +1294,44 @@ impl Monitor {
             || (action == Action::Resume && status.state != "PAUSED")
             || (action == Action::Stop && !is_active(&status.state))
         {
-            return ActionOutcome::Failed(format!("cannot {} while printer is {}", action.result(), status.state));
+            let error = format!("cannot {} while printer is {}", action.verb(), status.state);
+            if core.pending_action.is_none() {
+                return ActionOutcome::Failed(error);
+            }
+            if ENDED_STATES.contains(&status.state.as_str()) {
+                // The print is over and the request was never confirmed: nothing to retry.
+                self.retire_ended(core, action, &status.state);
+                return ActionOutcome::Ended(format!(
+                    "print already ended ({}); the {} was not confirmed",
+                    status.state,
+                    action.verb()
+                ));
+            }
+            // Nothing can be sent in this state (BUSY, ERROR, ATTENTION), and it may pass:
+            // BUSY covers crash recovery in the middle of a print. So no attempt is used up
+            // and the request stays alive, but the wait is not silent: one top-priority
+            // alert, a failed readiness check, and another look every retry interval.
+            let waiting = format!(
+                "{action:?} was not confirmed and the printer reports {}; check the printer",
+                status.state
+            );
+            if core.action_error.as_deref() != Some(&waiting) {
+                let mut event = self.event(
+                    core,
+                    "failure",
+                    &format!("{}: {action:?} NOT CONFIRMED", self.cfg.printer.name),
+                    &waiting,
+                    None,
+                    None,
+                );
+                event.priority = 5;
+                self.notifier.send(event, None);
+            }
+            if let Some(pending) = core.session.pending_action.as_mut() {
+                pending.deadline = now + self.cfg.printer.action_retry_s;
+            }
+            core.session.action_error = Some(waiting.clone());
+            return ActionOutcome::Failed(waiting);
         }
         let res = match action {
             Action::Pause => self.printer.pause(job_id),
@@ -1282,13 +1469,46 @@ impl Monitor {
             Ok(r) => r,
             Err(e) => {
                 self.sync_counters(&core);
-                return format!("failed: {e}");
+                return format!("failed: {}", self.redactor.text(&e.0));
             }
         };
         self.refresh_incident_snapshot(&core, now);
         lock(&self.view).snap.job = core.job.clone();
         self.sync_counters(&core);
         result
+    }
+
+    /// A genuine button was tapped after its permission ran out. Nothing is done to the
+    /// printer; say so, because the ntfy app reports the tap itself as a success.
+    pub fn reply_expired(&self, incident_id: &str) -> String {
+        let mut core = lock(&self.core);
+        let now = self.now();
+        // Only for the incident that is open now: an old button for a closed incident is
+        // ignored like any other reply to it, so a stale alert cannot be used to send notices.
+        let open = core
+            .incident
+            .as_ref()
+            .is_some_and(|incident| constant_time_eq(incident_id.as_bytes(), incident.id.as_bytes()));
+        if open && now - core.last_routed.get("expired").copied().unwrap_or(f64::NEG_INFINITY) >= 60.0 {
+            core.last_routed.insert("expired".into(), now);
+            let mut event = self.event(
+                &core,
+                "info",
+                &format!("{}: that button has expired", self.cfg.printer.name),
+                &format!(
+                    "Nothing was changed. Alert buttons work for {} after the alert is sent. \
+                     Use the newest alert or open the dashboard.",
+                    fmt_duration(self.cfg.notify.command_ttl_s)
+                ),
+                None,
+                None,
+            );
+            event.priority = self.cfg.notify.info.priority;
+            if self.cfg.notify.info.enabled {
+                self.notifier.send(event, self.cfg.notify.info.channels.as_deref());
+            }
+        }
+        "ignored: expired".into()
     }
 
     fn apply_reply(&self, core: &mut Core, cmd: &str, now: f64) -> Result<String, PrusaLinkError> {
@@ -1360,7 +1580,7 @@ impl Monitor {
                 let taken = match outcome {
                     ActionOutcome::Confirmed(action) => Some(action.result().into()),
                     ActionOutcome::Requested(_) => return Ok("stop requested; awaiting confirmation".into()),
-                    ActionOutcome::Failed(error) => return Err(PrusaLinkError(error)),
+                    ActionOutcome::Ended(error) | ActionOutcome::Failed(error) => return Err(PrusaLinkError(error)),
                 };
                 if let Some(i) = core.incident.as_mut() {
                     i.acted = taken;
@@ -1408,7 +1628,15 @@ impl Monitor {
         jpeg: Option<Arc<Vec<u8>>>,
         action_taken: Option<String>,
     ) -> Event {
-        let mut e = Event::new(kind, title, message, &self.cfg.printer.name);
+        // No configured secret may reach a third-party notification service. Only literal
+        // values are masked here, so links in a user's own templates survive; error text is
+        // redacted structurally where it is quoted into a message.
+        let mut e = Event::new(
+            kind,
+            self.redactor.literals(title),
+            self.redactor.literals(message),
+            &self.cfg.printer.name,
+        );
         e.job_id = core.job.job_id;
         e.job_name = core.job.job_name.clone();
         e.score = Some(core.decider.state.normalized_p);
@@ -1474,7 +1702,7 @@ impl Monitor {
         match outcome {
             ActionOutcome::Confirmed(action) => Ok(action.result().into()),
             ActionOutcome::Requested(action) => Ok(format!("{} requested; awaiting confirmation", action.verb())),
-            ActionOutcome::Failed(error) => Err(PrusaLinkError(error)),
+            ActionOutcome::Ended(error) | ActionOutcome::Failed(error) => Err(PrusaLinkError(error)),
         }
     }
 
@@ -1575,6 +1803,18 @@ impl Monitor {
             // keep the countdown live between ticks
             snap.incident = Some(inc.public(self.now()));
         }
+        // Error text originates in transports and child processes that quote URLs.
+        for text in [
+            &mut snap.printer_error,
+            &mut snap.action_error,
+            &mut snap.detector_error,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *text = self.redactor.text(text);
+        }
+        self.redactor.json(&mut snap.background_io);
         snap
     }
 
